@@ -23,10 +23,17 @@ If uv is not installed, install:
     powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
     ```
 
+Then, install cc-liquid as a CLI tool:
 ```bash
 uv tool install cc-liquid
 # Optional Numerai support
 uv tool install cc-liquid[numerai]
+```
+
+### Or run without directly installing (uvx)
+
+```bash
+uvx cc-liquid init
 ```
 
 ### First-time setup
@@ -43,12 +50,6 @@ The wizard will guide you through:
 - Setting up portfolio parameters
 - Auto-adding `.env` to `.gitignore` for security
 
-### Run without installing (uvx)
-
-```bash
-uvx cc-liquid --help
-uvx cc-liquid account
-```
 
 ### Enable tab auto-completion in your shell (optional)
 
