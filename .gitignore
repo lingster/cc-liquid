@@ -1,0 +1,40 @@
+# State file
+.cc_liquid_state.json
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.ruff_cache/
+.pytest_cache/
+site/
+
+# Virtual environments
+.venv
+
+# Environment variables
+.env
+.env.*
+
+# Data files
+*.parquet
+*.csv
+predictions.*
+prices.*
+
+# Logs
+*.log
+logs/
+
+# Trading history
+trades/
+history/
+
+# Private keys - NEVER commit these!
+*.key
+*.pem
+private_key*
+wallet_key*
