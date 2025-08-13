@@ -3,7 +3,7 @@
 import os
 import time
 import traceback
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 import subprocess
 import shutil
 import shlex
@@ -11,6 +11,7 @@ import shlex
 import click
 from rich.console import Console
 from rich.live import Live
+from typing import Any
 
 from .cli_callbacks import RichCLICallbacks
 from .cli_display import (
@@ -39,6 +40,234 @@ def cli():
     in_completion_mode = any(k.endswith("_COMPLETE") for k in os.environ)
     if not in_completion_mode:
         show_pre_alpha_warning()
+
+
+@cli.command(name="init")
+@click.option(
+    "--non-interactive", is_flag=True, help="Skip interactive setup, use defaults"
+)
+def init_cmd(non_interactive: bool):
+    """Interactive setup wizard for first-time users.
+
+    Guides you through creating config files with validation and helpful defaults.
+    """
+    console = Console()
+    from rich.prompt import Prompt, Confirm
+    from rich.panel import Panel
+    from rich.text import Text
+
+    # Check existing files
+    cfg_path = "cc-liquid-config.yaml"
+    env_path = ".env"
+
+    if os.path.exists(cfg_path) or os.path.exists(env_path):
+        existing_files = []
+        if os.path.exists(cfg_path):
+            existing_files.append(cfg_path)
+        if os.path.exists(env_path):
+            existing_files.append(env_path)
+
+        console.print(
+            f"\n[yellow]⚠️  Found existing files: {', '.join(existing_files)}[/yellow]"
+        )
+        if not non_interactive:
+            if not Confirm.ask("Overwrite existing files?", default=False):
+                console.print("[red]Setup cancelled.[/red]")
+                return
+
+    # Gather all configuration based on mode
+    if non_interactive:
+        # All defaults in one place for non-interactive mode
+        is_testnet = True
+        data_source = "crowdcent"
+        crowdcent_key = ""
+        hyper_key_placeholder = "0x..."
+        owner_address = None
+        vault_address = None
+        num_long = 10
+        num_short = 10
+        leverage = 1.0
+    else:
+        # Interactive flow
+        welcome_text = Text.from_markup(
+            "[bold cyan]Welcome to cc-liquid setup![/bold cyan]\n\n"
+            "This wizard will help you create:\n"
+            "• [cyan].env[/cyan] - for your private keys (never commit!)\n"
+            "• [cyan]cc-liquid-config.yaml[/cyan] - for your trading configuration\n\n"
+            "[dim]Press Ctrl+C anytime to cancel[/dim]"
+        )
+        console.print(Panel(welcome_text, title="Setup Wizard", border_style="cyan"))
+
+        # Step 1: Environment
+        console.print("\n[bold]Step 1: Choose Environment[/bold]")
+        console.print("[dim]Testnet is recommended for first-time users[/dim]")
+        is_testnet = Confirm.ask("Use testnet?", default=True)
+
+        # Step 2: Data source
+        console.print("\n[bold]Step 2: Data Source[/bold]")
+        console.print("Available sources:")
+        console.print(
+            "  • [cyan]crowdcent[/cyan] - CrowdCent metamodel (requires API key)"
+        )
+        console.print("  • [cyan]numerai[/cyan] - Numerai crypto signals (free)")
+        console.print("  • [cyan]local[/cyan] - Your own prediction file")
+
+        data_source = Prompt.ask(
+            "Choose data source",
+            choices=["crowdcent", "numerai", "local"],
+            default="crowdcent",
+        )
+
+        # Step 3: API keys
+        console.print("\n[bold]Step 3: API Keys[/bold]")
+
+        crowdcent_key = ""
+        if data_source == "crowdcent":
+            console.print("\n[cyan]CrowdCent API Key[/cyan]")
+            console.print("[dim]Get from: https://crowdcent.com/profile[/dim]")
+            crowdcent_key = Prompt.ask(
+                "Enter CrowdCent API key (or press Enter to add later)",
+                default="",
+                show_default=False,
+            )
+
+        console.print("\n[cyan]Hyperliquid Private Key[/cyan]")
+        console.print("[dim]Get from: https://app.hyperliquid.xyz/API[/dim]")
+        console.print(
+            "[yellow]⚠️  Use an agent wallet key, not your main wallet![/yellow]"
+        )
+        hyper_key_input = Prompt.ask(
+            "Enter Hyperliquid private key (or press Enter to add later)",
+            default="",
+            show_default=False,
+            password=True,  # Hide input for security
+        )
+        hyper_key_placeholder = hyper_key_input if hyper_key_input else "0x..."
+
+        # Step 4: Addresses
+        console.print("\n[bold]Step 4: Addresses[/bold]")
+        console.print("[dim]Leave blank to fill in later[/dim]")
+
+        owner_address = Prompt.ask(
+            "Owner address (your main wallet, NOT the agent wallet)",
+            default="",
+            show_default=False,
+        )
+        owner_address = owner_address if owner_address else None
+
+        vault_address = Prompt.ask(
+            "Vault address (optional, for managed vaults)",
+            default="",
+            show_default=False,
+        )
+        vault_address = vault_address if vault_address else None
+
+        # Step 5: Portfolio settings
+        console.print("\n[bold]Step 5: Portfolio Settings[/bold]")
+
+        num_long = int(Prompt.ask("Number of long positions", default="10"))
+        num_short = int(Prompt.ask("Number of short positions", default="10"))
+
+        console.print("\n[yellow]⚠️  Leverage Warning:[/yellow]")
+        console.print("[dim]1.0 = no leverage (safest)[/dim]")
+        console.print("[dim]2.0 = 2x leverage (moderate risk)[/dim]")
+        console.print("[dim]3.0+ = high risk of liquidation[/dim]")
+        leverage = float(Prompt.ask("Target leverage", default="1.0"))
+
+    # Compose configurations
+    yaml_cfg: dict[str, Any] = {
+        "active_profile": "default",
+        "profiles": {
+            "default": {
+                "owner": owner_address,
+                "vault": vault_address,
+                "signer_env": "HYPERLIQUID_PRIVATE_KEY",
+            }
+        },
+        "is_testnet": is_testnet,
+        "data": {
+            "source": data_source,
+            "path": "predictions.parquet",
+            **(
+                {
+                    "date_column": "date",
+                    "asset_id_column": "symbol",
+                    "prediction_column": "meta_model",
+                }
+                if data_source == "numerai"
+                else {
+                    "date_column": "release_date",
+                    "asset_id_column": "id",
+                    "prediction_column": "pred_10d",
+                }
+            ),
+        },
+        "portfolio": {
+            "num_long": num_long,
+            "num_short": num_short,
+            "target_leverage": leverage,
+            "rebalancing": {"every_n_days": 10, "at_time": "18:15"},
+        },
+        "execution": {"slippage_tolerance": 0.005, "min_trade_value": 10.0},
+    }
+
+    env_lines = [
+        "# Secrets only - NEVER commit this file to git!",
+        "# Add to .gitignore immediately",
+        "",
+        "# CrowdCent API (https://crowdcent.com/profile)",
+        f"CROWDCENT_API_KEY={crowdcent_key}",
+        "",
+        "# Hyperliquid Agent Wallet Private Key (https://app.hyperliquid.xyz/API)",
+        "# ⚠️  Use an agent wallet, NOT your main wallet!",
+        f"HYPERLIQUID_PRIVATE_KEY={hyper_key_placeholder}",
+    ]
+
+    # Write files
+    try:
+        with open(cfg_path, "w") as f:
+            yaml.safe_dump(yaml_cfg, f, sort_keys=False)
+        console.print(f"\n[green]✓[/green] Created [cyan]{cfg_path}[/cyan]")
+    except Exception as e:
+        console.print(f"[red]✗ Failed to write {cfg_path}:[/red] {e}")
+        raise SystemExit(1)
+
+    try:
+        with open(env_path, "w") as f:
+            f.write("\n".join(env_lines) + "\n")
+        console.print(f"[green]✓[/green] Created [cyan]{env_path}[/cyan]")
+    except Exception as e:
+        console.print(f"[red]✗ Failed to write {env_path}:[/red] {e}")
+        raise SystemExit(1)
+
+    # Add to .gitignore if it exists
+    if os.path.exists(".gitignore"):
+        with open(".gitignore", "r") as f:
+            gitignore_content = f.read()
+        if ".env" not in gitignore_content:
+            with open(".gitignore", "a") as f:
+                f.write("\n# cc-liquid secrets\n.env\n")
+            console.print("[green]✓[/green] Added .env to .gitignore")
+
+    # Summary and next steps
+    summary = Panel(
+        Text.from_markup(
+            f"[bold green]✅ Setup Complete![/bold green]\n\n"
+            f"Environment: [cyan]{'TESTNET' if is_testnet else 'MAINNET'}[/cyan]\n"
+            f"Data source: [cyan]{data_source}[/cyan]\n"
+            f"Portfolio: [green]{num_long}L[/green] / [red]{num_short}S[/red] @ [yellow]{leverage}x[/yellow]\n\n"
+            "[bold]Next steps:[/bold]\n"
+            "1. Fill in any missing values in [cyan].env[/cyan]\n"
+            "2. Test connection: [cyan]cc-liquid account[/cyan]\n"
+            "3. View config: [cyan]cc-liquid config[/cyan]\n"
+            "4. First rebalance: [cyan]cc-liquid rebalance[/cyan]\n\n"
+            "[dim]Optional: Install tab completion with 'cc-liquid completion install'[/dim]"
+        ),
+        title="🎉 Ready to Trade",
+        border_style="green",
+    )
+    console.print("\n")
+    console.print(summary)
 
 
 @cli.command(name="config")
@@ -336,7 +565,7 @@ def close_all(skip_confirm, set_overrides, force):
 )
 def rebalance(skip_confirm, set_overrides):
     """Execute rebalancing based on the configured data source."""
-    console = Console()
+    Console()
 
     # Apply CLI overrides to config
     overrides_applied = apply_cli_overrides(config, set_overrides)
@@ -515,7 +744,7 @@ def run_live_cli(
                 next_action_time = trader.compute_next_rebalance_time(
                     last_rebalance_date
                 )
-                now = datetime.now(UTC)
+                now = datetime.now(timezone.utc)
                 should_rebalance = now >= next_action_time
 
                 if should_rebalance:
@@ -551,7 +780,7 @@ def run_live_cli(
                             callbacks.info("Trading cancelled by user")
 
                         # Update state on successful completion
-                        last_rebalance_date = datetime.now(UTC)
+                        last_rebalance_date = datetime.now(timezone.utc)
                         trader.save_state(last_rebalance_date)
 
                         console.input(

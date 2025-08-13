@@ -11,10 +11,43 @@ This page gets you running in minutes.
 
 ## Install
 
+If uv is not installed, install:
+
+=== "macOS / Linux"
+    ```bash
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    ```
+
+=== "Windows (PowerShell)"
+    ```powershell
+    powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+    ```
+
 ```bash
-uv pip install cc-liquid
+uv tool install cc-liquid
 # Optional Numerai support
-uv pip install cc-liquid[numerai]
+uv tool install cc-liquid[numerai]
+```
+
+### First-time setup
+
+```bash
+cc-liquid init               # interactive setup wizard (recommended)
+cc-liquid init --non-interactive  # use safe defaults without prompts
+```
+
+The wizard will guide you through:
+- Choosing testnet vs mainnet (defaults to testnet for safety)
+- Selecting data source (CrowdCent, Numerai, or local)
+- Entering API keys (with links to get them)
+- Setting up portfolio parameters
+- Auto-adding `.env` to `.gitignore` for security
+
+### Run without installing (uvx)
+
+```bash
+uvx cc-liquid --help
+uvx cc-liquid account
 ```
 
 ### Enable tab auto-completion in your shell (optional)
@@ -50,16 +83,17 @@ See [Click Shell Completion](https://click.palletsprojects.com/en/stable/shell-c
 
 ## Configure
 
-1) Create `.env` in your working directory (never commit secrets):
+After running `cc-liquid init`, you'll have two files:
+
+1) `.env` - Contains your secrets (auto-added to .gitignore):
 
 ```env
-# Secrets only
-CROWDCENT_API_KEY=...                # from your CrowdCent profile
-HYPERLIQUID_PRIVATE_KEY=0x...        # default signer key name
-HYPER_AGENT_KEY_VAULT=0x...          # optional: assign profile-specific signer keys
+# Secrets only - NEVER commit this file to git!
+CROWDCENT_API_KEY=...                # from https://crowdcent.com/profile
+HYPERLIQUID_PRIVATE_KEY=0x...        # from https://app.hyperliquid.xyz/API
 ```
 
-2) Create `cc-liquid-config.yaml` with addresses and profiles:
+2) `cc-liquid-config.yaml` - Your trading configuration:
 
 ```yaml
 active_profile: personal

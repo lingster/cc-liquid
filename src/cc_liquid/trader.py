@@ -8,7 +8,7 @@ Users must comply with all Hyperliquid terms of service.
 import logging
 from dataclasses import dataclass
 import math
-from datetime import UTC, datetime, timedelta, time
+from datetime import timezone, datetime, timedelta, time
 from typing import Any
 
 import polars as pl
@@ -808,7 +808,7 @@ class CCLiquid:
 
                 if filled_data:
                     # Extract fill details
-                    total_sz = float(filled_data.get("totalSz", trade["sz"]))
+                    float(filled_data.get("totalSz", trade["sz"]))
                     avg_px = float(filled_data.get("avgPx", trade["price"]))
 
                     # Calculate slippage
@@ -868,17 +868,19 @@ class CCLiquid:
           configured time.
         """
         cfg = self.config.portfolio.rebalancing
-        now_utc = now or datetime.now(UTC)
+        now_utc = now or datetime.now(timezone.utc)
 
         hour, minute = map(int, cfg.at_time.split(":"))
         rebalance_time = time(hour=hour, minute=minute)
 
         if last_rebalance_date is None:
-            today_at = datetime.combine(now_utc.date(), rebalance_time, tzinfo=UTC)
+            today_at = datetime.combine(
+                now_utc.date(), rebalance_time, tzinfo=timezone.utc
+            )
             return today_at if now_utc < today_at else now_utc
 
         next_date = last_rebalance_date.date() + timedelta(days=cfg.every_n_days)
-        return datetime.combine(next_date, rebalance_time, tzinfo=UTC)
+        return datetime.combine(next_date, rebalance_time, tzinfo=timezone.utc)
 
     def _load_state(self) -> datetime | None:
         """Load the last rebalance date from persistent state."""

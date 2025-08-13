@@ -26,9 +26,31 @@ Read the docs: [documentation](https://crowdcent.github.io/cc-liquid)
 ## Installation
 
 ```bash
-uv pip install cc-liquid
+uv tool install cc-liquid
 # Optional Numerai support
-uv pip install cc-liquid[numerai]
+uv tool install cc-liquid[numerai]
+```
+
+### Quick Start
+
+```bash
+cc-liquid init        # Interactive setup wizard (recommended for new users)
+```
+
+The wizard guides you through:
+- Choosing testnet (recommended) or mainnet
+- Selecting data source (CrowdCent/Numerai/local)
+- Entering API keys securely
+- Setting portfolio parameters
+- Auto-configuring for safety
+
+### Run without installing (uvx)
+
+Use `uvx` to execute the CLI in an isolated, cached environment without a global install:
+
+```bash
+uvx cc-liquid --help
+uvx cc-liquid account
 ```
 
 ### Shell completion (optional)

@@ -23,9 +23,9 @@ title: Overview
 ### TL;DR
 
 ```bash
-uv pip install cc-liquid
-cc-liquid config     # show current config
-cc-liquid account    # view balances and positions
+uv tool install cc-liquid
+cc-liquid init       # interactive setup wizard
+cc-liquid account    # test connection & view positions
 cc-liquid rebalance  # plan and execute trades
 cc-liquid run        # run continuously on auto-pilot
 ```

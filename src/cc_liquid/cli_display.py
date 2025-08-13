@@ -1,6 +1,6 @@
 """Display utilities for rendering structured data."""
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from rich import box
@@ -244,7 +244,7 @@ def create_footer_panel(
     refresh_seconds: float | None,
 ) -> Panel:
     """Create monitoring footer with countdown and status details."""
-    now = datetime.now(UTC)
+    now = datetime.now(timezone.utc)
 
     # Next rebalance countdown
     countdown_str = ""
