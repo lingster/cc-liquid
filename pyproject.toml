@@ -1,6 +1,6 @@
 [project]
 name = "cc-liquid"
-version = "0.1.0a0"
+version = "0.1.1a1"
 description = "cc-liquid - open source reference implementation for a simple, metamodel-based Hyperliquid portfolio rebalancer"
 readme = "README.md"
 authors = [
@@ -17,6 +17,7 @@ dependencies = [
     "requests>=2.32.3",
     "eth-account>=0.13.0",
     "rich>=13.7.1",
+    "pyyaml",
 ]
 
 [project.scripts]

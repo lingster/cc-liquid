@@ -120,7 +120,7 @@ wheels = [
 
 [[package]]
 name = "cc-liquid"
-version = "0.1.0a0"
+version = "0.1.1a1"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
@@ -129,6 +129,7 @@ dependencies = [
     { name = "hyperliquid-python-sdk" },
     { name = "polars" },
     { name = "python-dotenv" },
+    { name = "pyyaml" },
     { name = "requests" },
     { name = "rich" },
 ]
@@ -161,6 +162,7 @@ requires-dist = [
     { name = "numerapi", marker = "extra == 'numerai'", specifier = "==2.20.7" },
     { name = "polars", specifier = ">=1.0.0" },
     { name = "python-dotenv", specifier = ">=1.1.0" },
+    { name = "pyyaml" },
     { name = "requests", specifier = ">=2.32.3" },
     { name = "rich", specifier = ">=13.7.1" },
 ]
