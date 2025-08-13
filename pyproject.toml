@@ -1,6 +1,6 @@
 [project]
 name = "cc-liquid"
-version = "0.1.1a1"
+version = "0.1.2a2"
 description = "cc-liquid - open source reference implementation for a simple, metamodel-based Hyperliquid portfolio rebalancer"
 readme = "README.md"
 authors = [
