@@ -23,6 +23,8 @@ cc-liquid is a simple metamodel-based rebalancer for Hyperliquid that:
 
 Read the docs: [documentation](https://crowdcent.github.io/cc-liquid)
 
+![dashboard](docs/images/dashboard.svg)
+
 ## Installation
 
 ```bash

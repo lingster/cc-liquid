@@ -33,8 +33,4 @@ Warning: `No predictions match Hyperliquid tradeable assets!`
 - Reduce position count or leverage
 - Avoid illiquid symbols (see [Configuration → Execution](configuration.md#execution))
 
-## [Testnet vs Mainnet](configuration.md#profiles-network--credentials)
-
-- Use `--set is_testnet=true` to switch networks
-
 

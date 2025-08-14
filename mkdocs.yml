@@ -45,12 +45,12 @@ nav:
       - Guides:
           - Walkthrough: walkthrough.md
           - Configuration: configuration.md
-          - How it works: how-it-works.md
           - Autopilot & Scheduling: autopilot.md
           - Headless & Custom Callbacks: headless.md
       - More:
           - Troubleshooting: troubleshooting.md
           - Security & Disclaimer: security.md
+          - About CrowdCent: https://crowdcent.com/about/
   - API Reference:
       - CLI: api/cli.md
       - Python API: api/python.md

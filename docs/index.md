@@ -10,7 +10,7 @@ title: Overview
 
 `cc-liquid` is a reference implementation for simple, automated portfolio rebalancing on Hyperliquid driven by metamodel predictions.
 
-![cc-liquid dashboard](images/dashboard.png)
+![cc-liquid dashboard](images/dashboard.svg)
 
 
 ### What you can do

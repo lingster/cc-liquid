@@ -2,8 +2,6 @@
 title: Install & Quick Start
 ---
 
-This page gets you running in minutes.
-
 ## Prerequisites
 
 - Hyperliquid API/Agent wallet (address + private key)
@@ -11,7 +9,7 @@ This page gets you running in minutes.
 
 ## Install
 
-If uv is not installed, install:
+If uv is not yet installed:
 
 === "macOS / Linux"
     ```bash
@@ -23,14 +21,13 @@ If uv is not installed, install:
     powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
     ```
 
-Then, install cc-liquid as a CLI tool:
+#### Install cc-liquid as a CLI tool:
 ```bash
 uv tool install cc-liquid
-# Optional Numerai support
-uv tool install cc-liquid[numerai]
+uv tool install cc-liquid[numerai] # optional Numerai support
 ```
 
-### Or run without directly installing (uvx)
+#### Or run with uvx (no install)
 
 ```bash
 uvx cc-liquid init
@@ -44,11 +41,17 @@ cc-liquid init --non-interactive  # use safe defaults without prompts
 ```
 
 The wizard will guide you through:
+
 - Choosing testnet vs mainnet (defaults to testnet for safety)
 - Selecting data source (CrowdCent, Numerai, or local)
 - Entering API keys (with links to get them)
 - Setting up portfolio parameters
 - Auto-adding `.env` to `.gitignore` for security
+
+
+Example init result:
+
+![init summary](images/init-summary.svg)
 
 
 ### Enable tab auto-completion in your shell (optional)
@@ -82,9 +85,10 @@ Manual equivalent:
 Restart your shell to activate completion, or run `source ~/.bashrc`, `source ~/.zshrc`, etc. as needed.  
 See [Click Shell Completion](https://click.palletsprojects.com/en/stable/shell-completion/) for details.
 
-## Configure
+## Quick Start
+### Configure
 
-After running `cc-liquid init`, you'll have two files:
+View [configuration](configuration.md) for full configuration details. After running `cc-liquid init`, you'll have two files:
 
 1) `.env` - Contains your secrets (auto-added to .gitignore):
 
@@ -124,7 +128,7 @@ execution:
   slippage_tolerance: 0.005
 ```
 
-## First run
+### First run
 
 ```bash
 cc-liquid config     # verify config is loaded
@@ -132,23 +136,7 @@ cc-liquid account    # view account and positions
 cc-liquid rebalance  # plan and execute trades (prompts for confirmation)
 ```
 
-Use overrides without editing files:
-
-```bash
-cc-liquid rebalance --set data.source=numerai --set portfolio.num_long=20 --set portfolio.target_leverage=2.0
-```
-
-### Testnet first (recommended)
-
-To avoid live trading while getting set up, use Hyperliquid testnet:
-
-Use a testnet profile or override `network: testnet`:
-
-```bash
-cc-liquid rebalance --set is_testnet=true   # or set profile.network=testnet
-```
-
-## Autopilot (continuous)
+### Autopilot (continuous)
 
 Runs a live dashboard and executes on your schedule.
 

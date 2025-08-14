@@ -6,10 +6,10 @@ cc-liquid loads configuration from `cc-liquid-config.yaml` and environment varia
 
 ## Environment variables (.env)
 
-Secrets only:
+Your env file, which should only store secrets/keys should look like this:
 
 ```env
-CROWDCENT_API_KEY=zzxFakeCr.owdCentKey1234567890   # (needed for CrowdCent metamodel source)
+CROWDCENT_API_KEY=zzxFake.CrowdCentKey1234567890   # (needed for CrowdCent metamodel source)
 HYPERLIQUID_PRIVATE_KEY=0xdeadbeefdeadbeefdeadbeefdeadbeefdead  # (default signer key variable name)
 ```
 
@@ -19,7 +19,7 @@ HYPERLIQUID_PRIVATE_KEY=0xdeadbeefdeadbeefdeadbeefdeadbeefdead  # (default signe
     - Do not put addresses in `.env`; keep owner/vault addresses in the configuration YAML file.
 
 ## YAML (`cc-liquid-config.yaml`)
-
+Your yaml file, in the root of where you call `cc-liquid` should look like this:
 ```yaml
 is_testnet: false
 
@@ -92,7 +92,7 @@ cc-liquid rebalance --set data.source=numerai
 Defaults: `date_column=date`, `asset_id_column=symbol`, `prediction_column=meta_model`, `path=predictions.parquet`
 
 !!! tip
-    Running commands with --set `data.source=numerai` can auto-apply column defaults for the Numerai metamodel.
+    Running commands with `--set data.source=numerai` can auto-apply column defaults for the Numerai metamodel.
 
 ### local
 
@@ -116,7 +116,7 @@ Column rules:
 ## Portfolio
 
 - `num_long` / `num_short`: counts for top/bottom selections
-- `target_leverage`: - scales notional per-position: `(account_value * target_leverage) / (num_long + num_short)`.
+- `target_leverage`: scales notional per-position like `(account_value * target_leverage) / (num_long + num_short)`.
 - `rebalancing.every_n_days` / `rebalancing.at_time` (UTC)
 
 ## Execution

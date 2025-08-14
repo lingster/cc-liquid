@@ -2,7 +2,16 @@
 title: Headless & Custom Callbacks
 ---
 
-Use cc-liquid as a library without the CLI UI. The core trading logic is UI-agnostic and driven by callbacks.
+For advanced use cases or building alternative UIs, you can also use cc-liquid as a library without the CLI UI. The core trading logic is UI-agnostic and driven by callbacks. 
+
+## Architecture
+
+cc-liquid follows a modular design:
+
+- **Data Layer** - Loads predictions from various sources (CrowdCent API, Numerai, local files)
+- **Strategy Layer** - Selects top/bottom assets and calculates equal-weight position sizes
+- **Execution Layer** - Interfaces with Hyperliquid via SDK for order management
+- **Monitoring Layer** - Provides live dashboard and scheduled rebalancing (managed via callbacks and alternative UI code)
 
 ## Callback protocol
 

@@ -10,6 +10,10 @@ Autopilot runs a live dashboard and executes rebalances on your schedule.
 cc-liquid run --skip-confirm
 ```
 
+Live dashboard (monitor):
+
+![dashboard](images/dashboard.svg)
+
 Flags:
 
 - `--skip-confirm`: execute without confirmation when due
