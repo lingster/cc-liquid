@@ -18,6 +18,12 @@ HYPERLIQUID_PRIVATE_KEY=0xdeadbeefdeadbeefdeadbeefdeadbeefdead  # (default signe
 
     - Do not put addresses in `.env`; keep owner/vault addresses in the configuration YAML file.
 
+!!! warning "Loading .env variables"
+    When `cc-liquid` is installed as a CLI tool (e.g., via `uv tool install`), it may not automatically load variables from `.env`. If you encounter errors about missing keys, you must load them manually in your shell session:
+    ```bash
+    export $(grep -v '^#' .env | xargs)
+    ```
+
 ## YAML (`cc-liquid-config.yaml`)
 Your yaml file, in the root of where you call `cc-liquid` should look like this:
 ```yaml

@@ -53,6 +53,15 @@ Example init result:
 
 ![init summary](images/init-summary.svg)
 
+!!! warning
+
+    Before running commands, your secrets must be loaded into your shell's environment. `cc-liquid` will attempt to load any .env in PATH, but if you are encountering errors it is likely that you need to manually export your environment variables. From the directory with your .env, run:
+
+    ```bash
+    export $(grep -v '^#' .env | xargs)
+    ```
+
+    This command reads your `.env` file, filters out comments, and exports the variables. You'll need to run it in each new terminal session.
 
 ### Enable tab auto-completion in your shell (optional)
 

@@ -41,6 +41,14 @@ This shows your current portfolio state:
 
 ![account](images/account.svg)
 
+!!! warning
+    Errors on this step are most often due to incrorrectly configured/loaded private keys. You may need to ensure your .env is loaded by running:
+    ```bash
+    export $(grep -v '^#' .env | xargs)
+    ```
+
+    This command reads your `.env` file, filters out comments, and exports the variables. You'll need to run it in each new terminal session.
+
 ## 4) Plan and execute rebalancing
 
 ```bash
@@ -71,30 +79,30 @@ cc-liquid rebalance --set portfolio.num_long=12 --set portfolio.num_short=8 --se
 
 1. **Load predictions**
 
-   - Downloads latest metamodel from CrowdCent/Numerai (or loads local file)
-   - Keeps most recent prediction per asset
+    - Downloads latest metamodel from CrowdCent/Numerai (or loads local file)
+    - Keeps most recent prediction per asset
 
 2. **Select assets**
 
-   - Top `num_long` assets for long positions (highest predictions)
-   - Bottom `num_short` assets for short positions (lowest predictions)
-   - Filters to only assets tradeable on Hyperliquid
+    - Top `num_long` assets for long positions (highest predictions)
+    - Bottom `num_short` assets for short positions (lowest predictions)
+    - Filters to only assets tradeable on Hyperliquid
 
 3. **Size positions**
 
-   - Equal-weight: `(account_value × target_leverage) / total_positions`
-   - Warns if position sizes fall below `min_trade_value`
+    - Equal-weight: `(account_value × target_leverage) / total_positions`
+    - Warns if position sizes fall below `min_trade_value`
 
 4. **Generate trades**
 
-   - Calculates delta between current and target positions
-   - Rounds sizes to exchange precision (`sz_decimals`)
-   - Marks trades below minimum as "skipped"
+    - Calculates delta between current and target positions
+    - Rounds sizes to exchange precision (`sz_decimals`)
+    - Marks trades below minimum as "skipped"
 
 5. **Execute orders**
 
-   - Places market orders with configured `slippage_tolerance`
-   - Reports fills, failures, and actual slippage
+    - Places market orders with configured `slippage_tolerance`
+    - Reports fills, failures, and actual slippage
 
 After execution completes:
 
