@@ -69,7 +69,8 @@ plugins:
             docstring_style: google
   - git-revision-date-localized:
       enable_creation_date: true
-  - git-authors
+  - git-authors:
+      show_email_address: false
 
 markdown_extensions:
   - pymdownx.highlight:
