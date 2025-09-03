@@ -120,7 +120,7 @@ wheels = [
 
 [[package]]
 name = "cc-liquid"
-version = "0.1.3a3"
+version = "0.1.4a4"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
