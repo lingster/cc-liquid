@@ -1,5 +1,6 @@
-# State file
+# State and cache files
 .cc_liquid_state.json
+.cc_liquid_optimizer_cache.json
 
 # Python-generated files
 __pycache__/

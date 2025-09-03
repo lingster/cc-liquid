@@ -1,19 +1,85 @@
 """Display utilities for rendering structured data."""
 
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from rich import box
 from rich.box import DOUBLE
 from rich.columns import Columns
-from rich.console import Console
+from rich.console import Console, Group
 from rich.layout import Layout
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+import re
 
 if TYPE_CHECKING:
     from .trader import AccountInfo, PortfolioInfo
+
+
+def strip_ansi_codes(text: str) -> str:
+    """Strip ANSI escape codes from text to prevent Rich layout issues."""
+    ansi_escape = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+    return ansi_escape.sub("", text)
+
+
+def create_setup_welcome_panel() -> Panel:
+    """Build the setup wizard welcome panel used by init command."""
+    welcome_text = Text.from_markup(
+        "[bold cyan]Welcome to cc-liquid setup![/bold cyan]\n\n"
+        "This wizard will help you create:\n"
+        "• [cyan].env[/cyan] - for your private keys (never commit!)\n"
+        "• [cyan]cc-liquid-config.yaml[/cyan] - for your trading configuration\n\n"
+        "[dim]Press Ctrl+C anytime to cancel[/dim]"
+    )
+    return Panel(welcome_text, title="Setup Wizard", border_style="cyan")
+
+
+def create_setup_summary_panel(
+    is_testnet: bool,
+    data_source: str,
+    num_long: int,
+    num_short: int,
+    leverage: float,
+) -> Panel:
+    """Build the final setup summary panel used by init command."""
+    summary_text = Text.from_markup(
+        f"[bold green]✅ Setup Complete![/bold green]\n\n"
+        f"Environment: [cyan]{'TESTNET' if is_testnet else 'MAINNET'}[/cyan]\n"
+        f"Data source: [cyan]{data_source}[/cyan]\n"
+        f"Portfolio: [green]{num_long}L[/green] / [red]{num_short}S[/red] @ [yellow]{leverage}x[/yellow]\n\n"
+        "[bold]Next steps:[/bold]\n"
+        "1. Fill in any missing values in [cyan].env[/cyan]\n"
+        "2. Test connection: [cyan]cc-liquid account[/cyan]\n"
+        "3. View config: [cyan]cc-liquid config[/cyan]\n"
+        "4. First rebalance: [cyan]cc-liquid rebalance[/cyan]\n\n"
+        "[dim]Optional: Install tab completion with 'cc-liquid completion install'[/dim]"
+    )
+    return Panel(
+        summary_text,
+        title="🎉 Ready to Trade",
+        border_style="green",
+    )
+
+
+def create_plotext_panel(
+    plot_func, title: str, width: int = 50, height: int = 10, style: str = "cyan"
+) -> Panel:
+    """Create a Rich panel with plotext content, handling ANSI codes properly."""
+    import plotext as plt
+
+    # Clear and configure plotext
+    plt.clf()
+    plt.plotsize(width, height)
+
+    # Execute the plotting function
+    plot_func(plt)
+
+    # Get clean output
+    chart_str = plt.build()
+    clean_chart = strip_ansi_codes(chart_str)
+
+    return Panel(Text(clean_chart, style=style), title=title, box=box.HEAVY)
 
 
 def create_data_bar(
@@ -931,3 +997,992 @@ def display_execution_summary(
         console.print(details_panel)
     else:
         console.print(Panel("[dim]No trades executed[/dim]", box=box.HEAVY))
+
+
+def display_backtest_summary(console: Console, result, config=None, show_positions=False):
+    """Display comprehensive backtest results in a cleaner sequential layout
+    
+    Args:
+        console: Rich console for output
+        result: BacktestResult with daily data and stats
+        config: Optional BacktestConfig to display
+        show_positions: Whether to show the detailed position analysis table
+    """
+    
+    # 0. Disclaimer warning
+    disclaimer = Panel(
+        Text.from_markup(
+            "[yellow]\n Past performance does not guarantee future results. "
+            "These results are hypothetical and subject to limitations.[/yellow]\n",
+            justify="center"
+        ),
+        title="[bold yellow] BACKTEST DISCLAIMER [/bold yellow]",
+        box=box.HEAVY,
+        border_style="yellow",
+    )
+    console.print(disclaimer)
+    
+    # 1. Header
+    header = Panel(
+        Text(
+            "BACKTEST RESULTS :: PERFORMANCE ANALYSIS",
+            style="bold cyan",
+            justify="center",
+        ),
+        box=DOUBLE,
+        style="cyan",
+    )
+    console.print(header)
+    
+    # 2-3. Metrics + Charts stacked on the left, Config as a persistent right sidebar
+    metrics_panel = create_backtest_metrics_panel(result.stats)
+
+    if len(result.daily) > 0:
+        equity_panel = create_linechart_panel(result.daily, "equity", "cyan", "Equity ($)")
+        drawdown_panel = create_linechart_panel(result.daily, "drawdown", "red", "Drawdown (%)")
+        dist_panel = create_backtest_distributions(result.daily)
+    else:
+        equity_panel = Panel("[dim]No data[/dim]", box=box.HEAVY)
+        drawdown_panel = Panel("[dim]No data[/dim]", box=box.HEAVY)
+        dist_panel = Panel("[dim]No distribution data[/dim]", box=box.HEAVY)
+
+    top_row = Columns([equity_panel, drawdown_panel], expand=True)
+    left_group = Group(metrics_panel, top_row, dist_panel)
+
+    summary_layout = Layout()
+    summary_layout.split_row(
+        Layout(name="main", ratio=3),
+        Layout(name="config", ratio=1)
+    )
+
+    summary_layout["main"].update(left_group)
+    summary_layout["config"].update(
+        create_backtest_config_panel(config)
+        if config
+        else Panel(
+            "[dim]No configuration data[/dim]",
+            box=box.HEAVY,
+            title="[bold cyan]BACKTEST CONFIG[/bold cyan]",
+        )
+    )
+
+    console.print(summary_layout)
+    
+    # 4. Positions table (full width) - only if flag is set
+    if show_positions and len(result.rebalance_positions) > 0:
+        positions_table = create_enhanced_positions_table(result.rebalance_positions, result.daily)
+        console.print(positions_table)
+
+
+def create_backtest_config_panel(config) -> Panel:
+    """Create configuration panel for backtest sidebar using tree-like layout."""
+    tree = Table(show_header=False, box=None, padding=(0, 0))
+    tree.add_column("Setting", style="cyan", width=18, no_wrap=True)
+    tree.add_column("Value", style="white")
+
+    # Environment/date range
+    if config.start_date or config.end_date:
+        start_str = config.start_date.strftime("%Y-%m-%d") if config.start_date else "start"
+        end_str = config.end_date.strftime("%Y-%m-%d") if config.end_date else "end"
+        tree.add_row("[bold]RANGE[/bold]", "")
+        tree.add_row("├─ From", start_str)
+        tree.add_row("└─ To", end_str)
+        tree.add_row("", "")
+
+    # Portfolio
+    leverage_color = (
+        "green" if config.target_leverage <= 2
+        else "yellow" if config.target_leverage <= 3
+        else "red"
+    )
+    tree.add_row("[bold]PORTFOLIO[/bold]", "")
+    tree.add_row("├─ Long", f"[green]{config.num_long}[/green]")
+    tree.add_row("├─ Short", f"[red]{config.num_short}[/red]")
+    tree.add_row("├─ Leverage", f"[{leverage_color}]{config.target_leverage:.1f}x[/{leverage_color}]")
+    tree.add_row("└─ Rebalance", f"{config.rebalance_every_n_days}d")
+    tree.add_row("", "")
+
+    # Costs
+    tree.add_row("[bold]COSTS[/bold]", "")
+    tree.add_row("├─ Fee", f"{config.fee_bps:.1f}bps")
+    tree.add_row("└─ Slippage", f"{config.slippage_bps:.1f}bps")
+    tree.add_row("", "")
+
+    # Data
+    source_name = (
+        config.predictions_path.split("/")[-1]
+        if "/" in config.predictions_path
+        else config.predictions_path
+    )
+    provider = getattr(config, "data_provider", None)
+    provider_color = (
+        "green" if provider == "crowdcent" else "yellow" if provider == "numerai" else "white"
+    )
+    tree.add_row("[bold]DATA[/bold]", "")
+    if provider:
+        tree.add_row("├─ Provider", f"[{provider_color}]{provider}[/{provider_color}]")
+    tree.add_row("├─ Source", source_name)
+    tree.add_row("└─ Pred Col", str(config.pred_value_column))
+
+    return Panel(tree, title="[bold cyan]BACKTEST CONFIG[/bold cyan]", box=box.HEAVY)
+
+
+def create_backtest_metrics_panel(stats: dict) -> Panel:
+    """Create metrics panel for backtest results."""
+    # Create two-column layout for metrics
+    left_table = Table(show_header=False, box=None, padding=(0, 1))
+    left_table.add_column("", width=15)
+    left_table.add_column("", justify="right")
+
+    right_table = Table(show_header=False, box=None, padding=(0, 1))
+    right_table.add_column("", width=15)
+    right_table.add_column("", justify="right")
+
+    # Left column: Returns and basic metrics
+    total_return = stats.get("total_return", 0)
+    cagr = stats.get("cagr", 0)
+    final_equity = stats.get("final_equity", 0)
+
+    ret_color = "green" if total_return >= 0 else "red"
+    cagr_color = "green" if cagr >= 0 else "red"
+
+    left_table.add_row("DAYS", f"{stats.get('days', 0):,}")
+    left_table.add_row("FINAL EQUITY", format_currency(final_equity, compact=True))
+    left_table.add_row("TOTAL RETURN", f"[{ret_color}]{total_return:.1%}[/{ret_color}]")
+    left_table.add_row("CAGR", f"[{cagr_color}]{cagr:.1%}[/{cagr_color}]")
+    left_table.add_row("WIN RATE", f"{stats.get('win_rate', 0):.1%}")
+
+    # Right column: Risk metrics
+    sharpe = stats.get("sharpe_ratio", 0)
+    sortino = stats.get("sortino_ratio", 0)
+    calmar = stats.get("calmar_ratio", 0)
+    max_dd = stats.get("max_drawdown", 0)
+    vol = stats.get("annual_volatility", 0)
+
+    # Color code risk metrics
+    sharpe_color = "green" if sharpe > 1 else "yellow" if sharpe > 0.5 else "red"
+    dd_color = "green" if max_dd > -0.1 else "yellow" if max_dd > -0.2 else "red"
+
+    right_table.add_row("SHARPE", f"[{sharpe_color}]{sharpe:.2f}[/{sharpe_color}]")
+    right_table.add_row("SORTINO", f"{sortino:.2f}")
+    right_table.add_row("CALMAR", f"{calmar:.2f}")
+    right_table.add_row("MAX DRAWDOWN", f"[{dd_color}]{max_dd:.1%}[/{dd_color}]")
+    right_table.add_row("VOLATILITY", f"{vol:.1%}")
+
+    return Panel(
+        Columns([left_table, right_table], expand=True),
+        title="[bold cyan]PERFORMANCE METRICS[/bold cyan]",
+        box=box.HEAVY,
+    )
+
+
+def create_linechart_panel(daily_df, metric: str, color: str, y_label: str) -> Panel:
+    """Create line chart panel using plotext."""
+
+    def plot_line(plt):
+        plt.plot(daily_df[metric], marker="braille", color=color)
+        plt.xlabel("Days")
+        plt.ylabel(y_label)
+
+    return create_plotext_panel(
+        plot_line,
+        f"[bold cyan]{metric.upper()}[/bold cyan]",
+        style=color,
+        height=9,
+        width=40,
+    )
+
+
+def create_backtest_distributions(daily_df) -> Panel:
+    """Create backtest distributions using standardized small-multiples like optimize."""
+    series_map: dict[str, dict[str, Any]] = {}
+
+    # Returns distribution
+    if "returns" in daily_df.columns:
+        returns = daily_df["returns"].to_list()
+        if returns:
+            series_map["RETURNS"] = {"values": returns, "color": "green", "bins": 15}
+
+    # Drawdown distribution
+    if "drawdown" in daily_df.columns:
+        drawdowns = daily_df["drawdown"].to_list()
+        if drawdowns:
+            series_map["DRAWDOWN"] = {"values": drawdowns, "color": "red", "bins": 15}
+
+    # Turnover distribution (non-zero only)
+    if "turnover" in daily_df.columns:
+        turnovers = daily_df["turnover"].to_list()
+        turnovers_nz = [t for t in turnovers if t and t != 0]
+        if turnovers_nz:
+            series_map["TURNOVER"] = {
+                "values": turnovers_nz,
+                "color": "yellow",
+                "bins": 15,
+            }
+
+    panel = (
+        create_small_multiples_panel(
+            series_map, "[bold cyan]DAILY DISTRIBUTIONS[/bold cyan]"
+        )
+        if series_map
+        else None
+    )
+    if panel is not None:
+        return panel
+    return Panel("[dim]No distribution data available[/dim]", box=box.HEAVY)
+
+
+def create_latest_positions_panel(positions_df) -> Panel:
+    """Create panel showing latest position snapshot."""
+    import polars as pl
+
+    if len(positions_df) == 0:
+        return Panel("[dim]No position data[/dim]", box=box.HEAVY)
+
+    # Get last rebalance date
+    latest_date = positions_df["date"].max()
+    latest_positions = positions_df.filter(positions_df["date"] == latest_date)
+
+    # Sort by absolute weight
+    latest_positions = latest_positions.with_columns(
+        pl.col("weight").abs().alias("abs_weight")
+    ).sort("abs_weight", descending=True)
+
+    table = Table(
+        show_header=True,
+        box=box.SIMPLE_HEAD,
+        header_style="bold cyan on #001926",
+        padding=(0, 1),
+    )
+
+    table.add_column("COIN", style="cyan")
+    table.add_column("WEIGHT", justify="right")
+
+    # Count positions
+    long_count = sum(
+        1 for row in latest_positions.iter_rows(named=True) if row["weight"] > 0
+    )
+    short_count = len(latest_positions) - long_count
+
+    for row in latest_positions.iter_rows(named=True):
+        weight = row["weight"]
+        weight_style = "green" if weight > 0 else "red"
+
+        table.add_row(
+            row["id"],
+            f"[{weight_style}]{abs(weight):.1%}[/{weight_style}]",
+        )
+
+    title = (
+        f"[bold cyan]FINAL POSITIONS[/bold cyan] [dim]│[/dim] "
+        f"[green]{long_count}L[/green] [red]{short_count}S[/red] [dim]│[/dim] "
+        f"{latest_date.strftime('%Y-%m-%d')}"
+    )
+
+    return Panel(table, title=title, box=box.HEAVY)
+
+
+def create_enhanced_positions_table(positions_df, daily_df) -> Panel:
+    """Create enhanced positions table with detailed statistics."""
+    import polars as pl
+
+    if len(positions_df) == 0:
+        return Panel("[dim]No position data[/dim]", box=box.HEAVY)
+
+    # Get unique dates for counting
+    unique_dates = positions_df["date"].unique().sort()
+    total_periods = len(unique_dates)
+    
+    # Get last rebalance date
+    latest_date = positions_df["date"].max()
+    
+    # Calculate statistics for each asset
+    position_stats = (
+        positions_df
+        .group_by("id")
+        .agg([
+            # Count how many times this asset was held
+            pl.col("weight").filter(pl.col("weight") != 0).count().alias("times_held"),
+            # Average weight when held (non-zero)
+            pl.col("weight").filter(pl.col("weight") != 0).mean().alias("avg_weight"),
+            # Count longs vs shorts
+            pl.col("weight").filter(pl.col("weight") > 0).count().alias("times_long"),
+            pl.col("weight").filter(pl.col("weight") < 0).count().alias("times_short"),
+            # First and last appearance
+            pl.col("date").min().alias("first_date"),
+            pl.col("date").max().alias("last_date"),
+            # Current weight (from latest date)
+            pl.col("weight").filter(pl.col("date") == latest_date).first().alias("current_weight"),
+        ])
+        .filter(pl.col("times_held") > 0)  # Only include assets that were held
+    )
+    
+    # Add a column for predominant side
+    position_stats = position_stats.with_columns(
+        pl.when(pl.col("times_long") > pl.col("times_short"))
+        .then(pl.lit("LONG"))
+        .when(pl.col("times_short") > pl.col("times_long"))
+        .then(pl.lit("SHORT"))
+        .otherwise(pl.lit("MIXED"))
+        .alias("predominant_side")
+    )
+    
+    # Sort by times held (frequency) and then by absolute average weight
+    position_stats = position_stats.sort(
+        [
+            pl.col("times_held").is_not_null(),  # Non-null first
+            pl.col("times_held"),
+            pl.col("avg_weight").abs()
+        ],
+        descending=[True, True, True]
+    )
+    
+    # Create the table
+    table = Table(
+        box=box.HEAVY_HEAD,
+        show_lines=False,
+        header_style="bold cyan on #001926",
+        expand=True,
+    )
+    
+    # Define columns
+    table.add_column("COIN", style="cyan", width=8)
+    table.add_column("SIDE", justify="center", width=8)
+    table.add_column("FREQUENCY", justify="right", width=10)
+    table.add_column("AVG WEIGHT", justify="right", width=10)
+    table.add_column("CURRENT", justify="right", width=10)
+    table.add_column("FIRST HELD", justify="center", width=12)
+    table.add_column("LAST HELD", justify="center", width=12)
+    table.add_column("CONSISTENCY", justify="center", width=12)
+    
+    # Add rows
+    for row in position_stats.iter_rows(named=True):
+        coin = row["id"]
+        side = row["predominant_side"]
+        times_held = row["times_held"] or 0
+        avg_weight = row["avg_weight"] or 0
+        current_weight = row["current_weight"] or 0
+        first_date = row["first_date"]
+        last_date = row["last_date"]
+        
+        # Determine side color
+        if side == "LONG":
+            side_style = "green"
+        elif side == "SHORT":
+            side_style = "red"
+        else:
+            side_style = "yellow"
+        
+        # Format frequency as fraction and percentage
+        freq_pct = (times_held / total_periods * 100) if total_periods > 0 else 0
+        freq_str = f"{times_held}/{total_periods} ({freq_pct:.0f}%)"
+        
+        # Format average weight
+        avg_weight_str = f"[{'green' if avg_weight > 0 else 'red'}]{abs(avg_weight):.1%}[/{'green' if avg_weight > 0 else 'red'}]"
+        
+        # Format current weight
+        if current_weight == 0:
+            current_str = "[dim]-[/dim]"
+        else:
+            current_str = f"[{'green' if current_weight > 0 else 'red'}]{abs(current_weight):.1%}[/{'green' if current_weight > 0 else 'red'}]"
+        
+        # Format dates
+        first_str = first_date.strftime("%Y-%m-%d") if first_date else "-"
+        last_str = last_date.strftime("%Y-%m-%d") if last_date else "-"
+        
+        # Consistency indicator (visual bar)
+        consistency_bar = create_data_bar(freq_pct, 100, width=8, filled_char="▓", empty_char="░")
+        consistency_color = "green" if freq_pct >= 75 else "yellow" if freq_pct >= 50 else "dim"
+        consistency_str = f"[{consistency_color}]{consistency_bar}[/{consistency_color}]"
+        
+        table.add_row(
+            f"[bold]{coin}[/bold]",
+            f"[{side_style}]{side}[/{side_style}]",
+            freq_str,
+            avg_weight_str,
+            current_str,
+            first_str,
+            last_str,
+            consistency_str,
+        )
+    
+    # Count current positions
+    current_positions = position_stats.filter(pl.col("current_weight") != 0)
+    current_longs = len(current_positions.filter(pl.col("current_weight") > 0))
+    current_shorts = len(current_positions.filter(pl.col("current_weight") < 0))
+    
+    # Calculate some summary stats
+    total_unique_assets = len(position_stats)
+    most_consistent = position_stats.head(1)
+    if len(most_consistent) > 0:
+        top_asset = most_consistent["id"][0]
+        top_freq = most_consistent["times_held"][0]
+        top_pct = (top_freq / total_periods * 100) if total_periods > 0 else 0
+        consistency_note = f"Most consistent: {top_asset} ({top_pct:.0f}%)"
+    else:
+        consistency_note = ""
+    
+    title = (
+        f"[bold cyan]POSITION ANALYSIS[/bold cyan]  [dim]│[/dim]  "
+        f"{total_unique_assets} unique assets over {total_periods} periods  [dim]│[/dim]  "
+        f"Current: [green]{current_longs}L[/green] [red]{current_shorts}S[/red]"
+    )
+    
+    if consistency_note:
+        title += f"  [dim]│[/dim]  {consistency_note}"
+    
+    return Panel(table, title=title, box=box.HEAVY)
+
+
+def display_optimization_results(
+    console: Console, results_df, metric: str, top_n: int = 20, config=None
+):
+    """Display optimization results."""
+    
+    # Disclaimer warning first
+    disclaimer = Panel(
+        Text.from_markup(
+            "[yellow]\n Optimized parameters are based on historical data and may be overfit. "
+            "Past optimal parameters may not remain optimal in future market conditions.[/yellow]\n",
+            justify="center"
+        ),
+        title="[bold yellow] OPTIMIZATION DISCLAIMER [/bold yellow]",
+        box=box.HEAVY,
+        border_style="yellow",
+    )
+    console.print(disclaimer)
+    
+    layout = Layout()
+    layout.split_column(Layout(name="header", size=3), Layout(name="body"))
+
+    # Header
+    header = Panel(
+        Text(
+            f"OPTIMIZATION RESULTS :: {metric.upper()}",
+            style="bold cyan",
+            justify="center",
+        ),
+        box=DOUBLE,
+        style="cyan",
+    )
+    layout["header"].update(header)
+
+    # Body: Main results + best params summary
+    layout["body"].split_row(
+        Layout(name="results", ratio=3), Layout(name="summary", ratio=1)
+    )
+
+    # Results table
+    results_panel = create_optimization_results_table(results_df, metric, top_n)
+    layout["results"].update(results_panel)
+
+    # Summary panel with best parameters
+    if len(results_df) > 0:
+        summary_panel = create_optimization_summary_panel(results_df.head(1), metric, config)
+        layout["summary"].update(summary_panel)
+    else:
+        layout["summary"].update(Panel("[dim]No results[/dim]", box=box.HEAVY))
+
+    console.print(layout)
+
+    sm_panel = create_optimization_small_multiples_panel(results_df)
+    if sm_panel is not None:
+        console.print(sm_panel)
+
+
+
+def _create_hist_panel(
+    values, title: str, color: str, bins: int = 15, width: int = 24, height: int = 6
+) -> Panel:
+    """Create a compact histogram panel for small multiples."""
+
+    def plot_hist(plt):
+        if not values:
+            return
+        plt.hist(values, bins=bins, color=color)
+        plt.xlabel("")
+        plt.ylabel("")
+
+    return create_plotext_panel(
+        plot_hist, f"[bold]{title}[/bold]", width=width, height=height, style=color
+    )
+
+
+def create_small_multiples_panel(
+    series_map: dict[str, dict[str, Any]], title: str
+) -> Panel | None:
+    """Create a small-multiples panel from a mapping of label -> values."""
+    panels = []
+    # Fixed sizes to encourage consistent visual scale
+    for label, conf in series_map.items():
+        values = conf.get("values", [])
+        if values is None:
+            values = []
+        color = conf.get("color", "cyan")
+        bins = conf.get("bins", 15)
+        p = _create_hist_panel(values, label, color=color, bins=bins)
+        panels.append(p)
+    if not panels:
+        return None
+    return Panel(Columns(panels, expand=True), title=title, box=box.HEAVY)
+
+
+def create_optimization_small_multiples_panel(results_df) -> Panel | None:
+    """Build small-multiples histograms for optimization metrics: Sharpe, CAGR, Calmar, Max DD, Volatility."""
+    try:
+        cols = set(results_df.columns)
+        series_map = {}
+        if "sharpe" in cols:
+            series_map["SHARPE"] = {
+                "values": results_df["sharpe"].to_list(),
+                "color": "cyan",
+            }
+        if "cagr" in cols:
+            series_map["CAGR"] = {
+                "values": results_df["cagr"].to_list(),
+                "color": "green",
+            }
+        if "calmar" in cols:
+            series_map["CALMAR"] = {
+                "values": results_df["calmar"].to_list(),
+                "color": "blue",
+            }
+        if "max_dd" in cols:
+            series_map["MAX DD"] = {
+                "values": results_df["max_dd"].to_list(),
+                "color": "red",
+            }
+        if "volatility" in cols:
+            series_map["VOL"] = {
+                "values": results_df["volatility"].to_list(),
+                "color": "yellow",
+            }
+        if not series_map:
+            return None
+        return create_small_multiples_panel(
+            series_map, "[bold cyan]METRIC DISTRIBUTIONS[/bold cyan]"
+        )
+    except Exception:
+        return None
+
+
+def create_optimization_results_table(results_df, metric: str, top_n: int) -> Panel:
+    """Create optimization results table panel."""
+    table = Table(
+        box=box.HEAVY_HEAD,
+        show_lines=False,
+        header_style="bold cyan on #001926",
+        expand=True,
+    )
+
+    # Add columns with consistent styling
+    table.add_column("RANK", style="dim", width=4, justify="right")
+    table.add_column("LONG", style="green", justify="right", width=6)
+    table.add_column("SHORT", style="red", justify="right", width=6)
+    table.add_column("LEV", style="yellow", justify="right", width=6)
+    table.add_column("DAYS", style="cyan", justify="right", width=6)
+    table.add_column(
+        "SHARPE",
+        justify="right",
+        width=8,
+        style="bold white" if metric == "sharpe" else "dim",
+    )
+    table.add_column(
+        "CAGR",
+        justify="right",
+        width=8,
+        style="bold white" if metric == "cagr" else "dim",
+    )
+    table.add_column(
+        "CALMAR",
+        justify="right",
+        width=8,
+        style="bold white" if metric == "calmar" else "dim",
+    )
+    table.add_column("MAX DD", justify="right", width=8)
+    table.add_column("EQUITY", justify="right", width=10)
+
+    for i, row in enumerate(results_df.head(top_n).iter_rows(named=True), 1):
+        # Color code metrics based on performance
+        sharpe = row["sharpe"]
+        sharpe_color = "green" if sharpe > 1 else "yellow" if sharpe > 0.5 else "red"
+
+        dd = row["max_dd"]
+        dd_color = "green" if dd > -0.1 else "yellow" if dd > -0.2 else "red"
+
+        cagr = row["cagr"]
+        cagr_color = "green" if cagr > 0.2 else "yellow" if cagr > 0 else "red"
+
+        # Special highlighting for top 3
+        rank_style = "bold cyan" if i == 1 else "cyan" if i <= 3 else "dim"
+
+        table.add_row(
+            f"[{rank_style}]{i}[/{rank_style}]",
+            str(row["num_long"]),
+            str(row["num_short"]),
+            f"{row['leverage']:.1f}x",
+            str(row["rebalance_days"]),
+            f"[{sharpe_color}]{sharpe:.2f}[/{sharpe_color}]",
+            f"[{cagr_color}]{cagr:.1%}[/{cagr_color}]",
+            f"{row['calmar']:.2f}",
+            f"[{dd_color}]{dd:.1%}[/{dd_color}]",
+            format_currency(row["final_equity"], compact=True),
+        )
+
+    # Calculate title with statistics
+    total_tested = len(results_df)
+    positive_sharpe = sum(
+        1 for row in results_df.iter_rows(named=True) if row["sharpe"] > 0
+    )
+
+    title = (
+        f"[bold cyan]TOP {top_n} COMBINATIONS[/bold cyan]  [dim]│[/dim]  "
+        f"Tested {total_tested}  [dim]│[/dim]  "
+        f"Positive Sharpe {positive_sharpe}/{total_tested} ({positive_sharpe / total_tested * 100:.1f}%)"
+    )
+
+    return Panel(table, title=title, box=box.HEAVY)
+
+
+def create_optimization_summary_panel(best_row_df, metric: str, config=None) -> Panel:
+    """Create summary panel for best parameters."""
+    best = best_row_df.iter_rows(named=True).__next__()
+
+    # Create metrics table
+    table = Table(show_header=False, box=None, padding=(0, 1))
+    table.add_column("", width=12)
+    table.add_column("", justify="right")
+
+    # Best configuration
+    table.add_row("[bold]BEST CONFIG[/bold]", "")
+    table.add_row("", "")
+    table.add_row("LONG", f"[green]{best['num_long']}[/green]")
+    table.add_row("SHORT", f"[red]{best['num_short']}[/red]")
+    table.add_row("LEVERAGE", f"[yellow]{best['leverage']:.1f}x[/yellow]")
+    table.add_row("REBALANCE", f"{best['rebalance_days']} days")
+    table.add_row("", "")
+
+    # Performance metrics
+    table.add_row("[bold]METRICS[/bold]", "")
+    table.add_row("", "")
+
+    # Highlight the optimization metric
+    if metric == "sharpe":
+        table.add_row("SHARPE", f"[bold cyan]{best['sharpe']:.2f}[/bold cyan]")
+        table.add_row("CAGR", f"{best['cagr']:.1%}")
+        table.add_row("CALMAR", f"{best['calmar']:.2f}")
+    elif metric == "cagr":
+        table.add_row("SHARPE", f"{best['sharpe']:.2f}")
+        table.add_row("CAGR", f"[bold cyan]{best['cagr']:.1%}[/bold cyan]")
+        table.add_row("CALMAR", f"{best['calmar']:.2f}")
+    else:  # calmar
+        table.add_row("SHARPE", f"{best['sharpe']:.2f}")
+        table.add_row("CAGR", f"{best['cagr']:.1%}")
+        table.add_row("CALMAR", f"[bold cyan]{best['calmar']:.2f}[/bold cyan]")
+
+    table.add_row("MAX DD", f"{best['max_dd']:.1%}")
+    table.add_row("VOLATILITY", f"{best['volatility']:.1%}")
+    table.add_row("", "")
+    table.add_row("FINAL EQUITY", format_currency(best["final_equity"]))
+    
+    # Add data source information if config is provided
+    if config:
+        table.add_row("", "")
+        table.add_row("[bold]DATA[/bold]", "")
+        table.add_row("", "")
+        
+        # Provider
+        provider = getattr(config, "data_provider", None)
+        if provider:
+            provider_color = (
+                "green" if provider == "crowdcent" 
+                else "yellow" if provider == "numerai" 
+                else "white"
+            )
+            table.add_row("PROVIDER", f"[{provider_color}]{provider}[/{provider_color}]")
+        
+        # Source file
+        source_name = (
+            config.predictions_path.split("/")[-1]
+            if "/" in config.predictions_path
+            else config.predictions_path
+        )
+        table.add_row("SOURCE", source_name[:12] + "..." if len(source_name) > 15 else source_name)
+        
+        # Prediction column
+        table.add_row("PRED COL", str(config.pred_value_column)[:15])
+
+    return Panel(
+        table, title=f"[bold cyan]BEST BY {metric.upper()}[/bold cyan]", box=box.HEAVY
+    )
+
+
+def create_optimization_progress_display(
+    current: int,
+    total: int,
+    current_params: dict,
+    best_so_far: dict | None = None,
+    elapsed_time: float = 0,
+) -> Layout:
+    """Create live progress display for optimization."""
+    from rich.layout import Layout
+    from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn
+    from rich.align import Align
+
+    layout = Layout()
+    layout.split_column(
+        Layout(name="header", size=3),
+        Layout(name="body", size=12),
+        Layout(name="footer", size=3),
+    )
+
+    # Header
+    header = Panel(
+        Text("OPTIMIZATION IN PROGRESS", style="bold cyan blink", justify="center"),
+        box=DOUBLE,
+        style="cyan",
+    )
+    layout["header"].update(header)
+
+    # Body: Progress bar and current/best params
+    layout["body"].split_column(
+        Layout(name="progress", size=5), Layout(name="params", size=7)
+    )
+
+    # Create progress bar
+    progress = Progress(
+        TextColumn("[bold cyan]Testing:[/bold cyan]"),
+        BarColumn(bar_width=40, style="cyan", complete_style="green"),
+        TextColumn("{task.completed}/{task.total}"),
+        TextColumn("[cyan]{task.percentage:>3.0f}%[/cyan]"),
+        TimeRemainingColumn(),
+        expand=False,
+    )
+
+    task = progress.add_task("Optimization", total=total, completed=current)
+    progress.update(task, completed=current)
+
+    progress_panel = Panel(
+        Align.center(progress, vertical="middle"),
+        box=box.HEAVY,
+        title="[bold cyan]PROGRESS[/bold cyan]",
+    )
+    layout["progress"].update(progress_panel)
+
+    # Parameters display
+    layout["params"].split_row(
+        Layout(name="current", ratio=1), Layout(name="best", ratio=1)
+    )
+
+    # Current parameters
+    current_table = Table(show_header=False, box=None, padding=(0, 1))
+    current_table.add_column("", width=12)
+    current_table.add_column("", justify="right")
+
+    current_table.add_row("COMBINATION", f"{current}/{total}")
+    current_table.add_row("", "")
+    current_table.add_row(
+        "LONG", f"[green]{current_params.get('num_long', '-')}[/green]"
+    )
+    current_table.add_row("SHORT", f"[red]{current_params.get('num_short', '-')}[/red]")
+    current_table.add_row(
+        "LEVERAGE", f"[yellow]{current_params.get('leverage', 0):.1f}x[/yellow]"
+    )
+    current_table.add_row("DAYS", f"{current_params.get('rebalance_days', '-')}")
+
+    layout["current"].update(
+        Panel(current_table, title="[bold cyan]TESTING[/bold cyan]", box=box.HEAVY)
+    )
+
+    # Best so far
+    if best_so_far:
+        best_table = Table(show_header=False, box=None, padding=(0, 1))
+        best_table.add_column("", width=12)
+        best_table.add_column("", justify="right")
+
+        best_table.add_row(
+            "SHARPE", f"[green]{best_so_far.get('sharpe', 0):.2f}[/green]"
+        )
+        best_table.add_row("CAGR", f"{best_so_far.get('cagr', 0):.1%}")
+        best_table.add_row("", "")
+        best_table.add_row("CONFIG", "")
+        best_table.add_row(
+            "L/S",
+            f"{best_so_far.get('num_long', '-')}/{best_so_far.get('num_short', '-')}",
+        )
+        best_table.add_row("LEV", f"{best_so_far.get('leverage', 0):.1f}x")
+
+        layout["best"].update(
+            Panel(
+                best_table,
+                title="[bold green]BEST SO FAR[/bold green]",
+                box=box.HEAVY,
+                border_style="green",
+            )
+        )
+    else:
+        layout["best"].update(
+            Panel(
+                "[dim]No results yet[/dim]",
+                title="[bold]BEST SO FAR[/bold]",
+                box=box.HEAVY,
+            )
+        )
+
+    # Footer
+    eta = (elapsed_time / current * (total - current)) if current > 0 else 0
+    eta_str = f"{int(eta // 60)}:{int(eta % 60):02d}" if eta > 0 else "--:--"
+
+    footer_text = (
+        f"[dim]Elapsed: {int(elapsed_time // 60)}:{int(elapsed_time % 60):02d} │ "
+        f"ETA: {eta_str} │ "
+        f"Rate: {current / elapsed_time:.1f}/s[/dim]"
+        if elapsed_time > 0
+        else "[dim]Starting...[/dim]"
+    )
+
+    layout["footer"].update(Panel(footer_text, box=box.HEAVY, style="dim"))
+
+    return layout
+
+
+def display_optimization_contours(console: Console, results_df, metric: str):
+    """Display parameter heatmaps using ASCII visualization as small multiples."""
+    import polars as pl
+
+    leverages = results_df["leverage"].unique().sort().to_list()
+    if not leverages:
+        console.print(Panel("[dim]No data to visualize[/dim]", box=box.HEAVY))
+        return
+
+    header = Panel(
+        Text(
+            f"PARAMETER HEATMAPS :: {metric.upper()}",
+            style="bold cyan",
+            justify="center",
+        ),
+        box=DOUBLE,
+        style="cyan",
+    )
+    console.print(header)
+
+    # Collect heatmap panels for a grid layout (up to 2x3)
+    heatmap_panels = []
+    for leverage in leverages:
+        df = results_df.filter(pl.col("leverage") == leverage)
+
+        if len(df) < 4:
+            heatmap_panels.append(
+                Panel(
+                    "[dim]Insufficient data[/dim]",
+                    title=f"[bold]LEV {leverage:.1f}x[/bold]",
+                    box=box.HEAVY,
+                    height=12,
+                )
+            )
+            continue
+
+        pivot = df.pivot(
+            index="num_long", on="num_short", values=metric, aggregate_function="mean"
+        )
+
+        longs = sorted(pivot["num_long"].to_list())
+        shorts = sorted([c for c in pivot.columns if c != "num_long"])
+
+        heatmap_str = create_ascii_heatmap(pivot, longs, shorts, metric)
+        best = df[metric].max()
+        worst = df[metric].min()
+        subtitle = (
+            f"[bold cyan]LEV {leverage:.1f}x[/bold cyan]  [dim]│[/dim]  "
+            f"Best {best:.3f}  [dim]│[/dim]  Worst {worst:.3f}"
+        )
+
+        heatmap_panels.append(
+            Panel(
+                heatmap_str,
+                title=subtitle,
+                box=box.HEAVY,
+                height=12,
+            )
+        )
+
+    # Arrange panels into small multiples grid and print once
+    if heatmap_panels:
+        num_panels = len(heatmap_panels)
+        # Choose columns per row for pleasant layout
+        if num_panels == 1:
+            cols_per_row = 1
+        elif num_panels in (2, 4):
+            cols_per_row = 2
+        else:
+            cols_per_row = 3
+
+        rows = []
+        for i in range(0, num_panels, cols_per_row):
+            rows.append(Columns(heatmap_panels[i : i + cols_per_row], expand=True))
+
+        from rich.table import Table as RichTable
+
+        container = RichTable.grid(expand=True)
+        for row in rows:
+            container.add_row(row)
+
+        console.print(container)
+
+
+def create_ascii_heatmap(pivot_df, longs: list, shorts: list, metric: str) -> str:
+    """Create an ASCII heatmap representation with sorted axes, legend-aware colors, and best-cell emphasis."""
+    import polars as pl
+
+    # Ensure numeric sort order (5, 10, 15 ...)
+    longs = sorted(longs)
+    shorts = sorted(shorts)
+
+    # Find best cell for emphasis
+    best_val = None
+    best_coord = None
+    for long_val in longs:
+        row = pivot_df.filter(pl.col("num_long") == long_val)
+        for short_val in shorts:
+            if len(row) > 0 and str(short_val) in row.columns:
+                val = row[str(short_val)][0]
+                if val is not None and (best_val is None or val > best_val):
+                    best_val = val
+                    best_coord = (long_val, short_val)
+
+    # Build the heatmap as a string
+    lines = []
+    header = "     L\\S  │ " + " ".join(f"{s:>4}" for s in shorts)
+    lines.append(header)
+    lines.append("─" * len(header))
+
+    for long_val in longs:
+        row_data = pivot_df.filter(pl.col("num_long") == long_val)
+        row_str = f"  {long_val:>6} │ "
+        if len(row_data) > 0:
+            for short_val in shorts:
+                if str(short_val) in row_data.columns:
+                    val = row_data[str(short_val)][0]
+                    if val is not None:
+                        # Color buckets for sharpe-like metrics
+                        if metric == "sharpe":
+                            if val > 1.5:
+                                txt = f"[green]{val:>4.1f}[/green]"
+                            elif val > 0:
+                                txt = f"[yellow]{val:>4.1f}[/yellow]"
+                            else:
+                                txt = f"[red]{val:>4.1f}[/red]"
+                        else:
+                            txt = f"{val:>4.1f}"
+                        # Emphasize best cell
+                        if best_coord == (long_val, short_val):
+                            txt = f"[bold]{txt}[/bold]"
+                        row_str += txt + " "
+                    else:
+                        row_str += "   - "
+                else:
+                    row_str += "   - "
+        else:
+            row_str += "   - " * len(shorts)
+        lines.append(row_str)
+    return "\n".join(lines)

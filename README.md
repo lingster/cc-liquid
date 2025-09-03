@@ -163,11 +163,30 @@ cc-liquid rebalance --set data.source=numerai --set portfolio.num_long=20 --set 
 4. **Generate Trades**: Calculates required trades from current to target positions
 5. **Execute Orders**: Places market orders with configured slippage tolerance
 
+## Backtesting & Optimization
+
+cc-liquid includes backtesting and optimization tools to test strategies on historical data:
+
+```bash
+cc-liquid analyze                    # Run backtest with current config
+cc-liquid optimize                   # Find optimal parameters via grid search
+```
+
+> ⚠️ **BACKTESTING DISCLAIMER** ⚠️
+> 
+> **Past performance does not predict future results.** Backtesting has inherent limitations:
+> - Results are hypothetical and may not reflect real trading conditions
+> - Optimized parameters are prone to overfitting
+> - Market conditions, liquidity, and execution costs change over time
+> - Always validate with out-of-sample data and paper trading before live deployment
+> 
+> See [full documentation](https://crowdcent.github.io/cc-liquid/backtesting/) for details.
+
 ## Future Enhancements
 
 - Neutralize to known risk factors
 - Unequal-weight position sizing
-- Backtest/analyze various configurations
+- Advanced portfolio optimization
 
 ## License
 

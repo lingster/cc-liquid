@@ -1,6 +1,7 @@
 """Command-line interface for cc-liquid."""
 
 import os
+import yaml
 import time
 import traceback
 from datetime import datetime, timezone
@@ -10,22 +11,36 @@ import shlex
 
 import click
 from rich.console import Console
-from rich.live import Live
+from rich.progress import (
+    Progress,
+    BarColumn,
+    TextColumn,
+    TimeRemainingColumn,
+    TimeElapsedColumn,
+    MofNCompleteColumn,
+)
 from typing import Any
 
 from .cli_callbacks import RichCLICallbacks
 from .cli_display import (
     create_dashboard_layout,
     create_config_panel,
+    create_header_panel,
+    create_setup_welcome_panel,
+    create_setup_summary_panel,
     display_portfolio,
     display_file_summary,
+    display_backtest_summary,
     show_pre_alpha_warning,
+    display_optimization_results,
+    display_optimization_contours,
 )
-from .config import apply_cli_overrides, config
+from .backtester import BacktestOptimizer, BacktestConfig, Backtester
+from .config import config
+from .config import apply_cli_overrides
 from .data_loader import DataLoader
 from .trader import CCLiquid
 from .completion import detect_shell_from_env, install_completion
-import yaml
 
 
 TMUX_SESSION_NAME = "cc-liquid"
@@ -89,14 +104,7 @@ def init_cmd(non_interactive: bool):
         leverage = 1.0
     else:
         # Interactive flow
-        welcome_text = Text.from_markup(
-            "[bold cyan]Welcome to cc-liquid setup![/bold cyan]\n\n"
-            "This wizard will help you create:\n"
-            "• [cyan].env[/cyan] - for your private keys (never commit!)\n"
-            "• [cyan]cc-liquid-config.yaml[/cyan] - for your trading configuration\n\n"
-            "[dim]Press Ctrl+C anytime to cancel[/dim]"
-        )
-        console.print(Panel(welcome_text, title="Setup Wizard", border_style="cyan"))
+        console.print(create_setup_welcome_panel())
 
         # Step 1: Environment
         console.print("\n[bold]Step 1: Choose Environment[/bold]")
@@ -250,21 +258,12 @@ def init_cmd(non_interactive: bool):
             console.print("[green]✓[/green] Added .env to .gitignore")
 
     # Summary and next steps
-    summary = Panel(
-        Text.from_markup(
-            f"[bold green]✅ Setup Complete![/bold green]\n\n"
-            f"Environment: [cyan]{'TESTNET' if is_testnet else 'MAINNET'}[/cyan]\n"
-            f"Data source: [cyan]{data_source}[/cyan]\n"
-            f"Portfolio: [green]{num_long}L[/green] / [red]{num_short}S[/red] @ [yellow]{leverage}x[/yellow]\n\n"
-            "[bold]Next steps:[/bold]\n"
-            "1. Fill in any missing values in [cyan].env[/cyan]\n"
-            "2. Test connection: [cyan]cc-liquid account[/cyan]\n"
-            "3. View config: [cyan]cc-liquid config[/cyan]\n"
-            "4. First rebalance: [cyan]cc-liquid rebalance[/cyan]\n\n"
-            "[dim]Optional: Install tab completion with 'cc-liquid completion install'[/dim]"
-        ),
-        title="🎉 Ready to Trade",
-        border_style="green",
+    summary = create_setup_summary_panel(
+        is_testnet=is_testnet,
+        data_source=data_source,
+        num_long=num_long,
+        num_short=num_short,
+        leverage=leverage,
     )
     console.print("\n")
     console.print(summary)
@@ -565,7 +564,6 @@ def close_all(skip_confirm, set_overrides, force):
 )
 def rebalance(skip_confirm, set_overrides):
     """Execute rebalancing based on the configured data source."""
-    Console()
 
     # Apply CLI overrides to config
     overrides_applied = apply_cli_overrides(config, set_overrides)
@@ -597,6 +595,449 @@ def rebalance(skip_confirm, set_overrides):
         )
     else:
         callbacks.info("Trading cancelled by user")
+
+
+@cli.command()
+@click.option(
+    "--prices",
+    default="raw_data.parquet",
+    help="Path to price data (parquet file with date, id, close columns)",
+)
+@click.option(
+    "--start-date",
+    type=click.DateTime(),
+    help="Start date for backtest (YYYY-MM-DD)",
+)
+@click.option(
+    "--end-date",
+    type=click.DateTime(),
+    help="End date for backtest (YYYY-MM-DD)",
+)
+@click.option(
+    "--set",
+    "set_overrides",
+    multiple=True,
+    help="Override config values (e.g., --set portfolio.num_long=15 --set data.source=numerai)",
+)
+@click.option(
+    "--fee-bps",
+    type=float,
+    default=2.5,
+    help="Trading fee in basis points",
+)
+@click.option(
+    "--slippage-bps",
+    type=float,
+    default=5.0,
+    help="Slippage cost in basis points",
+)
+@click.option(
+    "--prediction-lag",
+    type=int,
+    default=1,
+    help="Days between prediction date and trading date (default: 1, use higher values to avoid look-ahead bias)",
+)
+@click.option(
+    "--save-daily",
+    help="Save daily results to CSV file",
+)
+@click.option(
+    "--show-positions",
+    is_flag=True,
+    help="Show detailed position analysis table",
+)
+@click.option(
+    "--verbose",
+    is_flag=True,
+    help="Show detailed progress",
+)
+def analyze(
+    prices,
+    start_date,
+    end_date,
+    set_overrides,
+    fee_bps,
+    slippage_bps,
+    prediction_lag,
+    save_daily,
+    show_positions,
+    verbose,
+):
+    """Run backtest analysis on historical data.
+    
+    ⚠️ IMPORTANT DISCLAIMER:
+    Past performance does not guarantee future results. Backtesting results are
+    hypothetical and have inherent limitations. Actual trading results may differ
+    significantly. Always consider market conditions, liquidity, and execution costs
+    that may not be fully captured in simulations.
+    """
+    from .backtester import Backtester, BacktestConfig
+    from .config import config
+
+    console = Console()
+
+    # Apply CLI overrides to config (includes smart defaults for data.source changes)
+    overrides_applied = apply_cli_overrides(config, set_overrides)
+
+    # Show applied overrides through console
+    if overrides_applied:
+        console.print("[cyan]Configuration overrides applied:[/cyan]")
+        for override in overrides_applied:
+            console.print(f"  • {override}")
+        console.print()
+
+    # Now use the config value (which may have been overridden)
+    predictions = config.data.path
+
+    # Create backtest config using the updated config values
+    bt_config = BacktestConfig(
+        prices_path=prices,
+        predictions_path=predictions,
+        # Use config columns for predictions
+        pred_date_column=config.data.date_column,
+        pred_id_column=config.data.asset_id_column,
+        pred_value_column=config.data.prediction_column,
+        data_provider=config.data.source,
+        start_date=start_date,
+        end_date=end_date,
+        num_long=config.portfolio.num_long,
+        num_short=config.portfolio.num_short,
+        target_leverage=config.portfolio.target_leverage,
+        rebalance_every_n_days=config.portfolio.rebalancing.every_n_days,
+        prediction_lag_days=prediction_lag,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+        verbose=verbose,
+    )
+
+    try:
+        # Run backtest with spinner
+        from rich.spinner import Spinner
+        from rich.live import Live
+
+        with Live(
+            Spinner("dots", text="Running backtest..."), console=console, transient=True
+        ):
+            backtester = Backtester(bt_config)
+            result = backtester.run()
+
+        display_backtest_summary(console, result, bt_config, show_positions=show_positions)
+
+        # Save daily results if requested
+        if save_daily:
+            result.daily.write_csv(save_daily)
+            console.print(f"\n[green]✓[/green] Saved daily results to {save_daily}")
+
+    except Exception as e:
+        from rich.markup import escape
+
+        console.print(f"[red]✗ Backtest failed: {escape(str(e))}[/red]")
+        if verbose:
+            import traceback
+
+            traceback.print_exc()
+
+
+@cli.command()
+@click.option(
+    "--prices",
+    default="raw_data.parquet",
+    help="Path to price data",
+)
+@click.option(
+    "--start-date",
+    type=click.DateTime(),
+    help="Start date for backtest (YYYY-MM-DD)",
+)
+@click.option(
+    "--end-date",
+    type=click.DateTime(),
+    help="End date for backtest (YYYY-MM-DD)",
+)
+@click.option(
+    "--set",
+    "set_overrides",
+    multiple=True,
+    help="Override config values (e.g., --set data.source=numerai)",
+)
+@click.option(
+    "--num-longs",
+    default="10,20,30,40,50",
+    help="Comma-separated list of long positions to test",
+)
+@click.option(
+    "--num-shorts",
+    default="10,20,30,40,50",
+    help="Comma-separated list of short positions to test",
+)
+@click.option(
+    "--leverages",
+    default="1.0,2.0,3.0,4.0,5.0",
+    help="Comma-separated list of leverage values to test",
+)
+@click.option(
+    "--rebalance-days",
+    default="8,10,12",
+    help="Comma-separated list of rebalance frequencies to test",
+)
+@click.option(
+    "--metric",
+    type=click.Choice(["sharpe", "cagr", "calmar"]),
+    default="sharpe",
+    help="Optimization metric",
+)
+@click.option(
+    "--max-drawdown",
+    type=float,
+    help="Maximum drawdown constraint (e.g., 0.2 for 20%)",
+)
+@click.option(
+    "--fee-bps",
+    type=float,
+    default=2.5,
+    help="Trading fee in basis points",
+)
+@click.option(
+    "--slippage-bps",
+    type=float,
+    default=5.0,
+    help="Slippage cost in basis points",
+)
+@click.option(
+    "--prediction-lag",
+    type=int,
+    default=1,
+    help="Days between prediction date and trading date (default: 1, use higher values to avoid look-ahead bias)",
+)
+@click.option(
+    "--top-n",
+    type=int,
+    default=20,
+    help="Show top N results",
+)
+@click.option(
+    "--apply-best",
+    is_flag=True,
+    help="Run full analysis with best parameters",
+)
+@click.option(
+    "--save-results",
+    help="Save optimization results to CSV",
+)
+@click.option(
+    "--plot",
+    is_flag=True,
+    help="Show contour plots of results",
+)
+@click.option(
+    "--max-workers",
+    type=int,
+    help="Number of parallel workers (default: auto)",
+)
+@click.option(
+    "--clear-cache",
+    is_flag=True,
+    help="Clear cached optimization results",
+)
+@click.option(
+    "--verbose",
+    is_flag=True,
+    help="Show detailed progress",
+)
+def optimize(
+    prices,
+    start_date,
+    end_date,
+    set_overrides,
+    num_longs,
+    num_shorts,
+    leverages,
+    rebalance_days,
+    metric,
+    max_drawdown,
+    fee_bps,
+    slippage_bps,
+    prediction_lag,
+    top_n,
+    apply_best,
+    save_results,
+    plot,
+    max_workers,
+    clear_cache,
+    verbose,
+):
+    """Optimize backtest parameters using parallel grid search.
+    
+    ⚠️ IMPORTANT DISCLAIMER:
+    Optimization results are based on historical data and are subject to overfitting.
+    Parameters that performed well in the past may not perform well in the future.
+    Always use out-of-sample testing and forward walk analysis. Consider that
+    optimized parameters may be curve-fit to historical noise rather than true patterns.
+    """
+    console = Console()
+
+    # Apply CLI overrides to config (includes smart defaults for data.source changes)
+    overrides_applied = apply_cli_overrides(config, set_overrides)
+
+    # Show applied overrides through console
+    if overrides_applied:
+        console.print("[cyan]Configuration overrides applied:[/cyan]")
+        for override in overrides_applied:
+            console.print(f"  • {override}")
+        console.print()
+
+    # Parse parameter lists
+    num_longs_list = [int(x.strip()) for x in num_longs.split(",")]
+    num_shorts_list = [int(x.strip()) for x in num_shorts.split(",")]
+    leverages_list = [float(x.strip()) for x in leverages.split(",")]
+    rebalance_days_list = [int(x.strip()) for x in rebalance_days.split(",")]
+
+    # Now use the config value (which may have been overridden)
+    predictions = config.data.path
+
+    # Create base config with all parameters
+    base_config = BacktestConfig(
+        prices_path=prices,
+        predictions_path=predictions,
+        pred_date_column=config.data.date_column,
+        pred_id_column=config.data.asset_id_column,
+        pred_value_column=config.data.prediction_column,
+        data_provider=config.data.source,
+        start_date=start_date,
+        end_date=end_date,
+        prediction_lag_days=prediction_lag,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+        verbose=verbose,
+    )
+
+    try:
+        # Calculate total combinations
+        total_combos = (
+            len(num_longs_list)
+            * len(num_shorts_list)
+            * len(leverages_list)
+            * len(rebalance_days_list)
+        )
+
+        # Create optimizer
+        optimizer = BacktestOptimizer(base_config)
+
+        # Clear cache if requested
+        if clear_cache:
+            optimizer.clear_cache()
+            console.print("[yellow]Cache cleared[/yellow]\n")
+
+        # Show optimization header
+        header = create_header_panel(
+            f"OPTIMIZATION :: {total_combos} COMBINATIONS"
+        )
+        console.print(header)
+        console.print(f"\nOptimizing for: [bold yellow]{metric.upper()}[/bold yellow]")
+        if max_drawdown:
+            console.print(
+                f"Max drawdown constraint: [yellow]{max_drawdown:.1%}[/yellow]"
+            )
+        console.print(
+            f"Parameters: L={num_longs_list} S={num_shorts_list} Lev={leverages_list} Days={rebalance_days_list}"
+        )
+
+        if max_workers:
+            console.print(f"Parallel workers: [cyan]{max_workers}[/cyan]")
+        else:
+            import multiprocessing as mp
+
+            auto_workers = min(mp.cpu_count(), 24)
+            console.print(f"Parallel workers: [cyan]{auto_workers}[/cyan] (auto)")
+        console.print()
+
+        # Run optimization with Rich Progress
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TextColumn("•"),
+            TimeElapsedColumn(),
+            TextColumn("•"),
+            TimeRemainingColumn(),
+            console=console,
+            expand=False,
+        ) as progress:
+            # Run parallel optimization
+            results_df = optimizer.grid_search_parallel(
+                num_longs=num_longs_list,
+                num_shorts=num_shorts_list,
+                leverages=leverages_list,
+                rebalance_days=rebalance_days_list,
+                metric=metric,
+                max_drawdown_limit=max_drawdown,
+                max_workers=max_workers,
+                progress_callback=progress,
+            )
+
+        if len(results_df) == 0:
+            console.print("[red]No valid results found[/red]")
+            return
+
+        # Display results
+        console.print()  # Space after progress
+        display_optimization_results(console, results_df, metric, top_n, base_config)
+
+        # Show contour plots if requested
+        if plot:
+            display_optimization_contours(console, results_df, metric)
+
+        # Save results if requested
+        if save_results:
+            results_df.write_csv(save_results)
+            console.print(f"\n[green]✓[/green] Saved results to {save_results}")
+
+        # Apply best parameters if requested
+        if apply_best:
+            best_params = optimizer.get_best_params(results_df, metric)
+            if best_params:
+                console.print(
+                    "\n[bold cyan]Running full analysis with best parameters...[/bold cyan]"
+                )
+                console.print(
+                    f"Best params: L={best_params['num_long']}, S={best_params['num_short']}, "
+                    f"Lev={best_params['target_leverage']:.1f}x, Days={best_params['rebalance_every_n_days']}"
+                )
+
+                # Create config with best params and all other settings
+                best_config = BacktestConfig(
+                    prices_path=prices,
+                    predictions_path=predictions,
+                    pred_date_column=config.data.date_column,
+                    pred_id_column=config.data.asset_id_column,
+                    pred_value_column=config.data.prediction_column,
+                    data_provider=config.data.source,
+                    start_date=start_date,
+                    end_date=end_date,
+                    num_long=best_params["num_long"],
+                    num_short=best_params["num_short"],
+                    target_leverage=best_params["target_leverage"],
+                    rebalance_every_n_days=best_params["rebalance_every_n_days"],
+                    prediction_lag_days=prediction_lag,
+                    fee_bps=fee_bps,
+                    slippage_bps=slippage_bps,
+                    verbose=False,
+                )
+
+                # Run backtest
+                backtester = Backtester(best_config)
+                result = backtester.run()
+
+                display_backtest_summary(console, result, best_config, show_positions=False)
+
+    except Exception as e:
+        from rich.markup import escape
+
+        console.print(f"[red]✗ Optimization failed: {escape(str(e))}[/red]")
+        if verbose:
+            import traceback
+
+            traceback.print_exc()
 
 
 @cli.command()
@@ -725,6 +1166,7 @@ def run_live_cli(
     # converts seconds per refresh to Live's refresh-per-second value
     live_rps = 1.0 / refresh_seconds if refresh_seconds > 0 else 1.0
     from rich.spinner import Spinner
+    from rich.live import Live
 
     spinner = Spinner("dots", text="Loading...")
     with Live(

@@ -47,6 +47,7 @@ nav:
           - Configuration: configuration.md
           - Autopilot & Scheduling: autopilot.md
           - Headless & Custom Callbacks: headless.md
+          - Backtesting & Optimization: backtesting.md
       - More:
           - Troubleshooting: troubleshooting.md
           - Security & Disclaimer: security.md

@@ -11,5 +11,14 @@ Users must comply with all Hyperliquid terms of service.
 from .config import Config
 from .data_loader import DataLoader
 from .trader import CCLiquid
+from .backtester import Backtester, BacktestConfig, BacktestResult, BacktestOptimizer
 
-__all__ = ["Config", "DataLoader", "CCLiquid"]
+__all__ = [
+    "Config",
+    "DataLoader",
+    "CCLiquid",
+    "Backtester",
+    "BacktestConfig",
+    "BacktestResult",
+    "BacktestOptimizer",
+]
