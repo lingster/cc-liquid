@@ -145,4 +145,3 @@ def test_backtest_optimizer_run_single_backtest(tmp_path):
     assert result["rebalance_days"] == 1
     assert result["final_equity"] == pytest.approx(121.0)
     assert result["sharpe"] >= 0
-

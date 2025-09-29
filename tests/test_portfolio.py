@@ -63,4 +63,3 @@ def test_weights_from_ranks_skips_assets_without_scores():
     assert "AAA" in weights
     assert "BBB" not in weights
     assert sum(abs(w) for w in weights.values()) == pytest.approx(1.0)
-

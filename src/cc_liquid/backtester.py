@@ -274,9 +274,9 @@ class Backtester:
         )
 
         # Pivot to wide format
-        returns_wide = prices_long.pivot(
-            index="date", on="id", values="return"
-        ).sort("date")
+        returns_wide = prices_long.pivot(index="date", on="id", values="return").sort(
+            "date"
+        )
 
         if self.config.verbose:
             n_assets = len(returns_wide.columns) - 1  # Exclude date column

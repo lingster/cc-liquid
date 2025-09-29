@@ -458,7 +458,9 @@ class CCLiquid:
             power=self.config.portfolio.rank_power,
         )
 
-        target_positions = {asset: weight * account_value for asset, weight in weights.items()}
+        target_positions = {
+            asset: weight * account_value for asset, weight in weights.items()
+        }
 
         # Warn if resulting notionals fall below exchange minimums
         min_notional = self.config.execution.min_trade_value

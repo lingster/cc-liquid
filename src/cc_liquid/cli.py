@@ -68,8 +68,6 @@ def init_cmd(non_interactive: bool):
     """
     console = Console()
     from rich.prompt import Prompt, Confirm
-    from rich.panel import Panel
-    from rich.text import Text
 
     # Check existing files
     cfg_path = "cc-liquid-config.yaml"
@@ -664,7 +662,7 @@ def analyze(
     verbose,
 ):
     """Run backtest analysis on historical data.
-    
+
     ⚠️ IMPORTANT DISCLAIMER:
     Past performance does not guarantee future results. Backtesting results are
     hypothetical and have inherent limitations. Actual trading results may differ
@@ -723,7 +721,9 @@ def analyze(
             backtester = Backtester(bt_config)
             result = backtester.run()
 
-        display_backtest_summary(console, result, bt_config, show_positions=show_positions)
+        display_backtest_summary(
+            console, result, bt_config, show_positions=show_positions
+        )
 
         # Save daily results if requested
         if save_daily:
@@ -869,7 +869,7 @@ def optimize(
     verbose,
 ):
     """Optimize backtest parameters using parallel grid search.
-    
+
     ⚠️ IMPORTANT DISCLAIMER:
     Optimization results are based on historical data and are subject to overfitting.
     Parameters that performed well in the past may not perform well in the future.
@@ -933,9 +933,7 @@ def optimize(
             console.print("[yellow]Cache cleared[/yellow]\n")
 
         # Show optimization header
-        header = create_header_panel(
-            f"OPTIMIZATION :: {total_combos} COMBINATIONS"
-        )
+        header = create_header_panel(f"OPTIMIZATION :: {total_combos} COMBINATIONS")
         console.print(header)
         console.print(f"\nOptimizing for: [bold yellow]{metric.upper()}[/bold yellow]")
         if max_drawdown:
@@ -1034,7 +1032,9 @@ def optimize(
                 backtester = Backtester(best_config)
                 result = backtester.run()
 
-                display_backtest_summary(console, result, best_config, show_positions=False)
+                display_backtest_summary(
+                    console, result, best_config, show_positions=False
+                )
 
     except Exception as e:
         from rich.markup import escape

@@ -64,7 +64,9 @@ def weights_from_ranks(
             p = max(1e-6, float(power))
             raw = [((n - idx) / n) ** p for idx in range(n)]
         else:
-            raise ValueError(f"Invalid weighting scheme: {scheme}. Must be 'equal' or 'rank_power'")
+            raise ValueError(
+                f"Invalid weighting scheme: {scheme}. Must be 'equal' or 'rank_power'"
+            )
 
         denom = sum(raw) or 1.0
         scale = gross / denom
@@ -75,4 +77,3 @@ def weights_from_ranks(
     weights_short = _side(short_assets, gross_short, -1.0)
 
     return {**weights_long, **weights_short}
-

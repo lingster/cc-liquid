@@ -499,7 +499,12 @@ def create_config_tree_table(config_dict: dict) -> Table:
         ("├─ Long Positions", f"[green]{portfolio_config.get('num_long', 10)}[/green]"),
         ("├─ Short Positions", f"[red]{portfolio_config.get('num_short', 10)}[/red]"),
         ("├─ Target Leverage", f"[{leverage_color}]{leverage:.1f}x[/{leverage_color}]"),
-        ("├─ Weighting", f"{weighting_scheme} ({rank_power})" if weighting_scheme == "rank_power" else ""),
+        (
+            "├─ Weighting",
+            f"{weighting_scheme} ({rank_power})"
+            if weighting_scheme == "rank_power"
+            else "",
+        ),
         ("└─ Rebalancing", ""),
         ("   ├─ Frequency", f"Every {rebalancing.get('every_n_days', 10)} days"),
         ("   └─ Time (UTC)", rebalancing.get("at_time", "18:15")),
@@ -1002,29 +1007,31 @@ def display_execution_summary(
         console.print(Panel("[dim]No trades executed[/dim]", box=box.HEAVY))
 
 
-def display_backtest_summary(console: Console, result, config=None, show_positions=False):
+def display_backtest_summary(
+    console: Console, result, config=None, show_positions=False
+):
     """Display comprehensive backtest results in a cleaner sequential layout
-    
+
     Args:
         console: Rich console for output
         result: BacktestResult with daily data and stats
         config: Optional BacktestConfig to display
         show_positions: Whether to show the detailed position analysis table
     """
-    
+
     # 0. Disclaimer warning
     disclaimer = Panel(
         Text.from_markup(
             "[yellow]\n Past performance does not guarantee future results. "
             "These results are hypothetical and subject to limitations.[/yellow]\n",
-            justify="center"
+            justify="center",
         ),
         title="[bold yellow] BACKTEST DISCLAIMER [/bold yellow]",
         box=box.HEAVY,
         border_style="yellow",
     )
     console.print(disclaimer)
-    
+
     # 1. Header
     header = Panel(
         Text(
@@ -1036,13 +1043,17 @@ def display_backtest_summary(console: Console, result, config=None, show_positio
         style="cyan",
     )
     console.print(header)
-    
+
     # 2-3. Metrics + Charts stacked on the left, Config as a persistent right sidebar
     metrics_panel = create_backtest_metrics_panel(result.stats)
 
     if len(result.daily) > 0:
-        equity_panel = create_linechart_panel(result.daily, "equity", "cyan", "Equity ($)")
-        drawdown_panel = create_linechart_panel(result.daily, "drawdown", "red", "Drawdown (%)")
+        equity_panel = create_linechart_panel(
+            result.daily, "equity", "cyan", "Equity ($)"
+        )
+        drawdown_panel = create_linechart_panel(
+            result.daily, "drawdown", "red", "Drawdown (%)"
+        )
         dist_panel = create_backtest_distributions(result.daily)
     else:
         equity_panel = Panel("[dim]No data[/dim]", box=box.HEAVY)
@@ -1054,8 +1065,7 @@ def display_backtest_summary(console: Console, result, config=None, show_positio
 
     summary_layout = Layout()
     summary_layout.split_row(
-        Layout(name="main", ratio=3),
-        Layout(name="config", ratio=1)
+        Layout(name="main", ratio=3), Layout(name="config", ratio=1)
     )
 
     summary_layout["main"].update(left_group)
@@ -1070,10 +1080,12 @@ def display_backtest_summary(console: Console, result, config=None, show_positio
     )
 
     console.print(summary_layout)
-    
+
     # 4. Positions table (full width) - only if flag is set
     if show_positions and len(result.rebalance_positions) > 0:
-        positions_table = create_enhanced_positions_table(result.rebalance_positions, result.daily)
+        positions_table = create_enhanced_positions_table(
+            result.rebalance_positions, result.daily
+        )
         console.print(positions_table)
 
 
@@ -1085,7 +1097,9 @@ def create_backtest_config_panel(config) -> Panel:
 
     # Environment/date range
     if config.start_date or config.end_date:
-        start_str = config.start_date.strftime("%Y-%m-%d") if config.start_date else "start"
+        start_str = (
+            config.start_date.strftime("%Y-%m-%d") if config.start_date else "start"
+        )
         end_str = config.end_date.strftime("%Y-%m-%d") if config.end_date else "end"
         tree.add_row("[bold]RANGE[/bold]", "")
         tree.add_row("├─ From", start_str)
@@ -1094,14 +1108,19 @@ def create_backtest_config_panel(config) -> Panel:
 
     # Portfolio
     leverage_color = (
-        "green" if config.target_leverage <= 2
-        else "yellow" if config.target_leverage <= 3
+        "green"
+        if config.target_leverage <= 2
+        else "yellow"
+        if config.target_leverage <= 3
         else "red"
     )
     tree.add_row("[bold]PORTFOLIO[/bold]", "")
     tree.add_row("├─ Long", f"[green]{config.num_long}[/green]")
     tree.add_row("├─ Short", f"[red]{config.num_short}[/red]")
-    tree.add_row("├─ Leverage", f"[{leverage_color}]{config.target_leverage:.1f}x[/{leverage_color}]")
+    tree.add_row(
+        "├─ Leverage",
+        f"[{leverage_color}]{config.target_leverage:.1f}x[/{leverage_color}]",
+    )
     tree.add_row("└─ Rebalance", f"{config.rebalance_every_n_days}d")
     tree.add_row("", "")
 
@@ -1119,7 +1138,11 @@ def create_backtest_config_panel(config) -> Panel:
     )
     provider = getattr(config, "data_provider", None)
     provider_color = (
-        "green" if provider == "crowdcent" else "yellow" if provider == "numerai" else "white"
+        "green"
+        if provider == "crowdcent"
+        else "yellow"
+        if provider == "numerai"
+        else "white"
     )
     tree.add_row("[bold]DATA[/bold]", "")
     if provider:
@@ -1295,31 +1318,47 @@ def create_enhanced_positions_table(positions_df, daily_df) -> Panel:
     # Get unique dates for counting
     unique_dates = positions_df["date"].unique().sort()
     total_periods = len(unique_dates)
-    
+
     # Get last rebalance date
     latest_date = positions_df["date"].max()
-    
+
     # Calculate statistics for each asset
     position_stats = (
-        positions_df
-        .group_by("id")
-        .agg([
-            # Count how many times this asset was held
-            pl.col("weight").filter(pl.col("weight") != 0).count().alias("times_held"),
-            # Average weight when held (non-zero)
-            pl.col("weight").filter(pl.col("weight") != 0).mean().alias("avg_weight"),
-            # Count longs vs shorts
-            pl.col("weight").filter(pl.col("weight") > 0).count().alias("times_long"),
-            pl.col("weight").filter(pl.col("weight") < 0).count().alias("times_short"),
-            # First and last appearance
-            pl.col("date").min().alias("first_date"),
-            pl.col("date").max().alias("last_date"),
-            # Current weight (from latest date)
-            pl.col("weight").filter(pl.col("date") == latest_date).first().alias("current_weight"),
-        ])
+        positions_df.group_by("id")
+        .agg(
+            [
+                # Count how many times this asset was held
+                pl.col("weight")
+                .filter(pl.col("weight") != 0)
+                .count()
+                .alias("times_held"),
+                # Average weight when held (non-zero)
+                pl.col("weight")
+                .filter(pl.col("weight") != 0)
+                .mean()
+                .alias("avg_weight"),
+                # Count longs vs shorts
+                pl.col("weight")
+                .filter(pl.col("weight") > 0)
+                .count()
+                .alias("times_long"),
+                pl.col("weight")
+                .filter(pl.col("weight") < 0)
+                .count()
+                .alias("times_short"),
+                # First and last appearance
+                pl.col("date").min().alias("first_date"),
+                pl.col("date").max().alias("last_date"),
+                # Current weight (from latest date)
+                pl.col("weight")
+                .filter(pl.col("date") == latest_date)
+                .first()
+                .alias("current_weight"),
+            ]
+        )
         .filter(pl.col("times_held") > 0)  # Only include assets that were held
     )
-    
+
     # Add a column for predominant side
     position_stats = position_stats.with_columns(
         pl.when(pl.col("times_long") > pl.col("times_short"))
@@ -1329,17 +1368,17 @@ def create_enhanced_positions_table(positions_df, daily_df) -> Panel:
         .otherwise(pl.lit("MIXED"))
         .alias("predominant_side")
     )
-    
+
     # Sort by times held (frequency) and then by absolute average weight
     position_stats = position_stats.sort(
         [
             pl.col("times_held").is_not_null(),  # Non-null first
             pl.col("times_held"),
-            pl.col("avg_weight").abs()
+            pl.col("avg_weight").abs(),
         ],
-        descending=[True, True, True]
+        descending=[True, True, True],
     )
-    
+
     # Create the table
     table = Table(
         box=box.HEAVY_HEAD,
@@ -1347,7 +1386,7 @@ def create_enhanced_positions_table(positions_df, daily_df) -> Panel:
         header_style="bold cyan on #001926",
         expand=True,
     )
-    
+
     # Define columns
     table.add_column("COIN", style="cyan", width=8)
     table.add_column("SIDE", justify="center", width=8)
@@ -1357,7 +1396,7 @@ def create_enhanced_positions_table(positions_df, daily_df) -> Panel:
     table.add_column("FIRST HELD", justify="center", width=12)
     table.add_column("LAST HELD", justify="center", width=12)
     table.add_column("CONSISTENCY", justify="center", width=12)
-    
+
     # Add rows
     for row in position_stats.iter_rows(named=True):
         coin = row["id"]
@@ -1367,7 +1406,7 @@ def create_enhanced_positions_table(positions_df, daily_df) -> Panel:
         current_weight = row["current_weight"] or 0
         first_date = row["first_date"]
         last_date = row["last_date"]
-        
+
         # Determine side color
         if side == "LONG":
             side_style = "green"
@@ -1375,29 +1414,35 @@ def create_enhanced_positions_table(positions_df, daily_df) -> Panel:
             side_style = "red"
         else:
             side_style = "yellow"
-        
+
         # Format frequency as fraction and percentage
         freq_pct = (times_held / total_periods * 100) if total_periods > 0 else 0
         freq_str = f"{times_held}/{total_periods} ({freq_pct:.0f}%)"
-        
+
         # Format average weight
         avg_weight_str = f"[{'green' if avg_weight > 0 else 'red'}]{abs(avg_weight):.1%}[/{'green' if avg_weight > 0 else 'red'}]"
-        
+
         # Format current weight
         if current_weight == 0:
             current_str = "[dim]-[/dim]"
         else:
             current_str = f"[{'green' if current_weight > 0 else 'red'}]{abs(current_weight):.1%}[/{'green' if current_weight > 0 else 'red'}]"
-        
+
         # Format dates
         first_str = first_date.strftime("%Y-%m-%d") if first_date else "-"
         last_str = last_date.strftime("%Y-%m-%d") if last_date else "-"
-        
+
         # Consistency indicator (visual bar)
-        consistency_bar = create_data_bar(freq_pct, 100, width=8, filled_char="▓", empty_char="░")
-        consistency_color = "green" if freq_pct >= 75 else "yellow" if freq_pct >= 50 else "dim"
-        consistency_str = f"[{consistency_color}]{consistency_bar}[/{consistency_color}]"
-        
+        consistency_bar = create_data_bar(
+            freq_pct, 100, width=8, filled_char="▓", empty_char="░"
+        )
+        consistency_color = (
+            "green" if freq_pct >= 75 else "yellow" if freq_pct >= 50 else "dim"
+        )
+        consistency_str = (
+            f"[{consistency_color}]{consistency_bar}[/{consistency_color}]"
+        )
+
         table.add_row(
             f"[bold]{coin}[/bold]",
             f"[{side_style}]{side}[/{side_style}]",
@@ -1408,12 +1453,12 @@ def create_enhanced_positions_table(positions_df, daily_df) -> Panel:
             last_str,
             consistency_str,
         )
-    
+
     # Count current positions
     current_positions = position_stats.filter(pl.col("current_weight") != 0)
     current_longs = len(current_positions.filter(pl.col("current_weight") > 0))
     current_shorts = len(current_positions.filter(pl.col("current_weight") < 0))
-    
+
     # Calculate some summary stats
     total_unique_assets = len(position_stats)
     most_consistent = position_stats.head(1)
@@ -1424,16 +1469,16 @@ def create_enhanced_positions_table(positions_df, daily_df) -> Panel:
         consistency_note = f"Most consistent: {top_asset} ({top_pct:.0f}%)"
     else:
         consistency_note = ""
-    
+
     title = (
         f"[bold cyan]POSITION ANALYSIS[/bold cyan]  [dim]│[/dim]  "
         f"{total_unique_assets} unique assets over {total_periods} periods  [dim]│[/dim]  "
         f"Current: [green]{current_longs}L[/green] [red]{current_shorts}S[/red]"
     )
-    
+
     if consistency_note:
         title += f"  [dim]│[/dim]  {consistency_note}"
-    
+
     return Panel(table, title=title, box=box.HEAVY)
 
 
@@ -1441,20 +1486,20 @@ def display_optimization_results(
     console: Console, results_df, metric: str, top_n: int = 20, config=None
 ):
     """Display optimization results."""
-    
+
     # Disclaimer warning first
     disclaimer = Panel(
         Text.from_markup(
             "[yellow]\n Optimized parameters are based on historical data and may be overfit. "
             "Past optimal parameters may not remain optimal in future market conditions.[/yellow]\n",
-            justify="center"
+            justify="center",
         ),
         title="[bold yellow] OPTIMIZATION DISCLAIMER [/bold yellow]",
         box=box.HEAVY,
         border_style="yellow",
     )
     console.print(disclaimer)
-    
+
     layout = Layout()
     layout.split_column(Layout(name="header", size=3), Layout(name="body"))
 
@@ -1481,7 +1526,9 @@ def display_optimization_results(
 
     # Summary panel with best parameters
     if len(results_df) > 0:
-        summary_panel = create_optimization_summary_panel(results_df.head(1), metric, config)
+        summary_panel = create_optimization_summary_panel(
+            results_df.head(1), metric, config
+        )
         layout["summary"].update(summary_panel)
     else:
         layout["summary"].update(Panel("[dim]No results[/dim]", box=box.HEAVY))
@@ -1491,7 +1538,6 @@ def display_optimization_results(
     sm_panel = create_optimization_small_multiples_panel(results_df)
     if sm_panel is not None:
         console.print(sm_panel)
-
 
 
 def _create_hist_panel(
@@ -1687,31 +1733,37 @@ def create_optimization_summary_panel(best_row_df, metric: str, config=None) -> 
     table.add_row("VOLATILITY", f"{best['volatility']:.1%}")
     table.add_row("", "")
     table.add_row("FINAL EQUITY", format_currency(best["final_equity"]))
-    
+
     # Add data source information if config is provided
     if config:
         table.add_row("", "")
         table.add_row("[bold]DATA[/bold]", "")
         table.add_row("", "")
-        
+
         # Provider
         provider = getattr(config, "data_provider", None)
         if provider:
             provider_color = (
-                "green" if provider == "crowdcent" 
-                else "yellow" if provider == "numerai" 
+                "green"
+                if provider == "crowdcent"
+                else "yellow"
+                if provider == "numerai"
                 else "white"
             )
-            table.add_row("PROVIDER", f"[{provider_color}]{provider}[/{provider_color}]")
-        
+            table.add_row(
+                "PROVIDER", f"[{provider_color}]{provider}[/{provider_color}]"
+            )
+
         # Source file
         source_name = (
             config.predictions_path.split("/")[-1]
             if "/" in config.predictions_path
             else config.predictions_path
         )
-        table.add_row("SOURCE", source_name[:12] + "..." if len(source_name) > 15 else source_name)
-        
+        table.add_row(
+            "SOURCE", source_name[:12] + "..." if len(source_name) > 15 else source_name
+        )
+
         # Prediction column
         table.add_row("PRED COL", str(config.pred_value_column)[:15])
 
