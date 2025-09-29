@@ -72,7 +72,7 @@ def test_dataframe_data_returns_df(sample_dataframe):
     assert_frame_equal(df, sample_dataframe)
 
 
-@patch("cc_liquid.data_loader.ChallengeClient")
+@patch("crowdcent_challenge.ChallengeClient")
 def test_dataloader_from_crowdcent_api_happy_path(mock_challenge_client, tmp_path):
     """Test the CrowdCent API data loading flow with mocking."""
     # Arrange

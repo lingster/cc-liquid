@@ -36,6 +36,8 @@ class PortfolioConfig:
     num_long: int = 10
     num_short: int = 10
     target_leverage: float = 1.0  # Position sizing multiplier (1.0 = no leverage)
+    weighting_scheme: str = "equal"  # "equal" | "rank_power"
+    rank_power: float = 1.5
     rebalancing: RebalancingConfig = field(default_factory=RebalancingConfig)
 
 

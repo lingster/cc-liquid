@@ -463,6 +463,8 @@ def create_config_tree_table(config_dict: dict) -> Table:
     leverage = portfolio_config.get("target_leverage", 1.0)
     leverage_color = "green" if leverage <= 2 else "yellow" if leverage <= 3 else "red"
     rebalancing = portfolio_config.get("rebalancing", {})
+    weighting_scheme = portfolio_config.get("weighting_scheme", "equal")
+    rank_power = portfolio_config.get("rank_power", 1.5)
 
     # Execution section
     execution_config = config_dict.get("execution", {})
@@ -497,6 +499,7 @@ def create_config_tree_table(config_dict: dict) -> Table:
         ("├─ Long Positions", f"[green]{portfolio_config.get('num_long', 10)}[/green]"),
         ("├─ Short Positions", f"[red]{portfolio_config.get('num_short', 10)}[/red]"),
         ("├─ Target Leverage", f"[{leverage_color}]{leverage:.1f}x[/{leverage_color}]"),
+        ("├─ Weighting", f"{weighting_scheme} ({rank_power})" if weighting_scheme == "rank_power" else ""),
         ("└─ Rebalancing", ""),
         ("   ├─ Frequency", f"Every {rebalancing.get('every_n_days', 10)} days"),
         ("   └─ Time (UTC)", rebalancing.get("at_time", "18:15")),

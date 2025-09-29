@@ -22,6 +22,8 @@ from typing import Any, Literal
 
 import polars as pl
 
+from .portfolio import weights_from_ranks
+
 
 @dataclass
 class BacktestConfig:
@@ -52,6 +54,9 @@ class BacktestConfig:
     num_long: int = 10
     num_short: int = 10
     target_leverage: float = 1.0  # Sum of abs(weights), matching trader.py
+    # Weighting (opt-in non-EW)
+    weighting_scheme: Literal["equal", "rank_power"] = "equal"
+    rank_power: float = 1.5
 
     # Rebalancing
     rebalance_every_n_days: int = 10
@@ -270,7 +275,7 @@ class Backtester:
 
         # Pivot to wide format
         returns_wide = prices_long.pivot(
-            index="date", columns="id", values="return"
+            index="date", on="id", values="return"
         ).sort("date")
 
         if self.config.verbose:
@@ -302,10 +307,9 @@ class Backtester:
         predictions: pl.DataFrame,
         cutoff_date: datetime,
         available_assets: set[str],
-    ) -> tuple[list[str], list[str]]:
-        """Select long and short assets based on predictions up to cutoff date."""
+    ) -> tuple[list[str], list[str], pl.DataFrame]:
+        """Select assets and return latest predictions DataFrame for sizing."""
 
-        # Get latest predictions up to cutoff date for available assets
         latest_preds = (
             predictions.filter(pl.col("pred_date") <= cutoff_date)
             .filter(pl.col("id").is_in(available_assets))
@@ -315,13 +319,11 @@ class Backtester:
         )
 
         if len(latest_preds) == 0:
-            return [], []
+            empty = pl.DataFrame({"id": [], "pred": []})
+            return [], [], empty
 
-        # Sort by prediction score
-        latest_preds = latest_preds.sort("pred", descending=True)
-
-        # Select top N for long, bottom N for short
-        all_ids = latest_preds["id"].to_list()
+        latest_sorted = latest_preds.sort("pred", descending=True)
+        all_ids = latest_sorted["id"].to_list()
 
         num_long = min(self.config.num_long, len(all_ids))
         num_short = min(self.config.num_short, len(all_ids) - num_long)
@@ -329,7 +331,7 @@ class Backtester:
         long_assets = all_ids[:num_long]
         short_assets = all_ids[-num_short:] if num_short > 0 else []
 
-        return long_assets, short_assets
+        return long_assets, short_assets, latest_sorted.select(["id", "pred"])
 
     def _simulate(
         self,
@@ -370,23 +372,28 @@ class Backtester:
                         if val is not None and not math.isnan(val):
                             available_assets.add(col)
 
-                # Select assets
-                long_assets, short_assets = self._select_assets(
-                    predictions_long, cutoff_date, available_assets
+                # Determine selections and convert ranks to weights
+                long_assets, short_assets, latest_preds = self._select_assets(
+                    predictions_long,
+                    cutoff_date,
+                    available_assets,
                 )
 
-                # Calculate new weights (equal weight within each group)
-                new_weights = {}
+                new_weights: dict[str, float] = {}
                 total_positions = len(long_assets) + len(short_assets)
 
-                if total_positions > 0:
-                    # Position weight = target_leverage / total_positions
-                    position_weight = self.config.target_leverage / total_positions
-
-                    for asset in long_assets:
-                        new_weights[asset] = position_weight
-                    for asset in short_assets:
-                        new_weights[asset] = -position_weight
+                if total_positions > 0 and len(latest_preds) > 0:
+                    weights = weights_from_ranks(
+                        latest_preds=latest_preds,
+                        id_col="id",
+                        pred_col="pred",
+                        long_assets=long_assets,
+                        short_assets=short_assets,
+                        target_gross=self.config.target_leverage,
+                        scheme=self.config.weighting_scheme,
+                        power=self.config.rank_power,
+                    )
+                    new_weights = weights
 
                 # Calculate turnover (L1 norm of weight changes)
                 turnover = 0.0
@@ -554,6 +561,8 @@ class BacktestOptimizer:
                 "fee_bps": self.base_config.fee_bps,
                 "slippage_bps": self.base_config.slippage_bps,
                 "start_capital": self.base_config.start_capital,
+                "weighting_scheme": self.base_config.weighting_scheme,
+                "rank_power": self.base_config.rank_power,
             },
         }
 
@@ -608,6 +617,8 @@ class BacktestOptimizer:
             slippage_bps=self.base_config.slippage_bps,
             start_capital=self.base_config.start_capital,
             verbose=False,
+            weighting_scheme=self.base_config.weighting_scheme,
+            rank_power=self.base_config.rank_power,
         )
 
         try:

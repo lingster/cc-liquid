@@ -147,6 +147,13 @@ cc-liquid optimize --apply-best
 
 Choose your optimization target based on your goals: **sharpe** for best risk-adjusted returns (default), **cagr** for maximum absolute returns, or **calmar** for best returns relative to drawdown.
 
+!!! note "Weighting Schemes in Optimization"
+    The optimizer respects your configured `weighting_scheme` and `rank_power` settings. To optimize with different weighting:
+    ```bash
+    cc-liquid optimize --set portfolio.weighting_scheme=rank_power --set portfolio.rank_power=1.5
+    ```
+    See [Portfolio Weighting](portfolio-weighting.md) for details on concentration effects.
+
 ### Parallel execution
 
 The optimizer uses multiprocessing to test parameter combinations in parallel. It automatically detects CPU cores (capped at 24), caches results to speed up repeated runs, and shows real-time progress with best parameters found.

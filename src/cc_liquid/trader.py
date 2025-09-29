@@ -19,6 +19,7 @@ from hyperliquid.info import Info
 from .callbacks import CCLiquidCallbacks, NoOpCallbacks
 from .config import Config
 from .data_loader import DataLoader
+from .portfolio import weights_from_ranks
 
 logging.basicConfig(level=logging.INFO)
 
@@ -404,48 +405,73 @@ class CCLiquid:
         }
 
     def _get_target_positions(self, predictions: pl.DataFrame) -> dict[str, float]:
-        """Calculates the target notional value for each position using equal weighting."""
+        """Calculate target notionals using configurable weighting scheme."""
+
         latest_predictions = self._get_latest_predictions(predictions)
-        long_assets = self._select_assets(latest_predictions, descending=True)
-        short_assets = self._select_assets(latest_predictions, descending=False)
+        tradeable_predictions = self._filter_tradeable_predictions(latest_predictions)
+
+        if tradeable_predictions.height == 0:
+            return {}
+
+        id_col = self.config.data.asset_id_column
+        pred_col = self.config.data.prediction_column
+
+        sorted_preds = tradeable_predictions.sort(pred_col, descending=True)
+
+        num_long = self.config.portfolio.num_long
+        num_short = self.config.portfolio.num_short
+
+        if sorted_preds.height < num_long + num_short:
+            self.callbacks.warn(
+                f"Limited tradeable assets: {sorted_preds.height} available; "
+                f"requested {num_long} longs and {num_short} shorts"
+            )
+
+        long_assets = sorted_preds.head(num_long)[id_col].to_list()
+        short_assets = (
+            sorted_preds.sort(pred_col, descending=False)
+            .head(num_short)[id_col]
+            .to_list()
+            if num_short > 0
+            else []
+        )
 
         account_value = self.get_account_value()
-        total_positions = (
-            self.config.portfolio.num_long + self.config.portfolio.num_short
-        )
-
-        # When using leverage, we can allocate more notional value per position
-        # This effectively creates leveraged positions by sizing them larger than account equity
         target_leverage = self.config.portfolio.target_leverage
-        position_value = (account_value * target_leverage) / total_positions
+        total_positions = len(long_assets) + len(short_assets)
 
-        # Log the calculation for transparency
+        if total_positions == 0 or account_value <= 0 or target_leverage <= 0:
+            return {}
+
         self.callbacks.info(
-            f"Position sizing: ${account_value:.2f} × {target_leverage}x leverage "
-            f"÷ {total_positions} positions = ${position_value:.2f} per position"
+            f"Target gross leverage: {target_leverage:.2f}x across {total_positions} positions"
         )
 
-        # Warn if position sizes will be too small
-        min_position_value = self.config.execution.min_trade_value
-        if position_value < min_position_value:
-            msg = "Warning: Position size too small!\n"
-            msg += f"   Account value: ${account_value:.2f}\n"
-            if target_leverage > 1.0:
-                msg += f"   With {target_leverage}x leverage: ${account_value * target_leverage:.2f} total exposure\n"
-            msg += f"   Divided by {total_positions} positions = ${position_value:.2f} per position\n"
-            msg += f"   Minimum required: ${min_position_value}\n\n"
-            msg += "   Solutions:\n"
-            msg += f"   • Reduce positions (currently {self.config.portfolio.num_long} long + {self.config.portfolio.num_short} short)\n"
-            msg += "   • Increase account value\n"
-            if target_leverage < 5.0:
-                msg += f"   • Increase leverage (currently {target_leverage}x)\n"
-            self.callbacks.warn(msg)
+        weights = weights_from_ranks(
+            latest_preds=tradeable_predictions.select([id_col, pred_col]),
+            id_col=id_col,
+            pred_col=pred_col,
+            long_assets=long_assets,
+            short_assets=short_assets,
+            target_gross=target_leverage,
+            scheme=self.config.portfolio.weighting_scheme,
+            power=self.config.portfolio.rank_power,
+        )
 
-        target_positions = {}
-        for asset in long_assets:
-            target_positions[asset] = position_value
-        for asset in short_assets:
-            target_positions[asset] = -position_value
+        target_positions = {asset: weight * account_value for asset, weight in weights.items()}
+
+        # Warn if resulting notionals fall below exchange minimums
+        min_notional = self.config.execution.min_trade_value
+        undersized = [
+            asset
+            for asset, weight in target_positions.items()
+            if abs(weight) < min_notional
+        ]
+        if undersized:
+            self.callbacks.warn(
+                "Some target positions fall below minimum notional: "
+                + ", ".join(sorted(undersized))
+            )
 
         return target_positions
 
@@ -457,22 +483,19 @@ class CCLiquid:
             .first()
         )
 
-    def _select_assets(self, predictions: pl.DataFrame, descending: bool) -> list[str]:
-        """Selects top or bottom N assets based on prediction score,
-        filtered to only assets currently listed on Hyperliquid."""
+    def _filter_tradeable_predictions(self, predictions: pl.DataFrame) -> pl.DataFrame:
+        """Filter predictions to Hyperliquid-listed assets."""
 
-        # Use listed assets from /info meta
         universe = self.info.meta()["universe"]
         available_assets = {
             p["name"] for p in universe if not p.get("isDelisted", False)
         }
 
-        # Filter predictions to only tradeable assets
-        tradeable_predictions = predictions.filter(
+        tradeable = predictions.filter(
             pl.col(self.config.data.asset_id_column).is_in(available_assets)
         )
 
-        if tradeable_predictions.height == 0:
+        if tradeable.height == 0:
             self.logger.warning("No predictions match Hyperliquid tradeable assets!")
             self.callbacks.error(
                 "Error: No predictions match Hyperliquid tradeable assets!"
@@ -486,33 +509,8 @@ class CCLiquid:
             self.callbacks.info(
                 f"In predictions: {sorted(prediction_assets[:10])}{'...' if len(prediction_assets) > 10 else ''}"
             )
-            return []
 
-        # Select from filtered set
-        num_assets = (
-            self.config.portfolio.num_long
-            if descending
-            else self.config.portfolio.num_short
-        )
-
-        # Warn if we don't have enough tradeable assets
-        if tradeable_predictions.height < num_assets:
-            self.callbacks.warn(
-                f"Warning: Only {tradeable_predictions.height} tradeable assets available, requested {num_assets}"
-            )
-            self.callbacks.info(
-                f"Will use all {tradeable_predictions.height} available assets"
-            )
-
-        selected = (
-            tradeable_predictions.sort(
-                self.config.data.prediction_column, descending=descending
-            )
-            .head(num_assets)[self.config.data.asset_id_column]
-            .to_list()
-        )
-
-        return selected
+        return tradeable
 
     def _calculate_trades(
         self,

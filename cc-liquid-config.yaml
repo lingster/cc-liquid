@@ -15,6 +15,8 @@ portfolio:
   num_long: 60
   num_short: 50
   target_leverage: 4
+  weighting_scheme: rank_power
+  rank_power: 0.5
   rebalancing:
     every_n_days: 10
     at_time: '18:05'

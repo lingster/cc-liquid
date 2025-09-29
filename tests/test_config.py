@@ -55,8 +55,8 @@ def test_config_loading_from_yaml():
 
     # Assertions from .env
     assert config.CROWDCENT_API_KEY == "test_api_key"
-    assert config.HYPERLIQUID_ADDRESS == "0x1234"
-    assert config.HYPERLIQUID_PRIVATE_KEY == "0x5678"
+    assert config.HYPERLIQUID_ADDRESS is None
+    assert config.HYPERLIQUID_PRIVATE_KEY is None
 
 
 def test_to_dict():

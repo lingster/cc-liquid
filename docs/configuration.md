@@ -123,6 +123,8 @@ Column rules:
 
 - `num_long` / `num_short`: counts for top/bottom selections
 - `target_leverage`: scales notional per-position like `(account_value * target_leverage) / (num_long + num_short)`.
+- `weighting_scheme`: position sizing method (`equal`, `rank_power`) - see [Portfolio Weighting](portfolio-weighting.md)
+- `rank_power`: concentration parameter when using `rank_power` scheme (default: 1.5)
 - `rebalancing.every_n_days` / `rebalancing.at_time` (UTC)
 
 ## Execution
