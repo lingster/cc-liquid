@@ -795,9 +795,21 @@ class CCLiquid:
                     slippage=self.config.execution.slippage_tolerance,
                 )
 
-                statuses = (
-                    result.get("response", {}).get("data", {}).get("statuses", [])
-                )
+                # Handle error responses
+                if result.get("status") == "err":
+                    error_msg = result.get("response", "Unknown error")
+                    self.callbacks.on_trade_fail(trade, error_msg)
+                    failed_trades.append(trade)
+                    continue
+
+                # Handle success responses
+                response = result.get("response", {})
+                if not isinstance(response, dict):
+                    self.callbacks.on_trade_fail(trade, f"Unexpected response format: {response}")
+                    failed_trades.append(trade)
+                    continue
+
+                statuses = response.get("data", {}).get("statuses", [])
 
                 # Check for filled orders
                 filled_data = None
