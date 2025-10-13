@@ -149,12 +149,15 @@ cc-liquid optimize --apply-best
 
 Choose your optimization target based on your goals: **sharpe** for best risk-adjusted returns (default), **cagr** for maximum absolute returns, or **calmar** for best returns relative to drawdown.
 
-!!! note "Weighting Schemes in Optimization"
-    The optimizer respects your configured `weighting_scheme` and `rank_power` settings. To optimize with different weighting:
-    ```bash
-    cc-liquid optimize --set portfolio.weighting_scheme=rank_power --set portfolio.rank_power=1.5
-    ```
-    See [Portfolio Weighting](portfolio-weighting.md) for details on concentration effects.
+!!! note "Position Weighting in Optimization"
+    The optimizer tests different position weighting concentrations using `--rank-powers`. All optimizations use the `rank_power` scheme where:
+    
+    - `0.0` = equal weighting (all positions same size)
+    - `0.5-1.0` = mild concentration in top-ranked positions
+    - `1.5-2.0` = moderate concentration
+    - `2.0+` = heavy concentration
+    
+    This replaces the need for a separate `weighting_scheme` parameter. See [Portfolio Weighting](portfolio-weighting.md) for visual explanations of concentration effects.
 
 ### Parallel execution
 
