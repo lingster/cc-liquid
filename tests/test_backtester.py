@@ -134,7 +134,7 @@ def test_backtest_optimizer_run_single_backtest(tmp_path):
     optimizer = BacktestOptimizer(base_config)
     optimizer._cache_file = str(tmp_path / "cache.json")
 
-    params = {"num_long": 1, "num_short": 0, "leverage": 1.0, "rebalance_days": 1}
+    params = {"num_long": 1, "num_short": 0, "leverage": 1.0, "rebalance_days": 1, "rank_power": 0.0}
 
     result = optimizer._run_single_backtest(params)
 
@@ -143,5 +143,6 @@ def test_backtest_optimizer_run_single_backtest(tmp_path):
     assert result["num_short"] == 0
     assert result["leverage"] == 1.0
     assert result["rebalance_days"] == 1
+    assert result["rank_power"] == 0.0  # 0.0 = equal weight
     assert result["final_equity"] == pytest.approx(121.0)
     assert result["sharpe"] >= 0

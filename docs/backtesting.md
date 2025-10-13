@@ -78,8 +78,8 @@ cc-liquid analyze --show-positions --save-daily results.csv
 | `--start-date` | Auto | Backtest start date (YYYY-MM-DD) |
 | `--end-date` | Auto | Backtest end date (YYYY-MM-DD) |
 | `--set` | None | Override config values (e.g., `--set portfolio.num_long=15`) |
-| `--fee-bps` | 2.5 | Trading fees in basis points |
-| `--slippage-bps` | 5.0 | Slippage costs in basis points |
+| `--fee-bps` | 4.0 | Trading fees in basis points |
+| `--slippage-bps` | 50.0 | Slippage costs in basis points |
 | `--show-positions` | False | Show detailed position data |
 | `--save-daily` | None | Save daily returns to CSV |
 | `--verbose` | False | Show detailed progress |
@@ -111,7 +111,8 @@ cc-liquid optimize \
   --num-longs "10,20,30" \
   --num-shorts "0,5,10" \
   --leverages "1.0,2.0,3.0" \
-  --rebalance-days "7,14,21"
+  --rebalance-days "7,14,21" \
+  --rank-powers "0.0,0.5,1.0,1.5,2.0"
 
 # Optimize for specific metric
 cc-liquid optimize --metric calmar
@@ -129,10 +130,11 @@ cc-liquid optimize --apply-best
 |-----------|---------|-------------|
 | `--prices` | `raw_data.parquet` | Path to historical price data |
 | `--set` | None | Override config values (e.g., `--set data.source=numerai`) |
-| `--num-longs` | "5,10,15,20" | Long positions to test |
-| `--num-shorts` | "5,10,15,20" | Short positions to test |
-| `--leverages` | "1.0,1.5,2.0" | Leverage levels to test |
-| `--rebalance-days` | "5,10,15" | Rebalance frequencies to test |
+| `--num-longs` | "10,20,30,40,50" | Long positions to test |
+| `--num-shorts` | "10,20,30,40,50" | Short positions to test |
+| `--leverages` | "1.0,2.0,3.0,4.0,5.0" | Leverage levels to test |
+| `--rebalance-days` | "8,10,12" | Rebalance frequencies to test |
+| `--rank-powers` | "0.0,0.5,1.0,1.5,2.0" | Rank power values to test (0=equal weight) |
 | `--metric` | sharpe | Optimization target: sharpe, cagr, calmar |
 | `--max-drawdown` | None | Maximum drawdown constraint |
 | `--top-n` | 20 | Show top N results |

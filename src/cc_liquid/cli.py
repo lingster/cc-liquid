@@ -620,13 +620,13 @@ def rebalance(skip_confirm, set_overrides):
 @click.option(
     "--fee-bps",
     type=float,
-    default=2.5,
+    default=4.0,
     help="Trading fee in basis points",
 )
 @click.option(
     "--slippage-bps",
     type=float,
-    default=5.0,
+    default=50.0,
     help="Slippage cost in basis points",
 )
 @click.option(
@@ -783,6 +783,11 @@ def analyze(
     help="Comma-separated list of rebalance frequencies to test",
 )
 @click.option(
+    "--rank-powers",
+    default="0.0,0.5,1.0,1.5,2.0",
+    help="Comma-separated list of rank power values to test (0=equal weight)",
+)
+@click.option(
     "--metric",
     type=click.Choice(["sharpe", "cagr", "calmar"]),
     default="sharpe",
@@ -796,13 +801,13 @@ def analyze(
 @click.option(
     "--fee-bps",
     type=float,
-    default=2.5,
+    default=4.0,
     help="Trading fee in basis points",
 )
 @click.option(
     "--slippage-bps",
     type=float,
-    default=5.0,
+    default=50.0,
     help="Slippage cost in basis points",
 )
 @click.option(
@@ -855,6 +860,7 @@ def optimize(
     num_shorts,
     leverages,
     rebalance_days,
+    rank_powers,
     metric,
     max_drawdown,
     fee_bps,
@@ -893,6 +899,7 @@ def optimize(
     num_shorts_list = [int(x.strip()) for x in num_shorts.split(",")]
     leverages_list = [float(x.strip()) for x in leverages.split(",")]
     rebalance_days_list = [int(x.strip()) for x in rebalance_days.split(",")]
+    rank_powers_list = [float(x.strip()) for x in rank_powers.split(",")]
 
     # Now use the config value (which may have been overridden)
     predictions = config.data.path
@@ -941,7 +948,7 @@ def optimize(
                 f"Max drawdown constraint: [yellow]{max_drawdown:.1%}[/yellow]"
             )
         console.print(
-            f"Parameters: L={num_longs_list} S={num_shorts_list} Lev={leverages_list} Days={rebalance_days_list}"
+            f"Parameters: L={num_longs_list} S={num_shorts_list} Lev={leverages_list} Days={rebalance_days_list} Power={rank_powers_list}"
         )
 
         if max_workers:
@@ -971,6 +978,7 @@ def optimize(
                 num_shorts=num_shorts_list,
                 leverages=leverages_list,
                 rebalance_days=rebalance_days_list,
+                rank_powers=rank_powers_list,
                 metric=metric,
                 max_drawdown_limit=max_drawdown,
                 max_workers=max_workers,
@@ -1003,7 +1011,8 @@ def optimize(
                 )
                 console.print(
                     f"Best params: L={best_params['num_long']}, S={best_params['num_short']}, "
-                    f"Lev={best_params['target_leverage']:.1f}x, Days={best_params['rebalance_every_n_days']}"
+                    f"Lev={best_params['target_leverage']:.1f}x, Days={best_params['rebalance_every_n_days']}, "
+                    f"Power={best_params['rank_power']}"
                 )
 
                 # Create config with best params and all other settings
@@ -1020,8 +1029,8 @@ def optimize(
                     num_short=best_params["num_short"],
                     target_leverage=best_params["target_leverage"],
                     rebalance_every_n_days=best_params["rebalance_every_n_days"],
-                    weighting_scheme=config.portfolio.weighting_scheme,
-                    rank_power=config.portfolio.rank_power,
+                    weighting_scheme="rank_power",  # Always use rank_power (power=0 is equal weight)
+                    rank_power=best_params["rank_power"],
                     prediction_lag_days=prediction_lag,
                     fee_bps=fee_bps,
                     slippage_bps=slippage_bps,

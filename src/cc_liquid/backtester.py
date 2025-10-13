@@ -51,20 +51,20 @@ class BacktestConfig:
     end_date: datetime | None = None
 
     # Strategy parameters (match PortfolioConfig)
-    num_long: int = 10
-    num_short: int = 10
-    target_leverage: float = 1.0  # Sum of abs(weights), matching trader.py
+    num_long: int = 60
+    num_short: int = 50
+    target_leverage: float = 3.0  # Sum of abs(weights), matching trader.py
     # Weighting (opt-in non-EW)
     weighting_scheme: Literal["equal", "rank_power"] = "equal"
-    rank_power: float = 1.5
+    rank_power: float = 0.0
 
     # Rebalancing
     rebalance_every_n_days: int = 10
     prediction_lag_days: int = 1  # Use T-lag signals to trade at T
 
     # Costs (in basis points)
-    fee_bps: float = 2.5  # Trading fee
-    slippage_bps: float = 5.0  # Slippage cost
+    fee_bps: float = 4.0  # Trading fee
+    slippage_bps: float = 50.0  # Slippage cost
 
     # Initial capital
     start_capital: float = 100_000.0
@@ -475,7 +475,11 @@ class Backtester:
 
         # Annualized metrics (assuming 365 days per year for crypto)
         years = n_days / 365.0
-        cagr = (final_equity / start_equity) ** (1.0 / years) - 1 if years > 0 else 0
+        # Handle negative equity (can't take fractional power of negative number)
+        if years > 0 and final_equity > 0:
+            cagr = (final_equity / start_equity) ** (1.0 / years) - 1
+        else:
+            cagr = total_return  # Fallback to simple return if equity went negative
 
         # Risk metrics
         returns = daily["returns"]
@@ -617,8 +621,8 @@ class BacktestOptimizer:
             slippage_bps=self.base_config.slippage_bps,
             start_capital=self.base_config.start_capital,
             verbose=False,
-            weighting_scheme=self.base_config.weighting_scheme,
-            rank_power=self.base_config.rank_power,
+            weighting_scheme="rank_power",  # Always use rank_power (power=0 is equal weight)
+            rank_power=params["rank_power"],
         )
 
         try:
@@ -632,6 +636,7 @@ class BacktestOptimizer:
                 "num_short": params["num_short"],
                 "leverage": params["leverage"],
                 "rebalance_days": params["rebalance_days"],
+                "rank_power": params["rank_power"],
                 "sharpe": result.stats["sharpe_ratio"],
                 "cagr": result.stats["cagr"],
                 "calmar": result.stats["calmar_ratio"],
@@ -653,6 +658,7 @@ class BacktestOptimizer:
         num_shorts: list[int] | None = None,
         leverages: list[float] | None = None,
         rebalance_days: list[int] | None = None,
+        rank_powers: list[float] | None = None,
         metric: Literal["sharpe", "cagr", "calmar"] = "sharpe",
         max_drawdown_limit: float | None = None,
         max_workers: int | None = None,
@@ -665,6 +671,7 @@ class BacktestOptimizer:
             num_shorts: List of short position counts to test
             leverages: List of leverage values to test
             rebalance_days: List of rebalance frequencies to test
+            rank_powers: List of rank power values to test (0=equal weight)
             metric: Optimization metric
             max_drawdown_limit: Maximum drawdown constraint
             max_workers: Number of parallel workers (None = auto)
@@ -686,6 +693,8 @@ class BacktestOptimizer:
             leverages = [self.base_config.target_leverage]
         if rebalance_days is None:
             rebalance_days = [self.base_config.rebalance_every_n_days]
+        if rank_powers is None:
+            rank_powers = [self.base_config.rank_power]
 
         # Generate all parameter combinations
         param_combinations = []
@@ -693,14 +702,16 @@ class BacktestOptimizer:
             for n_short in num_shorts:
                 for leverage in leverages:
                     for rebal_days in rebalance_days:
-                        param_combinations.append(
-                            {
-                                "num_long": n_long,
-                                "num_short": n_short,
-                                "leverage": leverage,
-                                "rebalance_days": rebal_days,
-                            }
-                        )
+                        for rank_pow in rank_powers:
+                            param_combinations.append(
+                                {
+                                    "num_long": n_long,
+                                    "num_short": n_short,
+                                    "leverage": leverage,
+                                    "rebalance_days": rebal_days,
+                                    "rank_power": rank_pow,
+                                }
+                            )
 
         # Check cache to see which we already have
         cache = self._load_cache()
@@ -740,19 +751,13 @@ class BacktestOptimizer:
         results = []
         best_so_far = None
 
-        # Create task if progress callback provided
-        task_id = None
-        if progress_callback:
-            task_id = progress_callback.add_task(
-                "[cyan]Running backtests...", total=len(param_combinations)
-            )
+        # Track rate (only for non-cached backtests)
+        start_time = None
+        non_cached_completed = 0
 
-        # Track rate
-        start_time = time.time()
-        completed = 0
-
-        # Separate cached and to-run combinations
+        # Separate cached and to-run combinations (load cache instantly before starting progress)
         to_run: list[dict] = []
+        cached_count = 0
         for params in param_combinations:
             key = self._get_cache_key(params)
             cached = cache.get(key)
@@ -762,26 +767,23 @@ class BacktestOptimizer:
                     max_drawdown_limit is not None
                     and cached.get("max_dd", 0) < -max_drawdown_limit
                 ):
-                    if progress_callback and task_id is not None:
-                        progress_callback.update(task_id, advance=1)
+                    cached_count += 1
                     continue
                 results.append(cached)
                 if best_so_far is None or cached[metric] > best_so_far[metric]:
                     best_so_far = cached.copy()
-                if progress_callback and task_id is not None:
-                    completed += 1
-                    elapsed = max(time.time() - start_time, 1e-6)
-                    rate = completed / elapsed
-                    # Cap rate display at reasonable values
-                    rate_str = "instant" if rate > 999 else f"{rate:.1f}/s"
-                    desc = (
-                        f"[cyan]Backtests[/cyan] [dim]│[/dim] Best {metric}: {best_so_far[metric]:.3f} [dim]| {rate_str}[/dim]"
-                        if best_so_far is not None
-                        else f"[cyan]Running backtests... [dim]{rate_str}[/dim]"
-                    )
-                    progress_callback.update(task_id, advance=1, description=desc)
+                cached_count += 1
             else:
                 to_run.append(params)
+
+        # Create task AFTER loading cached results, so timer starts fresh
+        task_id = None
+        if progress_callback:
+            task_id = progress_callback.add_task(
+                "[cyan]Running backtests...", 
+                total=len(param_combinations),
+                completed=cached_count  # Already completed from cache
+            )
 
         # Run remaining in parallel
         if to_run:
@@ -792,6 +794,11 @@ class BacktestOptimizer:
                 }
                 for future in as_completed(future_to_params):
                     params = future_to_params[future]
+                    
+                    # Start timer on first actual backtest completion
+                    if start_time is None:
+                        start_time = time.time()
+                    
                     try:
                         result = future.result()
                         if result is not None:
@@ -816,9 +823,9 @@ class BacktestOptimizer:
                             self._save_cache(cache)
                             # Progress update
                             if progress_callback and task_id is not None:
-                                completed += 1
+                                non_cached_completed += 1
                                 elapsed = max(time.time() - start_time, 1e-6)
-                                rate = completed / elapsed
+                                rate = non_cached_completed / elapsed
                                 rate_str = "instant" if rate > 999 else f"{rate:.1f}/s"
                                 progress_callback.update(
                                     task_id,
@@ -827,9 +834,9 @@ class BacktestOptimizer:
                                 )
                         else:
                             if progress_callback and task_id is not None:
-                                completed += 1
+                                non_cached_completed += 1
                                 elapsed = max(time.time() - start_time, 1e-6)
-                                rate = completed / elapsed
+                                rate = non_cached_completed / elapsed
                                 rate_str = "instant" if rate > 999 else f"{rate:.1f}/s"
                                 progress_callback.update(
                                     task_id,
@@ -838,9 +845,9 @@ class BacktestOptimizer:
                                 )
                     except Exception:
                         if progress_callback and task_id is not None:
-                            completed += 1
+                            non_cached_completed += 1
                             elapsed = max(time.time() - start_time, 1e-6)
-                            rate = completed / elapsed
+                            rate = non_cached_completed / elapsed
                             rate_str = "instant" if rate > 999 else f"{rate:.1f}/s"
                             progress_callback.update(
                                 task_id,
@@ -853,6 +860,14 @@ class BacktestOptimizer:
             return pl.DataFrame()
 
         df = pl.DataFrame(results)
+        
+        # Cast numeric columns to proper float types (handles complex numbers, NaN, inf)
+        numeric_cols = ["sharpe", "cagr", "calmar", "sortino", "max_dd", "volatility", "win_rate", "final_equity"]
+        df = df.with_columns([
+            pl.col(col).cast(pl.Float64, strict=False).fill_nan(0.0)
+            for col in numeric_cols if col in df.columns
+        ])
+        
         df = df.sort(metric, descending=True)
 
         return df
@@ -904,4 +919,5 @@ class BacktestOptimizer:
             "num_short": int(best_row["num_short"][0]),
             "target_leverage": float(best_row["leverage"][0]),
             "rebalance_every_n_days": int(best_row["rebalance_days"][0]),
+            "rank_power": float(best_row["rank_power"][0]),
         }

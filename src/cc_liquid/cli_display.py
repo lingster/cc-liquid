@@ -1630,6 +1630,7 @@ def create_optimization_results_table(results_df, metric: str, top_n: int) -> Pa
     table.add_column("SHORT", style="red", justify="right", width=6)
     table.add_column("LEV", style="yellow", justify="right", width=6)
     table.add_column("DAYS", style="cyan", justify="right", width=6)
+    table.add_column("POWER", style="magenta", justify="right", width=6)
     table.add_column(
         "SHARPE",
         justify="right",
@@ -1671,6 +1672,7 @@ def create_optimization_results_table(results_df, metric: str, top_n: int) -> Pa
             str(row["num_short"]),
             f"{row['leverage']:.1f}x",
             str(row["rebalance_days"]),
+            f"{row['rank_power']:.1f}",
             f"[{sharpe_color}]{sharpe:.2f}[/{sharpe_color}]",
             f"[{cagr_color}]{cagr:.1%}[/{cagr_color}]",
             f"{row['calmar']:.2f}",
@@ -1709,6 +1711,7 @@ def create_optimization_summary_panel(best_row_df, metric: str, config=None) -> 
     table.add_row("SHORT", f"[red]{best['num_short']}[/red]")
     table.add_row("LEVERAGE", f"[yellow]{best['leverage']:.1f}x[/yellow]")
     table.add_row("REBALANCE", f"{best['rebalance_days']} days")
+    table.add_row("RANK POWER", f"[magenta]{best['rank_power']:.1f}[/magenta]")
     table.add_row("", "")
 
     # Performance metrics
