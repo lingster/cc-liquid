@@ -300,7 +300,7 @@ class CCLiquid:
         return round(size, sz_decimals), sz_decimals
 
     def _round_price_perp(self, coin: str, px: float) -> float:
-        """Round price according to Hyperliquid perp rules (not used for market orders).
+        """Round price according to Hyperliquid perp rules (used for limit orders).
 
         Rules (per Hyperliquid):
         - If px > 100_000: round to integer.
@@ -318,6 +318,12 @@ class CCLiquid:
 
     def plan_rebalance(self, predictions: pl.DataFrame | None = None) -> dict:
         """Compute a rebalancing plan without executing orders."""
+        # Check for open orders (warning if present)
+        open_orders = self.get_open_orders()
+        if open_orders:
+            self.callbacks.warn(
+                f"Found {len(open_orders)} open order(s). These may conflict with rebalancing."
+            )
         # Load predictions if not provided
         if predictions is None:
             self.callbacks.info("Loading predictions...")
@@ -331,6 +337,7 @@ class CCLiquid:
                     "skipped_trades": [],
                     "account_value": 0.0,
                     "leverage": self.config.portfolio.target_leverage,
+                    "open_orders": open_orders,
                 }
 
             # Display prediction info
@@ -356,6 +363,7 @@ class CCLiquid:
             "skipped_trades": skipped_trades,
             "account_value": account_value,
             "leverage": leverage,
+            "open_orders": open_orders,
         }
 
     def execute_plan(self, plan: dict) -> dict:
@@ -454,7 +462,6 @@ class CCLiquid:
             long_assets=long_assets,
             short_assets=short_assets,
             target_gross=target_leverage,
-            scheme=self.config.portfolio.weighting_scheme,
             power=self.config.portfolio.rank_power,
         )
 
@@ -529,6 +536,10 @@ class CCLiquid:
         trades = []
         skipped_trades = []  # Track trades we can't execute
         all_mids = self.info.all_mids()
+        
+
+        fee_info = self.get_fee_summary()
+        taker_rate = float(fee_info.get("userCrossRate", 0.00035))
 
         all_assets = set(target_positions.keys()) | set(current_positions.keys())
 
@@ -624,6 +635,7 @@ class CCLiquid:
                 "target_value": target_value,
                 "delta_value": delta_value,
                 "type": trade_type,
+                "estimated_fee": abs(delta_value) * taker_rate,
             }
 
             # Re-evaluate min notional AFTER rounding size
@@ -635,7 +647,7 @@ class CCLiquid:
                     skipped_trades.append(trade_data)
                 else:
                     forced, reason = self._compose_force_close_trades(
-                        asset, price, current_value, min_trade_value
+                        asset, price, current_value, min_trade_value, taker_rate
                     )
                     if forced is None:
                         skipped_trades.append(
@@ -673,7 +685,7 @@ class CCLiquid:
         return sorted(trades, key=sort_key)
 
     def _compose_force_close_trades(
-        self, coin: str, price: float, current_value: float, min_trade_value: float
+        self, coin: str, price: float, current_value: float, min_trade_value: float, taker_rate: float
     ) -> tuple[list[dict[str, Any]] | None, str | None]:
         """Compose the two-step forced close for sub-minimum closes.
         i.e. if we have a position of less than $10, we want to close it to $0, we need to increase the position
@@ -688,6 +700,8 @@ class CCLiquid:
 
         increase_is_buy = current_value > 0
         force_id = f"force_close:{coin}"
+        
+        step1_delta = min_increase_sz * price if increase_is_buy else -(min_increase_sz * price)
 
         step1 = {
             "coin": coin,
@@ -701,13 +715,12 @@ class CCLiquid:
                 if current_value >= 0
                 else -min_increase_sz * price
             ),
-            "delta_value": min_increase_sz * price
-            if increase_is_buy
-            else -(min_increase_sz * price),
+            "delta_value": step1_delta,
             "type": "increase",
             "force": True,
             "force_id": force_id,
             "force_seq": 0,
+            "estimated_fee": abs(step1_delta) * taker_rate,
         }
 
         total_notional_to_close = abs(current_value) + (min_increase_sz * price)
@@ -716,6 +729,8 @@ class CCLiquid:
         if close_sz_rounded is None:
             return None, "Unknown szDecimals (meta)"
         close_sz, _ = close_sz_rounded
+        
+        step2_delta = total_notional_to_close if close_is_buy else -total_notional_to_close
 
         step2 = {
             "coin": coin,
@@ -729,13 +744,12 @@ class CCLiquid:
                 else -(min_increase_sz * price)
             ),
             "target_value": 0,
-            "delta_value": total_notional_to_close
-            if close_is_buy
-            else -total_notional_to_close,
+            "delta_value": step2_delta,
             "type": "close",
             "force": True,
             "force_id": force_id,
             "force_seq": 1,
+            "estimated_fee": abs(step2_delta) * taker_rate,
         }
 
         # Ensure both meet minimum notional
@@ -771,7 +785,7 @@ class CCLiquid:
         return rounded_up_size, sz_decimals
 
     def _execute_trades(self, trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Executes a list of trades using the SDK's market_open for robustness."""
+        """Executes a list of trades sequentially with configurable order type and time-in-force."""
         if not trades:
             return []
 
@@ -787,13 +801,39 @@ class CCLiquid:
 
             try:
                 self.logger.debug(f"Executing trade: {trade}")
-                # Pass vault address if trading on behalf of a vault/subaccount.
-                result = self.exchange.market_open(
-                    name=trade["coin"],
-                    is_buy=trade["is_buy"],
-                    sz=trade["sz"],  # Already a float
-                    slippage=self.config.execution.slippage_tolerance,
-                )
+                
+                coin = trade["coin"]
+                is_buy = trade["is_buy"]
+                size = trade["sz"]
+                
+                # Determine limit price based on order_type
+                if self.config.execution.order_type == "limit":
+                    # Use passive pricing: buy below mid, sell above mid
+                    mid_price = float(self.info.all_mids()[coin])
+                    offset = self.config.execution.limit_price_offset
+                    
+                    if is_buy:
+                        limit_px = self._round_price_perp(coin, mid_price * (1 - offset))
+                    else:
+                        limit_px = self._round_price_perp(coin, mid_price * (1 + offset))
+                else:  # market
+                    # Use slippage price (aggressive) for market orders
+                    limit_px = self.exchange._slippage_price(
+                        coin, is_buy, self.config.execution.slippage_tolerance
+                    )
+                
+                # Build single order request
+                order_request = {
+                    "coin": coin,
+                    "is_buy": is_buy,
+                    "sz": size,
+                    "limit_px": limit_px,
+                    "order_type": {"limit": {"tif": self.config.execution.time_in_force}},
+                    "reduce_only": False,
+                }
+                
+                # Execute single order via bulk_orders with single-item list
+                result = self.exchange.bulk_orders([order_request])
 
                 # Handle error responses
                 if result.get("status") == "err":
@@ -810,17 +850,17 @@ class CCLiquid:
                     continue
 
                 statuses = response.get("data", {}).get("statuses", [])
+                
+                if not statuses:
+                    self.callbacks.on_trade_fail(trade, "No status returned")
+                    failed_trades.append(trade)
+                    continue
+                
+                status = statuses[0]  # Get first (and only) status
 
                 # Check for filled orders
-                filled_data = None
-                for status in statuses:
-                    if "filled" in status:
-                        filled_data = status["filled"]
-                        break
-
-                if filled_data:
-                    # Extract fill details
-                    float(filled_data.get("totalSz", trade["sz"]))
+                if "filled" in status:
+                    filled_data = status["filled"]
                     avg_px = float(filled_data.get("avgPx", trade["price"]))
 
                     # Calculate slippage
@@ -833,6 +873,9 @@ class CCLiquid:
                             (trade["price"] - avg_px) / trade["price"]
                         ) * 100
 
+                    # Extract actual fee from API response
+                    actual_fee = float(filled_data.get("fee", 0))
+
                     self.callbacks.on_trade_fill(trade, filled_data, slippage_pct)
 
                     successful_trades.append(
@@ -840,12 +883,37 @@ class CCLiquid:
                             **trade,
                             "fill_data": filled_data,
                             "slippage_pct": slippage_pct,
+                            "actual_fee": actual_fee,
+                            "status": "filled",
                         }
                     )
+                
+                # Check for resting orders (Gtc/Alo orders posted to book)
+                elif "resting" in status and self.config.execution.time_in_force in ("Gtc", "Alo"):
+                    resting_data = status["resting"]
+                    oid = resting_data.get("oid")
+                    
+                    # This is a success for Gtc/Alo - order is on the book
+                    self.callbacks.info(
+                        f"  {trade['coin']}: Order posted to book (OID: {oid}). "
+                        f"Check with 'cc-liquid orders'"
+                    )
+
+                    successful_trades.append(
+                        {
+                            **trade,
+                            "resting": True,
+                            "oid": oid,
+                            "status": "resting",
+                        }
+                    )
+                
+                # Handle errors or actual failures
                 else:
-                    # Handle errors or unfilled orders
-                    errors = [s.get("error") for s in statuses if "error" in s]
-                    error_msg = errors[0] if errors else "Order not filled"
+                    if "error" in status:
+                        error_msg = status["error"]
+                    else:
+                        error_msg = "Order rejected or not filled"
 
                     self.callbacks.on_trade_fail(trade, error_msg)
                     failed_trades.append(trade)
@@ -919,6 +987,85 @@ class CCLiquid:
         state_file = ".cc_liquid_state.json"
         with open(state_file, "w") as f:
             json.dump({"last_rebalance_date": last_rebalance_date.isoformat()}, f)
+
+    def get_open_orders(self) -> list[dict[str, Any]]:
+        """Get current open orders.
+
+        Returns:
+            List of open orders with details like coin, size, limit price, side, etc.
+        """
+        owner = self.config.HYPERLIQUID_VAULT_ADDRESS or self.config.HYPERLIQUID_ADDRESS
+        if not owner:
+            raise ValueError("Missing portfolio owner address")
+        return self.info.open_orders(owner)
+
+    def cancel_open_orders(self, coin: str | None = None) -> dict[str, Any]:
+        """Cancel open orders, optionally filtered by coin.
+
+        Args:
+            coin: If provided, only cancel orders for this coin. If None, cancel all.
+
+        Returns:
+            Result of the cancel operation
+        """
+        open_orders = self.get_open_orders()
+
+        if not open_orders:
+            return {"status": "ok", "response": "No open orders to cancel"}
+
+        # Filter by coin if specified
+        if coin:
+            orders_to_cancel = [o for o in open_orders if o["coin"] == coin]
+        else:
+            orders_to_cancel = open_orders
+
+        if not orders_to_cancel:
+            return {
+                "status": "ok",
+                "response": f"No open orders found for {coin}" if coin else "No orders to cancel",
+            }
+
+        # Build cancel requests
+        cancel_requests = [
+            {"coin": order["coin"], "oid": order["oid"]} for order in orders_to_cancel
+        ]
+
+        # Execute bulk cancel
+        self.logger.info(f"Cancelling {len(cancel_requests)} open orders...")
+        result = self.exchange.bulk_cancel(cancel_requests)
+
+        return result
+
+    def get_fill_history(
+        self, start_time: int | None = None, end_time: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Get fill history with optional time range.
+
+        Args:
+            start_time: Unix timestamp in milliseconds (optional)
+            end_time: Unix timestamp in milliseconds (optional)
+
+        Returns:
+            List of fills with execution details, prices, sizes, and fees
+        """
+        owner = self.config.HYPERLIQUID_VAULT_ADDRESS or self.config.HYPERLIQUID_ADDRESS
+        if not owner:
+            raise ValueError("Missing portfolio owner address")
+
+        if start_time is not None:
+            return self.info.user_fills_by_time(owner, start_time, end_time)
+        return self.info.user_fills(owner)
+
+    def get_fee_summary(self) -> dict[str, Any]:
+        """Get fee rates and trading volume statistics.
+
+        Returns:
+            Dictionary containing fee rates (maker/taker), volume stats, and fee schedule
+        """
+        owner = self.config.HYPERLIQUID_VAULT_ADDRESS or self.config.HYPERLIQUID_ADDRESS
+        if not owner:
+            raise ValueError("Missing portfolio owner address")
+        return self.info.user_fees(owner)
 
     def _load_predictions(self) -> pl.DataFrame | None:
         """Load predictions based on configured data source."""

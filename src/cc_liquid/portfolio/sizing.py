@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-from typing import Dict, Iterable, Literal, Mapping, Sequence
+from typing import Dict, Iterable, Mapping, Sequence
 
 import polars as pl
-
-Scheme = Literal["equal", "rank_power"]
 
 
 def weights_from_ranks(
@@ -15,12 +13,13 @@ def weights_from_ranks(
     long_assets: Sequence[str],
     short_assets: Sequence[str],
     target_gross: float,
-    scheme: Scheme = "rank_power",
-    power: float = 1.5,
+    power: float = 0.0,
 ) -> Dict[str, float]:
-    """Convert ranks (higher = stronger long) to signed weights.
+    """Convert ranks (higher = stronger long) to signed weights using rank power weighting.
 
     The output weights sum in absolute value to ``target_gross``.
+    
+    Weighting uses (rank/n)^power formula where power=0.0 produces equal weights.
 
     ``latest_preds`` accepts either:
     - Polars DataFrame with ``id_col``/``pred_col``
@@ -57,16 +56,9 @@ def weights_from_ranks(
             reverse=sign > 0,
         )
 
-        raw: list[float]
-        if scheme == "equal":
-            raw = [1.0] * n
-        elif scheme == "rank_power":
-            p = max(1e-6, float(power))
-            raw = [((n - idx) / n) ** p for idx in range(n)]
-        else:
-            raise ValueError(
-                f"Invalid weighting scheme: {scheme}. Must be 'equal' or 'rank_power'"
-            )
+        # Use rank power weighting: when power=0, all weights equal 1.0
+        p = max(1e-6, float(power))
+        raw: list[float] = [((n - idx) / n) ** p for idx in range(n)]
 
         denom = sum(raw) or 1.0
         scale = gross / denom

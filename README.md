@@ -93,8 +93,11 @@ portfolio:
   target_leverage: 1.0          # 1.0 = no leverage, 2.0 = 2x, etc.
 
 execution:
-  slippage_tolerance: 0.005
+  slippage_tolerance: 0.005     # Market orders: aggressive pricing (default)
+  limit_price_offset: 0.0       # Limit orders: passive offset (0.0 = exact mid)
   min_trade_value: 10.0
+  order_type: market            # "market" or "limit"
+  time_in_force: Ioc            # "Ioc", "Gtc", or "Alo"
 ```
 
 **Profile Management:**
@@ -124,6 +127,17 @@ cc-liquid download-numerai -o predictions.parquet
 # Rebalance portfolio
 cc-liquid rebalance
 
+# View open orders
+cc-liquid orders
+
+# Cancel open orders
+cc-liquid cancel-orders                  # Cancel all
+cc-liquid cancel-orders --coin BTC       # Cancel specific coin
+
+# View trade history
+cc-liquid history --days 7               # Last 7 days
+cc-liquid history --start 2025-01-01     # Date range
+
 # Continuous rebalancing (WARNING: auto-executes)
 cc-liquid run --skip-confirm
 ```
@@ -144,7 +158,10 @@ Use `--set` to override any config value at runtime:
 --set portfolio.target_leverage=2.0
 
 # Execution
---set execution.slippage_tolerance=0.01
+--set execution.slippage_tolerance=0.01      # Market order aggressiveness
+--set execution.limit_price_offset=0.003     # Limit order passive offset (0 = mid)
+--set execution.order_type=limit             # market or limit
+--set execution.time_in_force=Gtc            # Ioc, Gtc, or Alo
 
 # Environment
 --set is_testnet=true
@@ -155,13 +172,77 @@ Example combinations:
 cc-liquid rebalance --set data.source=numerai --set portfolio.num_long=20 --set portfolio.target_leverage=2.0
 ```
 
+### Order Types & Execution
+
+**Order Types:**
+- `market` - Uses `slippage_tolerance` to price away from mid for aggressive fills (default: 0.005)
+- `limit` - Uses `limit_price_offset` to price at or inside mid for passive maker orders (default: 0.0 = exact mid)
+
+**Pricing Behavior:**
+- `slippage_tolerance`: Market orders - buy ABOVE mid, sell BELOW mid (worse price, guaranteed fill)
+- `limit_price_offset`: Limit orders - buy BELOW mid, sell ABOVE mid (better price, may not fill)
+  - 0.0 = exact mid (default, current behavior)
+  - 0.002 = 0.2% inside mid (passive maker)
+  - 0.005 = 0.5% inside mid (more aggressive passive)
+
+**Time-in-Force (TIF):**
+- `Ioc` (Immediate or Cancel) - Fills what it can immediately, cancels rest. No orders stay on book. (default)
+- `Gtc` (Good til Canceled) - Orders stay on book until filled or manually canceled
+- `Alo` (Add Liquidity Only) - Only posts to book, never takes liquidity
+
+**Order Status:**
+- **Filled** - Order executed immediately ✅
+- **Resting** - Order posted to book and waiting (Gtc/Alo only) ✅
+- **Failed** - Order rejected or not filled ❌
+
+```bash
+# Use limit orders at exact mid (default)
+cc-liquid rebalance --set execution.order_type=limit --set execution.time_in_force=Gtc
+
+# Use limit orders with passive offset (inside mid)
+cc-liquid rebalance --set execution.order_type=limit --set execution.time_in_force=Gtc --set execution.limit_price_offset=0.002
+
+# Note: limit orders with Ioc (default TIF) may not fill if priced at or inside mid
+# Recommended to use Gtc or Alo with limit orders
+
+# Check what's on the book
+cc-liquid orders
+
+# Cancel orders before rebalancing
+cc-liquid rebalance --cancel-open-orders
+```
+
+**Managing Open Orders with Gtc:**
+
+When using `Gtc`, unfilled orders stay on the book and may conflict with rebalancing:
+
+```bash
+# Option 1: Auto-cancel before rebalancing
+cc-liquid rebalance --cancel-open-orders
+
+# Option 2: Manual management
+cc-liquid orders                    # Check open orders
+cc-liquid cancel-orders             # Cancel all
+cc-liquid rebalance                 # Will prompt if orders found
+
+# Option 3: Cancel specific coins
+cc-liquid cancel-orders --coin BTC
+```
+
+**Batch Execution:**
+- All orders are submitted in a single batch for efficiency
+- Reduces network latency and improves throughput
+- Better execution coordination across multiple trades
+
 ## How It Works
 
 1. **Download Metamodel**: Fetches consolidated predictions from CrowdCent or Numerai
 2. **Select Assets**: Identifies top N longs and bottom N shorts based on 10-day predictions
 3. **Calculate Positions**: Determines target sizes based on account value and leverage
 4. **Generate Trades**: Calculates required trades from current to target positions
-5. **Execute Orders**: Places market orders with configured slippage tolerance
+5. **Execute Orders**: Submits orders in batch with configured order type and time-in-force
+   - Properly handles size precision (szDecimals) and price precision (tick size)
+   - Distinguishes between filled orders and resting orders (for Gtc/Alo)
 
 ## Backtesting & Optimization
 

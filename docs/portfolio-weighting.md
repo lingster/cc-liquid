@@ -1,6 +1,6 @@
-# Portfolio Weighting Schemes
+# Portfolio Weighting
 
-cc-liquid supports rank power position sizing methods to go beyond equal weighting, allowing you to concentrate capital in your highest-conviction positions.
+cc-liquid uses rank power position sizing to control how capital is distributed across positions. By adjusting a single `rank_power` parameter, you can range from equal weighting (all positions same size) to heavy concentration in your highest-conviction positions.
 
 ## Visual Overview
 
@@ -16,7 +16,7 @@ The grid above shows how three different weighting schemes distribute capital ac
 
 These curves demonstrate how the rank power parameter controls concentration:
 
-- **Power = 0** (equal weight): All positions get the same allocation
+- **Power = 0.0** (equal weight, default): All positions get the same allocation
 - **Power = 0.5-1.0**: Mild concentration favoring top positions  
 - **Power = 1.5-2.0**: Moderate concentration
 - **Power = 3.0+**: Heavy concentration in top few positions
@@ -30,37 +30,44 @@ portfolio:
   num_long: 60
   num_short: 50
   target_leverage: 4.0
-  weighting_scheme: rank_power  # Options: equal, rank_power
-  rank_power: 1.5               # Used when scheme is rank_power (default: 1.5)
+  rank_power: 0.0  # 0.0 = equal weight (default), higher = more concentration
 ```
 
 ### CLI Override
 
 ```bash
-# Backtest with rank-weighted positions
-uv run -m cc_liquid.cli analyze \
-  --set portfolio.weighting_scheme=rank_power \
-  --set portfolio.rank_power=1.5
+# Equal weight (default)
+cc-liquid analyze --set portfolio.rank_power=0.0
 
-# Live trading with concentration
-uv run -m cc_liquid.cli rebalance \
-  --set portfolio.weighting_scheme=rank_power \
-  --set portfolio.rank_power=2.0
+# Moderate concentration
+cc-liquid analyze --set portfolio.rank_power=1.5
+
+# Heavy concentration for live trading
+cc-liquid rebalance --set portfolio.rank_power=2.0
 ```
 
-## Weighting Schemes
+## How Rank Power Works
 
-### Equal Weight (Default)
-Every position gets an equal share of the allocated capital. Simple and diversified.
+Positions are weighted using the formula `(rank/n)^power`, where:
+
+- `rank` is the position's rank within its side (1 = best)
+- `n` is the total number of positions on that side
+- `power` is your concentration parameter
+
+**Key insight:** When `power = 0.0`, the formula `(rank/n)^0 = 1.0` for all ranks, producing equal weighting. As you increase power, top-ranked positions (stronger signals) receive progressively more capital.
+
+### Examples
 
 ```yaml
-weighting_scheme: equal
-```
+# Equal weighting (default)
+rank_power: 0.0
 
-### Rank Power
-Positions are weighted by `(rank/n)^power`. Higher-ranked positions (stronger signals) get more capital.
-
-```yaml
-weighting_scheme: rank_power
+# Mild concentration
 rank_power: 0.5
+
+# Moderate concentration
+rank_power: 1.5
+
+# Heavy concentration
+rank_power: 2.5
 ```

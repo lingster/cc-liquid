@@ -143,7 +143,8 @@ cc-liquid rebalance --set portfolio.num_long=12 --set portfolio.num_short=8 --se
 
 5. **Execute orders**
 
-    - Places market orders with configured `slippage_tolerance`
+    - Market orders: uses `slippage_tolerance` for aggressive pricing (away from mid)
+    - Limit orders: uses `limit_price_offset` for passive pricing (at or inside mid)
     - Reports fills, failures, and actual slippage
 
 After execution completes:

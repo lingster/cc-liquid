@@ -50,7 +50,7 @@ def test_backtester_run_basic(tmp_path):  # noqa: D103
         num_long=1,
         num_short=0,
         target_leverage=1.0,
-        weighting_scheme="equal",
+        rank_power=0.0,  # 0.0 = equal weight
         rebalance_every_n_days=1,
         prediction_lag_days=1,
         fee_bps=0.0,
@@ -122,7 +122,7 @@ def test_backtest_optimizer_run_single_backtest(tmp_path):
         num_long=1,
         num_short=0,
         target_leverage=1.0,
-        weighting_scheme="equal",
+        rank_power=0.0,  # 0.0 = equal weight
         rebalance_every_n_days=1,
         prediction_lag_days=1,
         fee_bps=0.0,

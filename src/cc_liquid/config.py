@@ -36,8 +36,7 @@ class PortfolioConfig:
     num_long: int = 10
     num_short: int = 10
     target_leverage: float = 1.0  # Position sizing multiplier (1.0 = no leverage)
-    weighting_scheme: str = "equal"  # "equal" | "rank_power"
-    rank_power: float = 1.5
+    rank_power: float = 0.0  # 0.0 = equal weight (default), higher = more concentration
     rebalancing: RebalancingConfig = field(default_factory=RebalancingConfig)
 
 
@@ -45,8 +44,11 @@ class PortfolioConfig:
 class ExecutionConfig:
     """Order execution parameters."""
 
-    slippage_tolerance: float = 0.005
+    slippage_tolerance: float = 0.005  # Market orders: aggressive (away from mid)
+    limit_price_offset: float = 0.0  # Limit orders: passive offset (0.0 = exact mid, >0 = inside mid)
     min_trade_value: float = 10.0  # Exchange minimum order notional in USD
+    order_type: str = "market"  # "market" or "limit"
+    time_in_force: str = "Ioc"  # "Ioc" (Immediate or Cancel), "Gtc" (Good til Canceled), "Alo" (Add Liquidity Only)
 
 
 @dataclass
@@ -198,6 +200,18 @@ class Config:
                 signer_env = profile.get("signer_env", "HYPERLIQUID_PRIVATE_KEY")
             raise ValueError(
                 f"Private key not found. Set '{signer_env}' in your .env file."
+            )
+
+        # Validate order type
+        if self.execution.order_type not in ("market", "limit"):
+            raise ValueError(
+                f"Invalid order_type: {self.execution.order_type}. Must be 'market' or 'limit'"
+            )
+
+        # Validate time in force
+        if self.execution.time_in_force not in ("Ioc", "Gtc", "Alo"):
+            raise ValueError(
+                f"Invalid time_in_force: {self.execution.time_in_force}. Must be 'Ioc', 'Gtc', or 'Alo'"
             )
 
     def to_dict(self) -> dict[str, Any]:

@@ -4,7 +4,7 @@ import os
 import yaml
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import subprocess
 import shutil
 import shlex
@@ -440,9 +440,285 @@ def account():
 
     # Get structured portfolio info
     portfolio = trader.get_portfolio_info()
+    
+    # Get open orders
+    open_orders = trader.get_open_orders()
 
-    # Display using reusable display function with config
-    display_portfolio(portfolio, console, config.to_dict())
+    # Display using reusable display function with config and open orders
+    display_portfolio(portfolio, console, config.to_dict(), open_orders=open_orders)
+
+
+@cli.command()
+def orders():
+    """Show current open orders."""
+    console = Console()
+    trader = CCLiquid(config, callbacks=RichCLICallbacks())
+
+    try:
+        open_orders = trader.get_open_orders()
+
+        if not open_orders:
+            console.print("[yellow]No open orders[/yellow]")
+            return
+
+        from rich.table import Table
+
+        table = Table(title="Open Orders", show_header=True, header_style="bold cyan")
+        table.add_column("OID", style="dim")
+        table.add_column("COIN", style="cyan")
+        table.add_column("SIDE", justify="center")
+        table.add_column("SIZE", justify="right")
+        table.add_column("LIMIT PX", justify="right")
+        table.add_column("TIMESTAMP", justify="right")
+
+        for order in open_orders:
+            side = "BUY" if order["side"] == "B" else "SELL"
+            side_style = "green" if side == "BUY" else "red"
+            timestamp = datetime.fromtimestamp(order["timestamp"] / 1000).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+
+            table.add_row(
+                str(order["oid"]),
+                order["coin"],
+                f"[{side_style}]{side}[/{side_style}]",
+                order["sz"],
+                f"${float(order['limitPx']):,.2f}",
+                timestamp,
+            )
+
+        console.print(table)
+        console.print(f"\n[cyan]Total open orders: {len(open_orders)}[/cyan]")
+
+    except Exception as e:
+        console.print(f"[red]✗ Error fetching orders:[/red] {e}")
+        raise
+
+
+@cli.command(name="cancel-orders")
+@click.option("--coin", help="Cancel orders for specific coin only")
+@click.option("--skip-confirm", is_flag=True, help="Skip confirmation prompt")
+def cancel_orders(coin, skip_confirm):
+    """Cancel open orders."""
+    console = Console()
+    trader = CCLiquid(config, callbacks=RichCLICallbacks())
+
+    try:
+        # Get open orders first
+        open_orders = trader.get_open_orders()
+
+        if not open_orders:
+            console.print("[yellow]No open orders to cancel[/yellow]")
+            return
+
+        # Filter by coin if specified
+        if coin:
+            orders_to_show = [o for o in open_orders if o["coin"] == coin]
+            if not orders_to_show:
+                console.print(f"[yellow]No open orders found for {coin}[/yellow]")
+                return
+        else:
+            orders_to_show = open_orders
+
+        # Show orders to be cancelled
+        from rich.table import Table
+
+        table = Table(title="Orders to Cancel", show_header=True, header_style="bold yellow")
+        table.add_column("COIN", style="cyan")
+        table.add_column("SIDE", justify="center")
+        table.add_column("SIZE", justify="right")
+        table.add_column("LIMIT PX", justify="right")
+
+        for order in orders_to_show:
+            side = "BUY" if order["side"] == "B" else "SELL"
+            side_style = "green" if side == "BUY" else "red"
+
+            table.add_row(
+                order["coin"],
+                f"[{side_style}]{side}[/{side_style}]",
+                order["sz"],
+                f"${float(order['limitPx']):,.2f}",
+            )
+
+        console.print(table)
+
+        # Confirm cancellation
+        if not skip_confirm:
+            from rich.prompt import Confirm
+
+            if not Confirm.ask(
+                f"\n[bold yellow]Cancel {len(orders_to_show)} order(s)?[/bold yellow]"
+            ):
+                console.print("[yellow]Cancelled by user[/yellow]")
+                return
+
+        # Execute cancellation
+        result = trader.cancel_open_orders(coin)
+
+        if result.get("status") == "ok":
+            console.print(f"[green]✓ Cancelled {len(orders_to_show)} order(s)[/green]")
+        else:
+            console.print(f"[red]✗ Error cancelling orders:[/red] {result}")
+
+    except Exception as e:
+        console.print(f"[red]✗ Error:[/red] {e}")
+        raise
+
+
+@cli.command()
+@click.option("--days", type=int, help="Show fills from last N days")
+@click.option("--start", help="Start date (YYYY-MM-DD)")
+@click.option("--end", help="End date (YYYY-MM-DD)")
+@click.option("--limit", type=int, default=50, help="Max number of fills to show")
+def history(days, start, end, limit):
+    """Show trade fill history."""
+    console = Console()
+    trader = CCLiquid(config, callbacks=RichCLICallbacks())
+
+    try:
+        # Calculate time range
+        start_time = None
+        end_time = None
+
+        if days:
+            end_dt = datetime.now(timezone.utc)
+            start_dt = end_dt - timedelta(days=days)
+            start_time = int(start_dt.timestamp() * 1000)
+            end_time = int(end_dt.timestamp() * 1000)
+        elif start:
+            start_dt = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            start_time = int(start_dt.timestamp() * 1000)
+            if end:
+                end_dt = datetime.strptime(end, "%Y-%m-%d").replace(
+                    tzinfo=timezone.utc
+                )
+                end_time = int(end_dt.timestamp() * 1000)
+
+        # Get fills
+        fills = trader.get_fill_history(start_time, end_time)
+
+        if not fills:
+            console.print("[yellow]No fills found[/yellow]")
+            return
+
+        # Sort by time (most recent first) but don't limit yet
+        all_fills = sorted(fills, key=lambda x: x["time"], reverse=True)
+        total_fills = len(all_fills)
+
+        from rich.table import Table
+
+        # Get fee summary for rate calculation (for estimation comparison)
+        fee_info = trader.get_fee_summary()
+        taker_rate = float(fee_info.get("userCrossRate", 0.00035))
+
+        # Calculate aggregate statistics from ALL fills
+        actual_total_fees = 0.0
+        estimated_total_fees = 0.0
+        total_volume = 0.0
+        missing_fee_count = 0
+
+        for fill in all_fills:
+            size = float(fill["sz"])
+            price = float(fill["px"])
+            value = size * price
+            total_volume += value
+
+            # Actual fee from API
+            actual_fee = float(fill.get("fee", 0))
+            if actual_fee == 0 and "fee" not in fill:
+                missing_fee_count += 1
+            actual_total_fees += actual_fee
+
+            # Estimated fee for comparison
+            estimated_fee = value * taker_rate
+            estimated_total_fees += estimated_fee
+
+        # Now limit fills for display
+        fills_to_display = all_fills[:limit]
+
+        # Build display table with new columns
+        table = Table(title="Fill History", show_header=True, header_style="bold cyan")
+        table.add_column("TIME", style="dim", width=11)
+        table.add_column("COIN", style="cyan", width=8)
+        table.add_column("SIDE", justify="center", width=4)
+        table.add_column("DIR", justify="left", width=11)
+        table.add_column("SIZE", justify="right", width=10)
+        table.add_column("PRICE", justify="right", width=10)
+        table.add_column("VALUE", justify="right", width=11)
+        table.add_column("FEE", justify="right", width=8)
+        table.add_column("PNL", justify="right", width=10)
+        table.add_column("OID", style="dim", justify="right", width=10)
+
+        for fill in fills_to_display:
+            side = fill["side"]
+            side_style = "green" if side == "B" else "red"
+            timestamp = datetime.fromtimestamp(fill["time"] / 1000).strftime(
+                "%m-%d %H:%M"
+            )
+
+            size = float(fill["sz"])
+            price = float(fill["px"])
+            value = size * price
+
+            # Use actual fee from API
+            actual_fee = float(fill.get("fee", 0))
+
+            # Get direction (e.g., "Open Long", "Close Short")
+            direction = fill.get("dir", "-")
+
+            # Get order ID
+            oid = fill.get("oid", "-")
+            if oid != "-":
+                # Truncate long OIDs for display
+                oid = str(oid)[:10] if len(str(oid)) > 10 else str(oid)
+
+            pnl = float(fill.get("closedPnl", 0))
+            pnl_style = "green" if pnl >= 0 else "red"
+
+            table.add_row(
+                timestamp,
+                fill["coin"],
+                f"[{side_style}]{side}[/{side_style}]",
+                direction,
+                f"{size:.4f}",
+                f"${price:,.2f}",
+                f"${value:,.2f}",
+                f"${actual_fee:.2f}",
+                f"[{pnl_style}]${pnl:+,.2f}[/{pnl_style}]" if pnl != 0 else "-",
+                oid,
+            )
+
+        console.print(table)
+
+        # Build summary message
+        if total_fills > limit:
+            summary_prefix = f"Showing {len(fills_to_display)} of {total_fills} fills (use --limit to show more)"
+        else:
+            summary_prefix = f"Showing all {total_fills} fills"
+
+        # Show both actual and estimated fees for validation
+        if actual_total_fees > 0:
+            fee_diff_pct = abs(actual_total_fees - estimated_total_fees) / actual_total_fees * 100
+            fee_summary = (
+                f"Actual fees: ${actual_total_fees:,.2f}  │  "
+                f"Estimated: ${estimated_total_fees:,.2f} ({fee_diff_pct:.2f}% diff)"
+            )
+        else:
+            # Fallback to estimated if no actual fees available
+            fee_summary = f"Estimated fees: ${estimated_total_fees:,.2f}"
+            if missing_fee_count > 0:
+                console.print(
+                    f"[yellow]⚠️  Warning: {missing_fee_count}/{total_fills} fills missing 'fee' field, using estimation[/yellow]"
+                )
+
+        console.print(
+            f"\n[cyan]{summary_prefix}[/cyan]\n"
+            f"[cyan]Total volume: ${total_volume:,.2f}  │  {fee_summary}[/cyan]"
+        )
+
+    except Exception as e:
+        console.print(f"[red]✗ Error fetching history:[/red] {e}")
+        raise
 
 
 @cli.command()
@@ -560,7 +836,12 @@ def close_all(skip_confirm, set_overrides, force):
     multiple=True,
     help="Override config values (e.g., --set data.source=numerai --set portfolio.num_long=10)",
 )
-def rebalance(skip_confirm, set_overrides):
+@click.option(
+    "--cancel-open-orders",
+    is_flag=True,
+    help="Cancel all open orders before rebalancing (useful with Gtc orders).",
+)
+def rebalance(skip_confirm, set_overrides, cancel_open_orders):
     """Execute rebalancing based on the configured data source."""
 
     # Apply CLI overrides to config
@@ -573,8 +854,42 @@ def rebalance(skip_confirm, set_overrides):
     # Show applied overrides through callbacks
     callbacks.on_config_override(overrides_applied)
 
+    # Handle open orders before planning
+    if cancel_open_orders:
+        # Auto-cancel if flag is set
+        open_orders = trader.get_open_orders()
+        if open_orders:
+            callbacks.info(f"Cancelling {len(open_orders)} open order(s)...")
+            result = trader.cancel_open_orders()
+            if result.get("status") == "ok":
+                callbacks.info(f"✓ Cancelled {len(open_orders)} order(s)")
+            else:
+                callbacks.warn(f"Failed to cancel orders: {result}")
+        else:
+            callbacks.info("No open orders to cancel")
+
     # Preview plan first (no execution)
     plan = trader.plan_rebalance()
+
+    # Check for open orders if not already cancelled
+    if not cancel_open_orders and plan.get("open_orders"):
+        from rich.prompt import Confirm
+        console = Console()
+        
+        open_orders = plan["open_orders"]
+        console.print(
+            f"\n[bold yellow]⚠️  Found {len(open_orders)} open order(s) that may conflict with rebalancing[/bold yellow]"
+        )
+        
+        if Confirm.ask("Cancel open orders before proceeding?", default=False):
+            callbacks.info(f"Cancelling {len(open_orders)} open order(s)...")
+            result = trader.cancel_open_orders()
+            if result.get("status") == "ok":
+                callbacks.info(f"✓ Cancelled {len(open_orders)} order(s)")
+                # Re-plan after cancelling orders
+                plan = trader.plan_rebalance()
+            else:
+                callbacks.warn(f"Failed to cancel orders: {result}")
 
     # Render plan via callbacks
     all_trades = plan["trades"] + plan["skipped_trades"]
@@ -701,7 +1016,6 @@ def analyze(
         num_long=config.portfolio.num_long,
         num_short=config.portfolio.num_short,
         target_leverage=config.portfolio.target_leverage,
-        weighting_scheme=config.portfolio.weighting_scheme,
         rank_power=config.portfolio.rank_power,
         rebalance_every_n_days=config.portfolio.rebalancing.every_n_days,
         prediction_lag_days=prediction_lag,
@@ -914,7 +1228,6 @@ def optimize(
         data_provider=config.data.source,
         start_date=start_date,
         end_date=end_date,
-        weighting_scheme=config.portfolio.weighting_scheme,
         rank_power=config.portfolio.rank_power,
         prediction_lag_days=prediction_lag,
         fee_bps=fee_bps,
@@ -1029,7 +1342,6 @@ def optimize(
                     num_short=best_params["num_short"],
                     target_leverage=best_params["target_leverage"],
                     rebalance_every_n_days=best_params["rebalance_every_n_days"],
-                    weighting_scheme="rank_power",  # Always use rank_power (power=0 is equal weight)
                     rank_power=best_params["rank_power"],
                     prediction_lag_days=prediction_lag,
                     fee_bps=fee_bps,
@@ -1196,6 +1508,9 @@ def run_live_cli(
             while True:
                 # Get current portfolio state
                 portfolio = trader.get_portfolio_info()
+                
+                # Get open orders
+                open_orders = trader.get_open_orders()
 
                 # Calculate next rebalance time and determine if due
                 next_action_time = trader.compute_next_rebalance_time(
@@ -1267,6 +1582,7 @@ def run_live_cli(
                         is_rebalancing=False,
                         config_dict=config_obj.to_dict(),
                         refresh_seconds=refresh_seconds,
+                        open_orders=open_orders,
                     )
                     live.update(dashboard)
 

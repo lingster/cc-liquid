@@ -54,8 +54,7 @@ class BacktestConfig:
     num_long: int = 60
     num_short: int = 50
     target_leverage: float = 3.0  # Sum of abs(weights), matching trader.py
-    # Weighting (opt-in non-EW)
-    weighting_scheme: Literal["equal", "rank_power"] = "equal"
+    # Weighting: power=0.0 is equal weight, higher = more concentration
     rank_power: float = 0.0
 
     # Rebalancing
@@ -390,7 +389,6 @@ class Backtester:
                         long_assets=long_assets,
                         short_assets=short_assets,
                         target_gross=self.config.target_leverage,
-                        scheme=self.config.weighting_scheme,
                         power=self.config.rank_power,
                     )
                     new_weights = weights
@@ -565,7 +563,6 @@ class BacktestOptimizer:
                 "fee_bps": self.base_config.fee_bps,
                 "slippage_bps": self.base_config.slippage_bps,
                 "start_capital": self.base_config.start_capital,
-                "weighting_scheme": self.base_config.weighting_scheme,
                 "rank_power": self.base_config.rank_power,
             },
         }
@@ -621,7 +618,6 @@ class BacktestOptimizer:
             slippage_bps=self.base_config.slippage_bps,
             start_capital=self.base_config.start_capital,
             verbose=False,
-            weighting_scheme="rank_power",  # Always use rank_power (power=0 is equal weight)
             rank_power=params["rank_power"],
         )
 

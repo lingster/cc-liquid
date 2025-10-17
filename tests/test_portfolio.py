@@ -4,7 +4,8 @@ import pytest
 from cc_liquid.portfolio import weights_from_ranks
 
 
-def test_weights_from_ranks_equal_scheme_balances_long_short():
+def test_weights_from_ranks_equal_weight_with_power_zero():
+    """Test that power=0.0 produces equal weighting."""
     preds = pl.DataFrame(
         {
             "id": ["AAA", "BBB", "CCC"],
@@ -19,7 +20,7 @@ def test_weights_from_ranks_equal_scheme_balances_long_short():
         long_assets=["AAA", "BBB"],
         short_assets=["CCC"],
         target_gross=1.2,
-        scheme="equal",
+        power=0.0,
     )
 
     assert set(weights) == {"AAA", "BBB", "CCC"}
@@ -30,6 +31,7 @@ def test_weights_from_ranks_equal_scheme_balances_long_short():
 
 
 def test_weights_from_ranks_rank_power_favors_top_asset():
+    """Test that higher power values create concentration in top assets."""
     preds = {
         "AAA": 0.9,
         "BBB": 0.6,
@@ -41,7 +43,6 @@ def test_weights_from_ranks_rank_power_favors_top_asset():
         long_assets=["AAA", "BBB"],
         short_assets=["CCC"],
         target_gross=1.0,
-        scheme="rank_power",
         power=2.0,
     )
 

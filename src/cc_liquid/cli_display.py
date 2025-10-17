@@ -99,11 +99,21 @@ def create_data_bar(
 
 
 def format_currency(value: float, compact: bool = False) -> str:
-    """Format currency values with appropriate styling."""
-    if compact and abs(value) >= 1000:
-        if abs(value) >= 1_000_000:
-            return f"${value / 1_000_000:.1f}M"
-        return f"${value / 1_000:.1f}K"
+    """Format currency values with appropriate styling.
+    
+    Dynamically adjusts decimal places for low-priced assets.
+    """
+    if compact and abs(value) >= 1_000_000:
+        return f"${value / 1_000_000:.1f}M"
+    
+    # Dynamic decimal places based on magnitude
+    thresholds = [(0.01, 6), (0.1, 5), (1, 4), (10, 3)]
+    abs_val = abs(value)
+    
+    for threshold, decimals in thresholds:
+        if abs_val < threshold:
+            return f"${value:.{decimals}f}"
+    
     return f"${value:,.2f}"
 
 
@@ -376,6 +386,7 @@ def create_dashboard_layout(
     last_rebalance_time: datetime | None = None,
     is_rebalancing: bool = False,
     refresh_seconds: float | None = None,
+    open_orders: list[dict] | None = None,
 ) -> Layout:
     """Unified portfolio dashboard builder.
 
@@ -421,11 +432,19 @@ def create_dashboard_layout(
     layout["metrics"].update(create_metrics_panel(portfolio))
     layout["positions"].update(create_positions_panel(portfolio))
 
-    # Sidebar
+    # Sidebar: split into config (top) and open orders (bottom)
+    layout["sidebar"].split_column(
+        Layout(name="config", ratio=2),
+        Layout(name="open_orders", ratio=1)
+    )
+
     empty_sidebar_text = (
         "[dim]No config loaded[/dim]" if has_footer else "[dim]No config[/dim]"
     )
-    layout["sidebar"].update(create_sidebar_panel(config_dict, empty_sidebar_text))
+    layout["sidebar"]["config"].update(create_sidebar_panel(config_dict, empty_sidebar_text))
+    layout["sidebar"]["open_orders"].update(
+        create_open_orders_panel(open_orders or [])
+    )
 
     # Footer (optional)
     if has_footer:
@@ -463,8 +482,7 @@ def create_config_tree_table(config_dict: dict) -> Table:
     leverage = portfolio_config.get("target_leverage", 1.0)
     leverage_color = "green" if leverage <= 2 else "yellow" if leverage <= 3 else "red"
     rebalancing = portfolio_config.get("rebalancing", {})
-    weighting_scheme = portfolio_config.get("weighting_scheme", "equal")
-    rank_power = portfolio_config.get("rank_power", 1.5)
+    rank_power = portfolio_config.get("rank_power", 0.0)
 
     # Execution section
     execution_config = config_dict.get("execution", {})
@@ -473,6 +491,11 @@ def create_config_tree_table(config_dict: dict) -> Table:
         "green" if slippage_pct <= 0.5 else "yellow" if slippage_pct <= 1.0 else "red"
     )
     min_trade_value = execution_config.get("min_trade_value", 10.0)
+    order_type = execution_config.get("order_type", "market")
+    order_type_display = order_type.capitalize()
+    order_type_color = "green" if order_type == "limit" else "white"
+    time_in_force = execution_config.get("time_in_force", "Ioc")
+    limit_price_offset_pct = execution_config.get("limit_price_offset", 0.0) * 100
 
     # Profile section (owner/vault and signer env name)
     profile_cfg = config_dict.get("profile", {})
@@ -499,20 +522,25 @@ def create_config_tree_table(config_dict: dict) -> Table:
         ("├─ Long Positions", f"[green]{portfolio_config.get('num_long', 10)}[/green]"),
         ("├─ Short Positions", f"[red]{portfolio_config.get('num_short', 10)}[/red]"),
         ("├─ Target Leverage", f"[{leverage_color}]{leverage:.1f}x[/{leverage_color}]"),
-        (
-            "├─ Weighting",
-            f"{weighting_scheme} ({rank_power})"
-            if weighting_scheme == "rank_power"
-            else "",
-        ),
+        ("├─ Rank Power", f"{rank_power:.1f}"),
         ("└─ Rebalancing", ""),
         ("   ├─ Frequency", f"Every {rebalancing.get('every_n_days', 10)} days"),
         ("   └─ Time (UTC)", rebalancing.get("at_time", "18:15")),
         ("", ""),
         ("[bold]EXECUTION[/bold]", ""),
-        ("├─ Slippage", f"[{slippage_color}]{slippage_pct:.1f}%[/{slippage_color}]"),
-        ("└─ Min Trade Value", format_currency(min_trade_value, compact=False)),
+        ("├─ Order Type", f"[{order_type_color}]{order_type_display}[/{order_type_color}]"),
     ]
+    
+    # Add order-type-specific fields
+    if order_type == "limit":
+        rows.extend([
+            ("├─ Time In Force", f"[white]{time_in_force}[/white]"),
+            ("├─ Limit Offset", f"[white]{limit_price_offset_pct:.2f}%[/white]"),
+        ])
+    else:  # market
+        rows.append(("├─ Slippage", f"[{slippage_color}]{slippage_pct:.1f}%[/{slippage_color}]"))
+    
+    rows.append(("└─ Min Trade Value", format_currency(min_trade_value, compact=False)))
 
     for row in rows:
         table.add_row(*row)
@@ -524,13 +552,14 @@ def display_portfolio(
     portfolio: "PortfolioInfo",
     console: Console | None = None,
     config_dict: dict | None = None,
+    open_orders: list[dict] | None = None,
 ) -> None:
     """Display portfolio information in a compact dashboard."""
     if console is None:
         console = Console()
 
     # Use the new dashboard layout
-    layout = create_dashboard_layout(portfolio, config_dict)
+    layout = create_dashboard_layout(portfolio, config_dict, open_orders=open_orders)
     console.print(layout)
 
 
@@ -541,6 +570,42 @@ def create_config_panel(config_dict: dict) -> Panel:
         title="[bold cyan]CONFIG[/bold cyan]",
         box=box.HEAVY,
     )
+
+
+def create_open_orders_panel(open_orders: list[dict]) -> Panel:
+    """Create panel displaying open orders table."""
+    if not open_orders:
+        return Panel(
+            "[dim]No open orders[/dim]",
+            title="[bold cyan]OPEN ORDERS[/bold cyan]",
+            box=box.HEAVY,
+        )
+    
+    table = Table(
+        box=box.SIMPLE_HEAD,
+        show_lines=False,
+        header_style="bold cyan on #001926",
+        expand=True,
+    )
+    
+    table.add_column("COIN", style="cyan", width=8)
+    table.add_column("SIDE", justify="center", width=6)
+    table.add_column("SIZE", justify="right", width=10)
+    table.add_column("PRICE", justify="right", width=10)
+    
+    for order in open_orders:
+        side = "BUY" if order["side"] == "B" else "SELL"
+        side_style = "green" if side == "BUY" else "red"
+        
+        table.add_row(
+            order["coin"],
+            f"[{side_style}]{side}[/{side_style}]",
+            order["sz"],
+            f"${float(order['limitPx']):,.2f}",
+        )
+    
+    title = f"[bold cyan]OPEN ORDERS[/bold cyan]  [dim]│[/dim]  {len(open_orders)} active"
+    return Panel(table, title=title, box=box.HEAVY)
 
 
 def display_file_summary(
@@ -626,6 +691,9 @@ def create_rebalancing_metrics_panel(
     # Target portfolio metrics
     total_long_value = sum(v for v in target_positions.values() if v > 0)
     total_short_value = abs(sum(v for v in target_positions.values() if v < 0))
+    
+    # Calculate total estimated fees
+    total_estimated_fees = sum(t.get("estimated_fee", 0) for t in executable_trades)
 
     # Create two columns
     left_table = Table(show_header=False, box=None, padding=(0, 1))
@@ -646,6 +714,7 @@ def create_rebalancing_metrics_panel(
     left_table.add_row(
         "TARGET SHORT", f"[red]{format_currency(total_short_value, compact=True)}[/red]"
     )
+    left_table.add_row("EST. FEES", f"${total_estimated_fees:.2f}")
 
     right_table = Table(show_header=False, box=None, padding=(0, 1))
     right_table.add_column("", width=12)
@@ -725,6 +794,7 @@ def create_trades_panel(trades: list) -> Panel:
     table.add_column("TRADE", justify="center", width=6)
     table.add_column("SIZE", justify="right", width=10)
     table.add_column("PRICE", justify="right", width=10)
+    table.add_column("EST FEE", justify="right", width=8)
 
     # Sort trades by absolute delta value, with executable trades first
     sorted_trades = sorted(
@@ -769,7 +839,7 @@ def create_trades_panel(trades: list) -> Panel:
 
         # Delta with color
         delta_color = "green" if delta_value > 0 else "red"
-        delta_str = f"[{delta_color}]{delta_value:+,.0f}[/{delta_color}]"
+        delta_str = f"[{delta_color}]{delta_value:+,.2f}[/{delta_color}]"
 
         # Style differently if trade is skipped
         if trade.get("skipped", False):
@@ -780,9 +850,10 @@ def create_trades_panel(trades: list) -> Panel:
             action = f"[dim]{action}[/dim]"
             current_str = f"[dim]{current_str}[/dim]"
             target_str = f"[dim]{target_str}[/dim]"
-            delta_str = f"[dim yellow]{delta_value:+,.0f}[/dim yellow]"
+            delta_str = f"[dim yellow]{delta_value:+,.2f}[/dim yellow]"
             size_str = "[dim]-[/dim]"  # No size since it won't execute
             price_str = "[dim]-[/dim]"  # No price since it won't execute
+            fee_str = "[dim]-[/dim]"  # No fee for skipped trades
         else:
             coin_str = f"[bold]{coin}[/bold]"
             size_str = f"{trade.get('sz', 0):.4f}" if "sz" in trade else "[dim]-[/dim]"
@@ -791,6 +862,7 @@ def create_trades_panel(trades: list) -> Panel:
                 if "price" in trade
                 else "[dim]-[/dim]"
             )
+            fee_str = f"${trade.get('estimated_fee', 0):.2f}"
 
         table.add_row(
             coin_str,
@@ -802,6 +874,7 @@ def create_trades_panel(trades: list) -> Panel:
             trade_action,
             size_str,
             price_str,
+            fee_str,
         )
 
     return Panel(table, title=title, box=box.HEAVY, expand=True)
@@ -832,6 +905,9 @@ def create_execution_metrics_panel(
         min_slippage = min(slippages)
     else:
         avg_slippage = max_slippage = min_slippage = 0
+    
+    # Calculate total actual fees from successful trades
+    total_actual_fees = sum(t.get("actual_fee", 0) for t in successful_trades)
 
     # Create two columns
     left_table = Table(show_header=False, box=None, padding=(0, 1))
@@ -860,6 +936,8 @@ def create_execution_metrics_panel(
         )
         left_table.add_row("MAX SLIPPAGE", f"{max_slippage:+.3f}%")
         left_table.add_row("MIN SLIPPAGE", f"{min_slippage:+.3f}%")
+        left_table.add_row("", "")  # spacer
+        left_table.add_row("ACTUAL FEES", f"${total_actual_fees:.2f}")
 
     right_table = Table(show_header=False, box=None, padding=(0, 1))
     right_table.add_column("", width=15)
@@ -926,12 +1004,23 @@ def create_execution_details_panel(
     # Define columns
     table.add_column("COIN", style="cyan", width=8)
     table.add_column("SIDE", justify="center", width=6)
+    table.add_column("ACTION", justify="center", width=8)
     table.add_column("SIZE", justify="right", width=10)
     table.add_column("EXPECTED", justify="right", width=10)
     table.add_column("FILLED", justify="right", width=10)
     table.add_column("SLIPPAGE", justify="right", width=10)
     table.add_column("VALUE", justify="right", width=12)
+    table.add_column("FEE", justify="right", width=8)
     table.add_column("STATUS", justify="center", width=8)
+    
+    # Action styling (matching create_trades_panel)
+    action_styles = {
+        "open": "[green]OPEN[/green]",
+        "close": "[red]CLOSE[/red]",
+        "flip": "[yellow]FLIP[/yellow]",
+        "reduce": "[blue]REDUCE[/blue]",
+        "increase": "[cyan]ADD[/cyan]",
+    }
 
     # Add successful trades first
     for trade in successful_trades:
@@ -940,31 +1029,66 @@ def create_execution_details_panel(
             side = "BUY" if trade["is_buy"] else "SELL"
             side_style = "green" if side == "BUY" else "red"
             slippage_style = "green" if trade.get("slippage_pct", 0) <= 0 else "red"
+            
+            # Get action type
+            trade_type = trade.get("type", "increase")
+            action = action_styles.get(trade_type, "[dim]ADJUST[/dim]")
 
             table.add_row(
                 f"[bold]{trade['coin']}[/bold]",
                 f"[{side_style}]{side}[/{side_style}]",
+                action,
                 f"{float(fill['totalSz']):.4f}",
                 format_currency(trade["price"], compact=True),
                 format_currency(float(fill["avgPx"]), compact=True),
                 f"[{slippage_style}]{trade.get('slippage_pct', 0):+.3f}%[/{slippage_style}]",
                 format_currency(float(fill["totalSz"]) * float(fill["avgPx"])),
+                f"${trade.get('actual_fee', 0):.2f}",
                 "[green]✓[/green]",
+            )
+        elif trade.get("resting"):
+            # Handle resting orders (Gtc/Alo orders posted to book)
+            side = "BUY" if trade["is_buy"] else "SELL"
+            side_style = "green" if side == "BUY" else "red"
+            oid = trade.get("oid", "")
+            oid_short = str(oid)[:8] if oid else "-"
+            
+            # Get action type
+            trade_type = trade.get("type", "increase")
+            action = action_styles.get(trade_type, "[dim]ADJUST[/dim]")
+
+            table.add_row(
+                f"[bold]{trade['coin']}[/bold]",
+                f"[{side_style}]{side}[/{side_style}]",
+                action,
+                f"{trade['sz']:.4f}",
+                format_currency(trade["price"], compact=True),
+                f"[yellow]OPEN[/yellow]",
+                f"[dim]OID:{oid_short}[/dim]",
+                format_currency(trade["sz"] * trade["price"]),
+                "[dim]-[/dim]",
+                "[yellow]●[/yellow]",
             )
 
     # Add failed trades
     for trade in failed_trades:
         side = "BUY" if trade["is_buy"] else "SELL"
         side_style = "green" if side == "BUY" else "red"
+        
+        # Get action type
+        trade_type = trade.get("type", "increase")
+        action = action_styles.get(trade_type, "[dim]ADJUST[/dim]")
 
         table.add_row(
             f"[bold]{trade['coin']}[/bold]",
             f"[{side_style}]{side}[/{side_style}]",
+            action,
             f"{trade['sz']:.4f}",
             format_currency(trade["price"], compact=True),
             "[red]-[/red]",
             "[red]-[/red]",
             "[red]-[/red]",
+            "[dim]-[/dim]",
             "[red]✗[/red]",
         )
 

@@ -37,8 +37,8 @@ profiles:
     vault: null                 # omit or null for personal portfolio
     signer_env: HYPERLIQUID_PRIVATE_KEY
 
-  my-vault:
-    owner: 0xYourMain           # optional, informational
+  alternate-profile: # optional, informational
+    owner: 0xYourMain           
     vault: 0xVaultAddress
     signer_env: HYPERLIQUID_AGENT_KEY_VAULT
 
@@ -59,8 +59,11 @@ portfolio:
     at_time: "18:15"   # HH:MM (UTC)
 
 execution:
-  slippage_tolerance: 0.005
+  slippage_tolerance: 0.005      # Market orders: aggressive pricing (default: 0.005)
+  limit_price_offset: 0.0        # Limit orders: passive offset (default: 0.0 = exact mid)
   min_trade_value: 10.0
+  order_type: market | limit
+  time_in_force: Ioc | Gtc | Alo
 ```
 
 
@@ -123,14 +126,71 @@ Column rules:
 
 - `num_long` / `num_short`: counts for top/bottom selections
 - `target_leverage`: scales notional per-position like `(account_value * target_leverage) / (num_long + num_short)`.
-- `weighting_scheme`: position sizing method (`equal`, `rank_power`) - see [Portfolio Weighting](portfolio-weighting.md)
-- `rank_power`: concentration parameter when using `rank_power` scheme (default: 1.5)
+- `rank_power`: concentration parameter (0.0 = equal weight, default; higher = more concentration in top-ranked positions) - see [Portfolio Weighting](portfolio-weighting.md)
 - `rebalancing.every_n_days` / `rebalancing.at_time` (UTC)
 
 ## Execution
 
-- `slippage_tolerance`: used for market orders
+- `slippage_tolerance`: For market orders - calculates aggressive limit prices away from mid to ensure fills (buy above mid, sell below mid). Default: 0.005 (0.5%)
+- `limit_price_offset`: For limit orders - calculates passive prices inside mid for better execution (buy below mid, sell above mid). Default: 0.0 (exact mid). Higher values = further inside mid = better prices but lower fill probability.
 - `min_trade_value`: trades below this absolute USD delta are skipped
+- `order_type`: order execution method
+    - `market` (default): uses `slippage_tolerance` for aggressive fills away from mid
+    - `limit`: uses `limit_price_offset` for passive pricing (0.0 = exact mid, >0 = inside mid)
+- `time_in_force`: how long orders stay active
+    - `Ioc` (Immediate or Cancel, default): fills immediately or cancels, no orders stay on book
+    - `Gtc` (Good til Canceled): orders stay on book until filled or manually canceled
+    - `Alo` (Add Liquidity Only): only posts to book, never takes liquidity
+
+**Note on limit orders with Ioc**: Passive limit orders (priced at or inside mid) with Ioc may not fill immediately. Consider using `Gtc` or `Alo` for limit orders if you want orders to rest on the book.
+
+### Order Status
+
+When orders execute, they can have different outcomes:
+
+- **Filled** - Order executed immediately ✅
+- **Resting** - Order successfully posted to book and waiting (Gtc/Alo only) ✅
+- **Failed** - Order rejected or not filled ❌
+
+### Managing Open Orders
+
+When using `Gtc` or `Alo`, unfilled orders stay on the book. Use these commands to manage them:
+
+```bash
+# View current open orders
+cc-liquid orders
+
+# Cancel all open orders
+cc-liquid cancel-orders
+
+# Cancel orders for specific coin
+cc-liquid cancel-orders --coin BTC
+
+# Cancel orders before rebalancing
+cc-liquid rebalance --cancel-open-orders
+```
+
+If you rebalance while having open orders, cc-liquid will:
+1. Warn you about potential conflicts
+2. Prompt you to cancel them (interactive)
+3. Or you can use `--cancel-open-orders` flag to auto-cancel
+
+### View Trade History
+
+Track your fills and fees:
+
+```bash
+# Last 7 days
+cc-liquid history --days 7
+
+# Specific date range
+cc-liquid history --start 2025-01-01 --end 2025-01-31
+
+# Limit results
+cc-liquid history --limit 100
+```
+
+Shows execution price, size, fees, and realized PnL for each fill.
 
 ## CLI overrides
 
@@ -151,3 +211,6 @@ Smart defaults when switching `data.source` are applied unless explicitly overri
 ## CLI helpers
 
 - `cc-liquid profile list | show | use <name>` – manage profiles
+- `cc-liquid orders` – view current open orders
+- `cc-liquid cancel-orders [--coin SYMBOL]` – cancel open orders
+- `cc-liquid history [--days N | --start DATE --end DATE]` – view trade history and fees
