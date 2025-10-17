@@ -54,6 +54,11 @@ portfolio:
   num_long: 10
   num_short: 10
   target_leverage: 1.0
+  rank_power: 0.0
+  stop_loss:
+    sides: none                # "none", "both", "long_only", "short_only"
+    pct: 0.17                  # 17% from entry price
+    slippage: 0.05             # 5% slippage tolerance
   rebalancing:
     every_n_days: 10
     at_time: "18:15"   # HH:MM (UTC)
@@ -128,6 +133,54 @@ Column rules:
 - `target_leverage`: scales notional per-position like `(account_value * target_leverage) / (num_long + num_short)`.
 - `rank_power`: concentration parameter (0.0 = equal weight, default; higher = more concentration in top-ranked positions) - see [Portfolio Weighting](portfolio-weighting.md)
 - `rebalancing.every_n_days` / `rebalancing.at_time` (UTC)
+
+### Stop Loss Protection
+
+Stop losses protect your positions from adverse price moves using Hyperliquid's native TP/SL trigger orders. They're calculated from entry price (not current price) for consistent risk management.
+
+Configuration:
+
+- `stop_loss.sides`: which positions to protect
+    - `none` (default): no stop loss protection
+    - `both`: protect all positions (longs and shorts)
+    - `long_only`: protect only long positions
+    - `short_only`: protect only short positions
+- `stop_loss.pct`: trigger distance from entry price (default: 0.17 = 17%)
+    - For longs: triggers when price falls 17% below entry
+    - For shorts: triggers when price rises 17% above entry
+- `stop_loss.slippage`: slippage tolerance for the limit order (default: 0.05 = 5%)
+    - Controls how far from trigger price the limit order can fill
+    - Higher = more likely to fill but worse execution
+    - Lower = better execution but may not fill in fast moves
+
+**How it works:**
+
+1. After each rebalance, stop losses are automatically placed on all eligible open positions
+2. Stop losses use Hyperliquid's position-based TP/SL (not order-based OCO)
+3. Existing TP/SL orders are cancelled and replaced with fresh ones each rebalance
+4. Stop losses remain active until:
+   - Triggered by price move (position closes with slippage)
+   - Next rebalance (cancelled and replaced with new stops)
+   - Manually cancelled
+
+**Manual application:**
+
+For positions opened manually or when limit orders fill after rebalance:
+
+```bash
+# Apply stop losses to all eligible open positions
+cc-liquid apply-stops
+
+# Override sides temporarily
+cc-liquid apply-stops --set portfolio.stop_loss.sides=both
+```
+
+**Backtesting:**
+
+Stop losses are simulated in backtests - positions that hit the trigger are closed with appropriate slippage and trading costs. This affects:
+- Maximum drawdown (typically reduced)
+- Total returns (may be reduced due to false positive stops)
+- Turnover and fees (increased)
 
 ## Execution
 
@@ -213,4 +266,5 @@ Smart defaults when switching `data.source` are applied unless explicitly overri
 - `cc-liquid profile list | show | use <name>` – manage profiles
 - `cc-liquid orders` – view current open orders
 - `cc-liquid cancel-orders [--coin SYMBOL]` – cancel open orders
+- `cc-liquid apply-stops` – manually apply stop losses to all open positions
 - `cc-liquid history [--days N | --start DATE --end DATE]` – view trade history and fees

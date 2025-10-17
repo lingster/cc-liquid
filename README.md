@@ -91,6 +91,13 @@ portfolio:
   num_long: 10
   num_short: 10
   target_leverage: 1.0          # 1.0 = no leverage, 2.0 = 2x, etc.
+  stop_loss:
+    sides: none                 # "none", "both", "long_only", "short_only"
+    pct: 0.17                   # 17% from entry price
+    slippage: 0.05              # 5% slippage tolerance
+  rebalancing:
+    every_n_days: 10
+    at_time: "18:15"
 
 execution:
   slippage_tolerance: 0.005     # Market orders: aggressive pricing (default)
@@ -134,6 +141,10 @@ cc-liquid orders
 cc-liquid cancel-orders                  # Cancel all
 cc-liquid cancel-orders --coin BTC       # Cancel specific coin
 
+# Apply stop losses to positions
+cc-liquid apply-stops                    # Apply to configured sides
+cc-liquid apply-stops --set portfolio.stop_loss.sides=both  # Override
+
 # View trade history
 cc-liquid history --days 7               # Last 7 days
 cc-liquid history --start 2025-01-01     # Date range
@@ -156,6 +167,11 @@ Use `--set` to override any config value at runtime:
 --set portfolio.num_long=15
 --set portfolio.num_short=8
 --set portfolio.target_leverage=2.0
+
+# Stop Loss
+--set portfolio.stop_loss.sides=both        # Enable on both sides
+--set portfolio.stop_loss.pct=0.15          # 15% from entry
+--set portfolio.stop_loss.slippage=0.05     # 5% slippage tolerance
 
 # Execution
 --set execution.slippage_tolerance=0.01      # Market order aggressiveness

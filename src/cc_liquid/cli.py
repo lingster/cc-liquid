@@ -910,6 +910,103 @@ def rebalance(skip_confirm, set_overrides, cancel_open_orders):
         callbacks.info("Trading cancelled by user")
 
 
+@cli.command(name="apply-stops")
+@click.option(
+    "--set",
+    "set_overrides",
+    multiple=True,
+    help="Override config values (e.g., --set portfolio.stop_loss.sides=both)",
+)
+def apply_stops(set_overrides):
+    """Manually apply stop losses to all open positions.
+    
+    Useful after:
+    - Limit orders fill (were resting on book during rebalance)
+    - Manual trades outside the bot
+    - Bot restart with existing positions
+    - Changing stop loss configuration
+    """
+    console = Console()
+    
+    # Apply CLI overrides
+    overrides_applied = apply_cli_overrides(config, set_overrides)
+    
+    # Create trader
+    callbacks = RichCLICallbacks()
+    trader = CCLiquid(config, callbacks=callbacks)
+    
+    # Show overrides
+    callbacks.on_config_override(overrides_applied)
+    
+    try:
+        # Show what we're doing
+        console.print("\n[cyan]Applying stop losses to open positions...[/cyan]")
+        
+        # Apply stop losses
+        result = trader.apply_stop_losses()
+        
+        # Display results
+        if result.get("status") == "disabled":
+            console.print(f"[yellow]{result['message']}[/yellow]")
+            return
+        
+        applied = result.get("applied", [])
+        skipped = result.get("skipped", [])
+        errors = result.get("errors", [])
+        
+        # Count side-filtered skips vs other skips
+        side_skips = [s for s in skipped if "not configured" in s.get("reason", "")]
+        other_skips = [s for s in skipped if "not configured" not in s.get("reason", "")]
+        
+        # Summary
+        console.print(f"\n[bold cyan]Stop Loss Application Summary[/bold cyan]")
+        console.print(f"[green]✓ Applied: {len(applied)}[/green]")
+        if side_skips:
+            console.print(f"[dim]⊘ Skipped (side filter): {len(side_skips)}[/dim]")
+        if other_skips:
+            console.print(f"[yellow]⊘ Skipped (other): {len(other_skips)}[/yellow]")
+        if errors:
+            console.print(f"[red]✗ Errors: {len(errors)}[/red]")
+        
+        # Details table
+        if applied:
+            from rich.table import Table
+            from .cli_display import format_currency
+            
+            table = Table(title="Applied Stop Losses", show_header=True, header_style="bold cyan")
+            table.add_column("COIN", style="cyan")
+            table.add_column("SIDE", justify="center")
+            table.add_column("ENTRY", justify="right")
+            table.add_column("TRIGGER", justify="right")
+            table.add_column("LIMIT", justify="right")
+            
+            for sl in applied:
+                side_style = "green" if sl["side"] == "LONG" else "red"
+                table.add_row(
+                    sl["coin"],
+                    f"[{side_style}]{sl['side']}[/{side_style}]",
+                    format_currency(sl['entry_px']),
+                    format_currency(sl['trigger_px']),
+                    format_currency(sl['limit_px']),
+                )
+            console.print(table)
+        
+        # Only show non-side-filtered skips (actual issues)
+        if other_skips:
+            console.print("\n[yellow]Skipped positions (issues):[/yellow]")
+            for s in other_skips:
+                console.print(f"  • {s['coin']}: {s['reason']}")
+        
+        if errors:
+            console.print("\n[red]Errors:[/red]")
+            for e in errors:
+                console.print(f"  • {e['coin']}: {e['error']}")
+                
+    except Exception as e:
+        console.print(f"[red]✗ Error applying stop losses:[/red] {e}")
+        raise
+
+
 @cli.command()
 @click.option(
     "--prices",
@@ -1021,6 +1118,9 @@ def analyze(
         prediction_lag_days=prediction_lag,
         fee_bps=fee_bps,
         slippage_bps=slippage_bps,
+        stop_loss_sides=config.portfolio.stop_loss.sides,
+        stop_loss_pct=config.portfolio.stop_loss.pct,
+        stop_loss_slippage=config.portfolio.stop_loss.slippage,
         verbose=verbose,
     )
 
@@ -1232,6 +1332,9 @@ def optimize(
         prediction_lag_days=prediction_lag,
         fee_bps=fee_bps,
         slippage_bps=slippage_bps,
+        stop_loss_sides=config.portfolio.stop_loss.sides,
+        stop_loss_pct=config.portfolio.stop_loss.pct,
+        stop_loss_slippage=config.portfolio.stop_loss.slippage,
         verbose=verbose,
     )
 
@@ -1346,6 +1449,9 @@ def optimize(
                     prediction_lag_days=prediction_lag,
                     fee_bps=fee_bps,
                     slippage_bps=slippage_bps,
+                    stop_loss_sides=config.portfolio.stop_loss_sides,
+                    stop_loss_pct=config.portfolio.stop_loss_pct,
+                    stop_loss_slippage=config.portfolio.stop_loss_slippage,
                     verbose=False,
                 )
 

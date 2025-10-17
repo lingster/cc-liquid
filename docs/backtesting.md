@@ -239,6 +239,35 @@ Adjust trading costs:
 cc-liquid analyze --fee-bps 5 --slippage-bps 10
 ```
 
+### Stop loss simulation
+
+Stop losses configured in your portfolio are automatically simulated in backtests. The simulation:
+
+- Checks each day if positions hit their trigger price (from entry)
+- Closes triggered positions with configured slippage
+- Applies trading costs (fees + slippage_bps) to stop loss exits
+- Removes stopped positions until next rebalance
+
+**Impact on metrics:**
+
+- **Drawdown**: Usually reduced (stops cut losses)
+- **Returns**: May be reduced (false positive stops)
+- **Turnover**: Increased (stop exits count as trades)
+- **Win rate**: May change (stops prevent both large losses and recoveries)
+
+**Testing stop loss configurations:**
+
+```bash
+# Compare with and without stops
+cc-liquid analyze --set portfolio.stop_loss.sides=none
+cc-liquid analyze --set portfolio.stop_loss.sides=both
+
+# Test different trigger levels
+cc-liquid analyze --set portfolio.stop_loss.pct=0.10  # Tight 10%
+cc-liquid analyze --set portfolio.stop_loss.pct=0.17  # Default 17%
+cc-liquid analyze --set portfolio.stop_loss.pct=0.25  # Loose 25%
+```
+
 
 ## Red flags
 

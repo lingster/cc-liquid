@@ -378,7 +378,32 @@ class CCLiquid:
 
         self.callbacks.info(f"Starting execution of {len(trades)} trades...")
         successful_trades = self._execute_trades(trades)
-        return {"successful_trades": successful_trades, "all_trades": trades}
+        
+        # Apply stop losses after execution
+        sl_result = None
+        if self.config.portfolio.stop_loss.sides != "none":
+            self.callbacks.info("Applying stop losses to positions...")
+            sl_result = self.apply_stop_losses()
+            
+            # Report SL results
+            if sl_result.get("status") == "ok":
+                applied_count = sl_result.get("total_applied", 0)
+                if applied_count > 0:
+                    self.callbacks.info(f"✓ Placed {applied_count} stop loss order(s)")
+                
+                # Warn about resting orders
+                resting = [t for t in successful_trades if t.get("resting")]
+                if resting:
+                    self.callbacks.warn(
+                        f"{len(resting)} order(s) resting on book. "
+                        "Run 'cc-liquid apply-stops' after they fill to add protection."
+                    )
+        
+        return {
+            "successful_trades": successful_trades,
+            "all_trades": trades,
+            "stop_loss_result": sl_result
+        }
 
     def plan_close_all_positions(self, *, force: bool = False) -> dict:
         """Plan to close all open positions (return to cash) without executing orders."""
@@ -1066,6 +1091,226 @@ class CCLiquid:
         if not owner:
             raise ValueError("Missing portfolio owner address")
         return self.info.user_fees(owner)
+
+    def _should_apply_stop_loss(self, side: str) -> bool:
+        """Check if stop loss should be applied to a position side."""
+        sides_config = self.config.portfolio.stop_loss.sides
+        if sides_config == "none":
+            return False
+        if sides_config == "both":
+            return True
+        if sides_config == "long_only" and side == "LONG":
+            return True
+        if sides_config == "short_only" and side == "SHORT":
+            return True
+        return False
+
+    def cancel_all_tpsl_orders(self) -> dict[str, Any]:
+        """Cancel all existing TP/SL orders across the portfolio."""
+        open_orders = self.get_open_orders()
+        
+        if not open_orders:
+            return {"status": "ok", "response": "No open orders", "cancelled": 0}
+        
+        # Filter for TP/SL orders - check both nested structure and direct
+        tpsl_orders = []
+        for o in open_orders:
+            order_type = o.get("orderType", {})
+            # Check if it's a trigger order (TP/SL)
+            if isinstance(order_type, dict) and "trigger" in order_type:
+                tpsl_orders.append(o)
+            # Also check string format if API returns it differently
+            elif isinstance(order_type, str) and "trigger" in order_type.lower():
+                tpsl_orders.append(o)
+        
+        if not tpsl_orders:
+            self.callbacks.info(f"No existing TP/SL orders to cancel (found {len(open_orders)} other orders)")
+            return {"status": "ok", "response": "No TP/SL orders to cancel", "cancelled": 0}
+        
+        cancel_requests = [
+            {"coin": order["coin"], "oid": order["oid"]} 
+            for order in tpsl_orders
+        ]
+        
+        self.callbacks.info(f"Cancelling {len(cancel_requests)} existing TP/SL order(s)...")
+        result = self.exchange.bulk_cancel(cancel_requests)
+        result["cancelled"] = len(cancel_requests)
+        return result
+
+    def apply_stop_losses(self) -> dict[str, Any]:
+        """Apply stop losses to all current open positions per config.
+        
+        Returns:
+            Dict with counts of applied/skipped SLs and any errors
+        """
+        if self.config.portfolio.stop_loss.sides == "none":
+            return {
+                "status": "disabled",
+                "message": "Stop losses disabled in config (stop_loss.sides=none)"
+            }
+        
+        # Get current positions
+        positions = self.get_positions()
+        if not positions:
+            return {
+                "status": "ok",
+                "applied": 0,
+                "message": "No open positions to protect"
+            }
+        
+        # Cancel existing TP/SL orders first
+        self.cancel_all_tpsl_orders()
+        
+        # Get current prices
+        all_mids = self.info.all_mids()
+        
+        applied = []
+        skipped = []
+        errors = []
+        
+        # Count eligible positions first for progress tracking
+        eligible_positions = []
+        for coin, position in positions.items():
+            size = float(position.get("szi", 0))
+            if size == 0:
+                continue
+            side = "LONG" if size > 0 else "SHORT"
+            if self._should_apply_stop_loss(side):
+                eligible_positions.append(coin)
+        
+        total_eligible = len(eligible_positions)
+        
+        # Build all SL orders first
+        orders_to_place = []
+        order_metadata = []  # Track metadata for each order
+        
+        for coin, position in positions.items():
+            size = float(position.get("szi", 0))
+            if size == 0:
+                continue
+            
+            side = "LONG" if size > 0 else "SHORT"
+            
+            # Check if this side should have SL
+            if not self._should_apply_stop_loss(side):
+                skipped.append({"coin": coin, "reason": f"Side {side} not configured"})
+                continue
+            
+            # Get entry price
+            entry_px = float(position.get("entryPx", 0))
+            if entry_px <= 0:
+                skipped.append({"coin": coin, "reason": "Invalid entry price"})
+                continue
+            
+            # Calculate trigger price
+            stop_pct = self.config.portfolio.stop_loss.pct
+            if side == "LONG":
+                trigger_px = entry_px * (1 - stop_pct)
+                is_buy = False  # SL on long = sell
+            else:  # SHORT
+                trigger_px = entry_px * (1 + stop_pct)
+                is_buy = True  # SL on short = buy
+            
+            # Calculate limit price with slippage
+            slippage = self.config.portfolio.stop_loss.slippage
+            if is_buy:
+                limit_px = trigger_px * (1 + slippage)
+            else:
+                limit_px = trigger_px * (1 - slippage)
+            
+            # Round prices
+            trigger_px = self._round_price_perp(coin, trigger_px)
+            limit_px = self._round_price_perp(coin, limit_px)
+            
+            # Round size
+            rounded = self._round_size(coin, abs(size))
+            if rounded is None:
+                skipped.append({"coin": coin, "reason": "Unknown szDecimals"})
+                continue
+            sl_size, _ = rounded
+            
+            # Build SL order
+            sl_order = {
+                "coin": coin,
+                "is_buy": is_buy,
+                "sz": sl_size,
+                "limit_px": limit_px,
+                "order_type": {
+                    "trigger": {
+                        "isMarket": False,  # Use limit for custom slippage
+                        "triggerPx": trigger_px,  # SDK handles string conversion
+                        "tpsl": "sl"
+                    }
+                },
+                "reduce_only": True,
+            }
+            
+            orders_to_place.append(sl_order)
+            order_metadata.append({
+                "coin": coin,
+                "side": side,
+                "entry_px": entry_px,
+                "trigger_px": trigger_px,
+                "limit_px": limit_px,
+                "size": sl_size
+            })
+        
+        # Place all orders in one batch
+        if orders_to_place:
+            self.callbacks.info(f"Placing {len(orders_to_place)} stop loss order(s) in batch...")
+            
+            try:
+                result = self.exchange.bulk_orders(orders_to_place)
+                
+                if result.get("status") == "ok":
+                    # Process response statuses
+                    response = result.get("response", {})
+                    statuses = response.get("data", {}).get("statuses", [])
+                    
+                    for i, status in enumerate(statuses):
+                        if i >= len(order_metadata):
+                            break
+                        
+                        metadata = order_metadata[i]
+                        
+                        if "resting" in status:
+                            # SL order successfully placed
+                            applied.append(metadata)
+                        elif "error" in status:
+                            errors.append({
+                                "coin": metadata["coin"],
+                                "error": status["error"]
+                            })
+                        else:
+                            # Unexpected status
+                            errors.append({
+                                "coin": metadata["coin"],
+                                "error": f"Unexpected status: {status}"
+                            })
+                else:
+                    # Bulk operation failed entirely
+                    for metadata in order_metadata:
+                        errors.append({
+                            "coin": metadata["coin"],
+                            "error": result.get("response", "Bulk operation failed")
+                        })
+            except Exception as e:
+                # Exception during bulk operation
+                for metadata in order_metadata:
+                    errors.append({
+                        "coin": metadata["coin"],
+                        "error": str(e)
+                    })
+        
+        return {
+            "status": "ok",
+            "applied": applied,
+            "skipped": skipped,
+            "errors": errors,
+            "total_applied": len(applied),
+            "total_skipped": len(skipped),
+            "total_errors": len(errors)
+        }
 
     def _load_predictions(self) -> pl.DataFrame | None:
         """Load predictions based on configured data source."""

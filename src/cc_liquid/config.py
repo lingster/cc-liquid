@@ -30,6 +30,15 @@ class RebalancingConfig:
 
 
 @dataclass
+class StopLossConfig:
+    """Stop loss protection configuration."""
+
+    sides: str = "none"  # "none", "both", "long_only", "short_only"
+    pct: float = 0.17  # 17% from entry price
+    slippage: float = 0.05  # Slippage tolerance for limit order
+
+
+@dataclass
 class PortfolioConfig:
     """Portfolio construction parameters."""
 
@@ -38,6 +47,7 @@ class PortfolioConfig:
     target_leverage: float = 1.0  # Position sizing multiplier (1.0 = no leverage)
     rank_power: float = 0.0  # 0.0 = equal weight (default), higher = more concentration
     rebalancing: RebalancingConfig = field(default_factory=RebalancingConfig)
+    stop_loss: StopLossConfig = field(default_factory=StopLossConfig)
 
 
 @dataclass
@@ -217,9 +227,11 @@ class Config:
     def to_dict(self) -> dict[str, Any]:
         """Return a dictionary representation of the config."""
         portfolio_dict = self.portfolio.__dict__.copy()
-        # Convert nested dataclass to dict
+        # Convert nested dataclasses to dict
         if hasattr(self.portfolio, "rebalancing"):
             portfolio_dict["rebalancing"] = self.portfolio.rebalancing.__dict__
+        if hasattr(self.portfolio, "stop_loss"):
+            portfolio_dict["stop_loss"] = self.portfolio.stop_loss.__dict__
 
         # Profile summary (non-secret)
         active_profile = self.active_profile

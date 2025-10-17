@@ -270,7 +270,7 @@ def create_positions_panel(portfolio: "PortfolioInfo") -> Panel:
 
     # Define columns
     table.add_column("COIN", style="cyan", width=8)
-    table.add_column("SIDE", justify="center", width=8)
+    table.add_column("SIDE", justify="center", width=5)
     table.add_column("SIZE", justify="right", width=8)
     table.add_column("ENTRY", justify="right", width=10)
     table.add_column("MARK", justify="right", width=10)
@@ -504,6 +504,11 @@ def create_config_tree_table(config_dict: dict) -> Table:
     active_profile = profile_cfg.get("active") or "[dim]-[/dim]"
     signer_env = profile_cfg.get("signer_env") or "HYPERLIQUID_PRIVATE_KEY"
 
+    # Check if stop loss is enabled
+    stop_loss_config = portfolio_config.get("stop_loss", {})
+    stop_loss_sides = stop_loss_config.get("sides", "none")
+    stop_loss_enabled = stop_loss_sides != "none"
+    
     # Build all rows
     rows = [
         ("[bold]ENVIRONMENT[/bold]", ""),
@@ -523,13 +528,28 @@ def create_config_tree_table(config_dict: dict) -> Table:
         ("├─ Short Positions", f"[red]{portfolio_config.get('num_short', 10)}[/red]"),
         ("├─ Target Leverage", f"[{leverage_color}]{leverage:.1f}x[/{leverage_color}]"),
         ("├─ Rank Power", f"{rank_power:.1f}"),
+    ]
+    
+    sides_color = "green" if stop_loss_sides == "both" else "yellow" if stop_loss_enabled else "dim"
+    rows.append(("├─ Stop Loss", f"[{sides_color}]{stop_loss_sides}[/{sides_color}]"))
+    
+    if stop_loss_enabled:
+        stop_pct = stop_loss_config.get("pct", 0.17) * 100
+        slippage = stop_loss_config.get("slippage", 0.05) * 100
+        
+        rows.extend([
+            ("│  ├─ Trigger", f"{stop_pct:.0f}%"),
+            ("│  └─ Slippage", f"{slippage:.0f}%"),
+        ])
+    
+    rows.extend([
         ("└─ Rebalancing", ""),
         ("   ├─ Frequency", f"Every {rebalancing.get('every_n_days', 10)} days"),
         ("   └─ Time (UTC)", rebalancing.get("at_time", "18:15")),
         ("", ""),
         ("[bold]EXECUTION[/bold]", ""),
         ("├─ Order Type", f"[{order_type_color}]{order_type_display}[/{order_type_color}]"),
-    ]
+    ])
     
     # Add order-type-specific fields
     if order_type == "limit":
@@ -601,7 +621,7 @@ def create_open_orders_panel(open_orders: list[dict]) -> Panel:
             order["coin"],
             f"[{side_style}]{side}[/{side_style}]",
             order["sz"],
-            f"${float(order['limitPx']):,.2f}",
+            format_currency(float(order['limitPx'])),
         )
     
     title = f"[bold cyan]OPEN ORDERS[/bold cyan]  [dim]│[/dim]  {len(open_orders)} active"

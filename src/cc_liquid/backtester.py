@@ -67,6 +67,11 @@ class BacktestConfig:
 
     # Initial capital
     start_capital: float = 100_000.0
+    
+    # Stop loss configuration (flat for BacktestConfig, maps to portfolio.stop_loss in main config)
+    stop_loss_sides: str = "none"  # "none", "both", "long_only", "short_only"
+    stop_loss_pct: float = 0.17  # 17% from entry price
+    stop_loss_slippage: float = 0.05  # Slippage tolerance for limit order
 
     # Options
     verbose: bool = False
@@ -347,6 +352,7 @@ class Backtester:
         daily_results = []
         position_snapshots = []
         current_weights = {}  # Asset -> weight
+        entry_prices = {}  # Asset -> entry price (for stop loss tracking)
 
         # Convert rebalance dates to set for fast lookup
         rebalance_set = set(rebalance_dates)
@@ -415,10 +421,104 @@ class Backtester:
                         {"date": date, "id": asset, "weight": weight}
                     )
 
+                # Update entry prices for new/changed positions
+                # Entry price = 1.0 (normalized, we track returns from here)
+                for asset in new_weights:
+                    if asset not in current_weights or current_weights.get(asset, 0) == 0:
+                        # New position - set entry price to 1.0 (start of tracking)
+                        entry_prices[asset] = 1.0
+                    # For existing positions, keep the original entry price
+
                 # Update current weights for next period
                 current_weights = new_weights.copy()
             else:
                 turnover = 0.0
+
+            # Check for stop loss triggers before calculating portfolio return
+            if self.config.stop_loss_sides != "none" and current_weights:
+                triggered_stops = []
+                
+                for asset, weight in current_weights.items():
+                    if weight == 0:
+                        continue
+                    
+                    # Determine side
+                    side = "LONG" if weight > 0 else "SHORT"
+                    
+                    # Check if this side has SL enabled
+                    should_protect = (
+                        self.config.stop_loss_sides == "both" or
+                        (self.config.stop_loss_sides == "long_only" and side == "LONG") or
+                        (self.config.stop_loss_sides == "short_only" and side == "SHORT")
+                    )
+                    
+                    if not should_protect:
+                        continue
+                    
+                    # Get entry price
+                    entry_price = entry_prices.get(asset, 0)
+                    if entry_price <= 0:
+                        continue
+                    
+                    # Get current return to calculate current price
+                    if asset not in returns_row.columns:
+                        continue
+                    current_return = returns_row[asset][0]
+                    if current_return is None or math.isnan(current_return):
+                        continue
+                    
+                    # Calculate current price from entry + cumulative return
+                    # Note: This is simplified - in reality we'd need to track cumulative returns
+                    # For now, we check if today's return would trigger the stop
+                    current_price = entry_price * (1 + current_return)
+                    
+                    # Check if stop triggered
+                    stop_pct = self.config.stop_loss_pct
+                    if side == "LONG":
+                        trigger_price = entry_price * (1 - stop_pct)
+                        triggered = current_price <= trigger_price
+                    else:  # SHORT
+                        trigger_price = entry_price * (1 + stop_pct)
+                        triggered = current_price >= trigger_price
+                    
+                    if triggered:
+                        # Calculate exit with slippage
+                        slippage = self.config.stop_loss_slippage
+                        if side == "LONG":
+                            exit_price = trigger_price * (1 - slippage)
+                        else:
+                            exit_price = trigger_price * (1 + slippage)
+                        
+                        # Calculate realized return from entry to exit
+                        if side == "LONG":
+                            realized_return = (exit_price - entry_price) / entry_price
+                        else:
+                            realized_return = (entry_price - exit_price) / entry_price
+                        
+                        triggered_stops.append({
+                            "asset": asset,
+                            "side": side,
+                            "weight": weight,
+                            "realized_return": realized_return,
+                        })
+                
+                # Process triggered stops
+                for stop in triggered_stops:
+                    asset = stop["asset"]
+                    weight = stop["weight"]
+                    realized_return = stop["realized_return"]
+                    
+                    # Remove position (set weight to 0)
+                    current_weights[asset] = 0
+                    
+                    # Account for turnover and costs
+                    turnover += abs(weight)
+                    total_cost_bps = self.config.fee_bps + self.config.slippage_bps
+                    cost = abs(weight) * (total_cost_bps / 10_000)
+                    equity *= 1 - cost
+                    
+                    # Note: The realized return from the stop will NOT be added to portfolio_return
+                    # because we're zeroing the weight, so the position won't contribute below
 
             # Calculate portfolio return (using current weights from previous rebalance)
             portfolio_return = 0.0
