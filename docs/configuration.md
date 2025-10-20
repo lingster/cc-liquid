@@ -175,13 +175,6 @@ cc-liquid apply-stops
 cc-liquid apply-stops --set portfolio.stop_loss.sides=both
 ```
 
-**Backtesting:**
-
-Stop losses are simulated in backtests - positions that hit the trigger are closed with appropriate slippage and trading costs. This affects:
-- Maximum drawdown (typically reduced)
-- Total returns (may be reduced due to false positive stops)
-- Turnover and fees (increased)
-
 ## Execution
 
 - `slippage_tolerance`: For market orders - calculates aggressive limit prices away from mid to ensure fills (buy above mid, sell below mid). Default: 0.005 (0.5%)

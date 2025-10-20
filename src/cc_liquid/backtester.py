@@ -67,11 +67,6 @@ class BacktestConfig:
 
     # Initial capital
     start_capital: float = 100_000.0
-    
-    # Stop loss configuration (flat for BacktestConfig, maps to portfolio.stop_loss in main config)
-    stop_loss_sides: str = "none"  # "none", "both", "long_only", "short_only"
-    stop_loss_pct: float = 0.17  # 17% from entry price
-    stop_loss_slippage: float = 0.05  # Slippage tolerance for limit order
 
     # Options
     verbose: bool = False
@@ -352,7 +347,6 @@ class Backtester:
         daily_results = []
         position_snapshots = []
         current_weights = {}  # Asset -> weight
-        entry_prices = {}  # Asset -> entry price (for stop loss tracking)
 
         # Convert rebalance dates to set for fast lookup
         rebalance_set = set(rebalance_dates)
@@ -364,7 +358,26 @@ class Backtester:
             # Get today's returns
             returns_row = returns_wide.filter(pl.col("date") == date)
 
+            # Calculate portfolio return using old weights (positions held from previous close)
+            portfolio_return = 0.0
+
+            if current_weights:
+                for asset, weight in current_weights.items():
+                    if asset in returns_row.columns:
+                        asset_return = returns_row[asset][0]
+                        if asset_return is not None and not math.isnan(asset_return):
+                            portfolio_return += weight * asset_return
+
+            # Update equity with returns
+            equity *= 1 + portfolio_return
+
+            # Track peak and drawdown
+            if equity > peak_equity:
+                peak_equity = equity
+            drawdown = (equity - peak_equity) / peak_equity if peak_equity > 0 else 0
+
             # Check if we need to rebalance
+            turnover = 0.0
             if date in rebalance_set:
                 # Determine cutoff date for predictions (T - lag)
                 cutoff_date = date - timedelta(days=self.config.prediction_lag_days)
@@ -400,7 +413,6 @@ class Backtester:
                     new_weights = weights
 
                 # Calculate turnover (L1 norm of weight changes)
-                turnover = 0.0
                 all_assets = set(current_weights.keys()) | set(new_weights.keys())
                 for asset in all_assets:
                     old_w = current_weights.get(asset, 0.0)
@@ -411,8 +423,7 @@ class Backtester:
                 total_cost_bps = self.config.fee_bps + self.config.slippage_bps
                 cost = turnover * (total_cost_bps / 10_000)
 
-                # Update weights AFTER calculating returns (weights take effect next period)
-                # But deduct costs immediately
+                # Deduct rebalancing costs from equity
                 equity *= 1 - cost
 
                 # Store position snapshot
@@ -421,122 +432,8 @@ class Backtester:
                         {"date": date, "id": asset, "weight": weight}
                     )
 
-                # Update entry prices for new/changed positions
-                # Entry price = 1.0 (normalized, we track returns from here)
-                for asset in new_weights:
-                    if asset not in current_weights or current_weights.get(asset, 0) == 0:
-                        # New position - set entry price to 1.0 (start of tracking)
-                        entry_prices[asset] = 1.0
-                    # For existing positions, keep the original entry price
-
-                # Update current weights for next period
+                # Update weights for next period (take effect at next close)
                 current_weights = new_weights.copy()
-            else:
-                turnover = 0.0
-
-            # Check for stop loss triggers before calculating portfolio return
-            if self.config.stop_loss_sides != "none" and current_weights:
-                triggered_stops = []
-                
-                for asset, weight in current_weights.items():
-                    if weight == 0:
-                        continue
-                    
-                    # Determine side
-                    side = "LONG" if weight > 0 else "SHORT"
-                    
-                    # Check if this side has SL enabled
-                    should_protect = (
-                        self.config.stop_loss_sides == "both" or
-                        (self.config.stop_loss_sides == "long_only" and side == "LONG") or
-                        (self.config.stop_loss_sides == "short_only" and side == "SHORT")
-                    )
-                    
-                    if not should_protect:
-                        continue
-                    
-                    # Get entry price
-                    entry_price = entry_prices.get(asset, 0)
-                    if entry_price <= 0:
-                        continue
-                    
-                    # Get current return to calculate current price
-                    if asset not in returns_row.columns:
-                        continue
-                    current_return = returns_row[asset][0]
-                    if current_return is None or math.isnan(current_return):
-                        continue
-                    
-                    # Calculate current price from entry + cumulative return
-                    # Note: This is simplified - in reality we'd need to track cumulative returns
-                    # For now, we check if today's return would trigger the stop
-                    current_price = entry_price * (1 + current_return)
-                    
-                    # Check if stop triggered
-                    stop_pct = self.config.stop_loss_pct
-                    if side == "LONG":
-                        trigger_price = entry_price * (1 - stop_pct)
-                        triggered = current_price <= trigger_price
-                    else:  # SHORT
-                        trigger_price = entry_price * (1 + stop_pct)
-                        triggered = current_price >= trigger_price
-                    
-                    if triggered:
-                        # Calculate exit with slippage
-                        slippage = self.config.stop_loss_slippage
-                        if side == "LONG":
-                            exit_price = trigger_price * (1 - slippage)
-                        else:
-                            exit_price = trigger_price * (1 + slippage)
-                        
-                        # Calculate realized return from entry to exit
-                        if side == "LONG":
-                            realized_return = (exit_price - entry_price) / entry_price
-                        else:
-                            realized_return = (entry_price - exit_price) / entry_price
-                        
-                        triggered_stops.append({
-                            "asset": asset,
-                            "side": side,
-                            "weight": weight,
-                            "realized_return": realized_return,
-                        })
-                
-                # Process triggered stops
-                for stop in triggered_stops:
-                    asset = stop["asset"]
-                    weight = stop["weight"]
-                    realized_return = stop["realized_return"]
-                    
-                    # Remove position (set weight to 0)
-                    current_weights[asset] = 0
-                    
-                    # Account for turnover and costs
-                    turnover += abs(weight)
-                    total_cost_bps = self.config.fee_bps + self.config.slippage_bps
-                    cost = abs(weight) * (total_cost_bps / 10_000)
-                    equity *= 1 - cost
-                    
-                    # Note: The realized return from the stop will NOT be added to portfolio_return
-                    # because we're zeroing the weight, so the position won't contribute below
-
-            # Calculate portfolio return (using current weights from previous rebalance)
-            portfolio_return = 0.0
-
-            if current_weights:
-                for asset, weight in current_weights.items():
-                    if asset in returns_row.columns:
-                        asset_return = returns_row[asset][0]
-                        if asset_return is not None and not math.isnan(asset_return):
-                            portfolio_return += weight * asset_return
-
-            # Update equity
-            equity *= 1 + portfolio_return
-
-            # Track peak and drawdown
-            if equity > peak_equity:
-                peak_equity = equity
-            drawdown = (equity - peak_equity) / peak_equity if peak_equity > 0 else 0
 
             # Store daily results
             daily_results.append(
@@ -584,8 +481,12 @@ class Backtester:
         daily_vol = returns.std()
         annual_vol = float(daily_vol * math.sqrt(365)) if daily_vol is not None else 0.0
 
-        # Sharpe ratio (assuming 0 risk-free rate)
-        sharpe = cagr / annual_vol if annual_vol > 0 else 0.0
+        # Calculate annualized arithmetic mean return for Sharpe/Sortino
+        mean_daily_return = returns.mean()
+        annualized_mean_return = float(mean_daily_return * 365) if mean_daily_return is not None else 0.0
+
+        # Sharpe ratio (using arithmetic mean, not CAGR)
+        sharpe = annualized_mean_return / annual_vol if annual_vol > 0 else 0.0
 
         # Drawdown
         max_drawdown = daily["drawdown"].min()  # Most negative value
@@ -606,16 +507,16 @@ class Backtester:
         if avg_turnover is None:
             avg_turnover = 0
 
-        # Sortino ratio (downside deviation)
+        # Sortino ratio (downside deviation, using arithmetic mean)
         negative_returns = returns.filter(returns < 0)
         if len(negative_returns) > 0:
             downside_vol = negative_returns.std()
             annual_downside_vol = (
                 downside_vol * math.sqrt(365) if downside_vol is not None else 0
             )
-            sortino = cagr / annual_downside_vol if annual_downside_vol > 0 else 0
+            sortino = annualized_mean_return / annual_downside_vol if annual_downside_vol > 0 else 0
         else:
-            sortino = float("inf") if cagr > 0 else 0
+            sortino = float("inf") if annualized_mean_return > 0 else 0
 
         return {
             "days": n_days,

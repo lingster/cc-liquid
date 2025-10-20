@@ -1118,9 +1118,6 @@ def analyze(
         prediction_lag_days=prediction_lag,
         fee_bps=fee_bps,
         slippage_bps=slippage_bps,
-        stop_loss_sides=config.portfolio.stop_loss.sides,
-        stop_loss_pct=config.portfolio.stop_loss.pct,
-        stop_loss_slippage=config.portfolio.stop_loss.slippage,
         verbose=verbose,
     )
 
@@ -1332,9 +1329,6 @@ def optimize(
         prediction_lag_days=prediction_lag,
         fee_bps=fee_bps,
         slippage_bps=slippage_bps,
-        stop_loss_sides=config.portfolio.stop_loss.sides,
-        stop_loss_pct=config.portfolio.stop_loss.pct,
-        stop_loss_slippage=config.portfolio.stop_loss.slippage,
         verbose=verbose,
     )
 
@@ -1449,9 +1443,6 @@ def optimize(
                     prediction_lag_days=prediction_lag,
                     fee_bps=fee_bps,
                     slippage_bps=slippage_bps,
-                    stop_loss_sides=config.portfolio.stop_loss_sides,
-                    stop_loss_pct=config.portfolio.stop_loss_pct,
-                    stop_loss_slippage=config.portfolio.stop_loss_slippage,
                     verbose=False,
                 )
 

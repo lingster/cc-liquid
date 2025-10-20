@@ -64,8 +64,8 @@ def test_backtester_run_basic(tmp_path):  # noqa: D103
     assert result.daily.height == 2
     assert result.rebalance_positions.height == 2
     assert set(result.rebalance_positions["id"].unique()) == {"AAA"}
-    assert result.stats["final_equity"] == pytest.approx(121.0)
-    assert result.stats["total_return"] == pytest.approx(0.21, abs=1e-6)
+    assert result.stats["final_equity"] == pytest.approx(110.0)
+    assert result.stats["total_return"] == pytest.approx(0.10, abs=1e-6)
     assert result.stats["avg_turnover"] == pytest.approx(1.0)
 
 
@@ -144,5 +144,5 @@ def test_backtest_optimizer_run_single_backtest(tmp_path):
     assert result["leverage"] == 1.0
     assert result["rebalance_days"] == 1
     assert result["rank_power"] == 0.0  # 0.0 = equal weight
-    assert result["final_equity"] == pytest.approx(121.0)
+    assert result["final_equity"] == pytest.approx(110.0)
     assert result["sharpe"] >= 0
