@@ -2193,10 +2193,10 @@ def create_ascii_heatmap(pivot_df, longs: list, shorts: list, metric: str) -> st
 def display_pnl_summary(
     pnl_summary: dict[str, dict[str, float]], console: Console | None = None
 ) -> None:
-    """Display PNL summary table with totals.
+    """Display PNL summary table with totals, fees, and volume.
 
     Args:
-        pnl_summary: Dictionary mapping currency to realized/unrealized PNL
+        pnl_summary: Dictionary mapping currency to realized/unrealized PNL, fees, and volume
         console: Rich Console instance (creates new one if None)
     """
     if console is None:
@@ -2223,15 +2223,21 @@ def display_pnl_summary(
     # Add rows for each currency
     total_realized = 0.0
     total_unrealized = 0.0
+    total_fees = 0.0
+    total_volume = 0.0
 
     for currency in sorted(pnl_summary.keys()):
         data = pnl_summary[currency]
         realized = data["realized_pnl"]
         unrealized = data["unrealized_pnl"]
         total = realized + unrealized
+        fees = data.get("fees", 0.0)
+        volume = data.get("volume", 0.0)
 
         total_realized += realized
         total_unrealized += unrealized
+        total_fees += fees
+        total_volume += volume
 
         # Style based on profit/loss
         realized_style = "green" if realized >= 0 else "red"
@@ -2260,3 +2266,8 @@ def display_pnl_summary(
     )
 
     console.print(table)
+
+    # Add fee and volume summary below the table (similar to history command)
+    console.print(
+        f"\n[cyan]Total volume: ${total_volume:,.2f}  │  Fees: ${total_fees:,.2f}[/cyan]"
+    )

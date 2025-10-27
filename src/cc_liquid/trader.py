@@ -99,25 +99,42 @@ class PortfolioInfo:
 def aggregate_pnl_by_currency(
     fills: list[dict[str, Any]], positions: list[Position]
 ) -> dict[str, dict[str, float]]:
-    """Aggregate realized and unrealized PNL by currency.
+    """Aggregate realized and unrealized PNL, fees, and volume by currency.
 
     Args:
         fills: List of fill history dictionaries from Hyperliquid API
         positions: List of current Position objects with unrealized PNL
 
     Returns:
-        Dictionary mapping currency to {"realized_pnl": float, "unrealized_pnl": float}
+        Dictionary mapping currency to {
+            "realized_pnl": float,
+            "unrealized_pnl": float,
+            "fees": float,
+            "volume": float
+        }
         sorted alphabetically by currency name
     """
-    # Aggregate realized PNL from fills
+    # Aggregate realized PNL, fees, and volume from fills
     realized_pnl_by_coin: dict[str, float] = {}
+    fees_by_coin: dict[str, float] = {}
+    volume_by_coin: dict[str, float] = {}
+
     for fill in fills:
         coin = fill["coin"]
         closed_pnl = float(fill.get("closedPnl", 0))
+        fee = float(fill.get("fee", 0))
+        size = float(fill["sz"])
+        price = float(fill["px"])
+        value = size * price
 
         if coin not in realized_pnl_by_coin:
             realized_pnl_by_coin[coin] = 0.0
+            fees_by_coin[coin] = 0.0
+            volume_by_coin[coin] = 0.0
+
         realized_pnl_by_coin[coin] += closed_pnl
+        fees_by_coin[coin] += fee
+        volume_by_coin[coin] += value
 
     # Aggregate unrealized PNL from positions
     unrealized_pnl_by_coin: dict[str, float] = {}
@@ -134,6 +151,8 @@ def aggregate_pnl_by_currency(
         pnl_summary[coin] = {
             "realized_pnl": realized_pnl_by_coin.get(coin, 0.0),
             "unrealized_pnl": unrealized_pnl_by_coin.get(coin, 0.0),
+            "fees": fees_by_coin.get(coin, 0.0),
+            "volume": volume_by_coin.get(coin, 0.0),
         }
 
     return pnl_summary

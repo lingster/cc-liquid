@@ -321,9 +321,9 @@ def test_aggregate_pnl_total():
     from cc_liquid.trader import aggregate_pnl_by_currency
 
     fills = [
-        {"coin": "BTC", "closedPnl": "10.5"},
-        {"coin": "ETH", "closedPnl": "-5.3"},
-        {"coin": "BTC", "closedPnl": "2.1"},
+        {"coin": "BTC", "closedPnl": "10.5", "fee": "0.01", "sz": "1.0", "px": "100.0"},
+        {"coin": "ETH", "closedPnl": "-5.3", "fee": "0.02", "sz": "2.0", "px": "50.0"},
+        {"coin": "BTC", "closedPnl": "2.1", "fee": "0.01", "sz": "0.5", "px": "100.0"},
     ]
 
     positions = []
@@ -387,10 +387,10 @@ def test_aggregate_pnl_sorting():
     from cc_liquid.trader import aggregate_pnl_by_currency
 
     fills = [
-        {"coin": "ZEC", "closedPnl": "1.0"},
-        {"coin": "APE", "closedPnl": "2.0"},
-        {"coin": "BTC", "closedPnl": "3.0"},
-        {"coin": "ETH", "closedPnl": "4.0"},
+        {"coin": "ZEC", "closedPnl": "1.0", "fee": "0.01", "sz": "1.0", "px": "10.0"},
+        {"coin": "APE", "closedPnl": "2.0", "fee": "0.01", "sz": "1.0", "px": "10.0"},
+        {"coin": "BTC", "closedPnl": "3.0", "fee": "0.01", "sz": "1.0", "px": "10.0"},
+        {"coin": "ETH", "closedPnl": "4.0", "fee": "0.01", "sz": "1.0", "px": "10.0"},
     ]
 
     pnl_summary = aggregate_pnl_by_currency(fills, [])
@@ -399,3 +399,30 @@ def test_aggregate_pnl_sorting():
     keys = list(pnl_summary.keys())
     assert keys == sorted(keys)
     assert keys == ["APE", "BTC", "ETH", "ZEC"]
+
+
+def test_aggregate_pnl_fees_and_volume():
+    """Test that fees and volume are correctly aggregated."""
+    from cc_liquid.trader import aggregate_pnl_by_currency
+
+    fills = [
+        {"coin": "BTC", "closedPnl": "10.5", "fee": "0.05", "sz": "1.0", "px": "50000.0"},
+        {"coin": "BTC", "closedPnl": "2.1", "fee": "0.03", "sz": "0.5", "px": "50000.0"},
+        {"coin": "ETH", "closedPnl": "-5.3", "fee": "0.10", "sz": "10.0", "px": "3000.0"},
+    ]
+
+    positions = []
+
+    pnl_summary = aggregate_pnl_by_currency(fills, positions)
+
+    # Check BTC aggregation: two trades
+    # Fees: 0.05 + 0.03 = 0.08
+    # Volume: (1.0 * 50000) + (0.5 * 50000) = 50000 + 25000 = 75000
+    assert pnl_summary["BTC"]["fees"] == pytest.approx(0.08)
+    assert pnl_summary["BTC"]["volume"] == pytest.approx(75000.0)
+
+    # Check ETH aggregation: one trade
+    # Fees: 0.10
+    # Volume: 10.0 * 3000 = 30000
+    assert pnl_summary["ETH"]["fees"] == pytest.approx(0.10)
+    assert pnl_summary["ETH"]["volume"] == pytest.approx(30000.0)
