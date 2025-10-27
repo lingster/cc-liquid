@@ -1083,7 +1083,7 @@ def create_execution_details_panel(
                 action,
                 f"{trade['sz']:.4f}",
                 format_currency(trade["price"], compact=True),
-                f"[yellow]OPEN[/yellow]",
+                "[yellow]OPEN[/yellow]",
                 f"[dim]OID:{oid_short}[/dim]",
                 format_currency(trade["sz"] * trade["price"]),
                 "[dim]-[/dim]",

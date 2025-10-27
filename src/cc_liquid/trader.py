@@ -1204,9 +1204,6 @@ class CCLiquid:
         # Cancel existing TP/SL orders first
         self.cancel_all_tpsl_orders()
         
-        # Get current prices
-        all_mids = self.info.all_mids()
-        
         applied = []
         skipped = []
         errors = []
@@ -1220,9 +1217,7 @@ class CCLiquid:
             side = "LONG" if size > 0 else "SHORT"
             if self._should_apply_stop_loss(side):
                 eligible_positions.append(coin)
-        
-        total_eligible = len(eligible_positions)
-        
+
         # Build all SL orders first
         orders_to_place = []
         order_metadata = []  # Track metadata for each order

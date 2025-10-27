@@ -989,7 +989,7 @@ def apply_stops(set_overrides):
         other_skips = [s for s in skipped if "not configured" not in s.get("reason", "")]
         
         # Summary
-        console.print(f"\n[bold cyan]Stop Loss Application Summary[/bold cyan]")
+        console.print("\n[bold cyan]Stop Loss Application Summary[/bold cyan]")
         console.print(f"[green]✓ Applied: {len(applied)}[/green]")
         if side_skips:
             console.print(f"[dim]⊘ Skipped (side filter): {len(side_skips)}[/dim]")
