@@ -2188,3 +2188,75 @@ def create_ascii_heatmap(pivot_df, longs: list, shorts: list, metric: str) -> st
             row_str += "   - " * len(shorts)
         lines.append(row_str)
     return "\n".join(lines)
+
+
+def display_pnl_summary(
+    pnl_summary: dict[str, dict[str, float]], console: Console | None = None
+) -> None:
+    """Display PNL summary table with totals.
+
+    Args:
+        pnl_summary: Dictionary mapping currency to realized/unrealized PNL
+        console: Rich Console instance (creates new one if None)
+    """
+    if console is None:
+        console = Console()
+
+    if not pnl_summary:
+        console.print("[yellow]No PNL data available[/yellow]")
+        return
+
+    # Create table
+    table = Table(
+        title="PNL Summary by Currency",
+        show_header=True,
+        header_style="bold cyan on #001926",
+        box=box.HEAVY,
+        show_lines=False,
+    )
+
+    table.add_column("CURRENCY", style="cyan", width=12)
+    table.add_column("REALIZED PNL", justify="right", width=15)
+    table.add_column("UNREALIZED PNL", justify="right", width=15)
+    table.add_column("TOTAL PNL", justify="right", width=15)
+
+    # Add rows for each currency
+    total_realized = 0.0
+    total_unrealized = 0.0
+
+    for currency in sorted(pnl_summary.keys()):
+        data = pnl_summary[currency]
+        realized = data["realized_pnl"]
+        unrealized = data["unrealized_pnl"]
+        total = realized + unrealized
+
+        total_realized += realized
+        total_unrealized += unrealized
+
+        # Style based on profit/loss
+        realized_style = "green" if realized >= 0 else "red"
+        unrealized_style = "green" if unrealized >= 0 else "red"
+        total_style = "green" if total >= 0 else "red"
+
+        table.add_row(
+            currency,
+            f"[{realized_style}]${realized:+,.2f}[/{realized_style}]",
+            f"[{unrealized_style}]${unrealized:+,.2f}[/{unrealized_style}]",
+            f"[{total_style}]${total:+,.2f}[/{total_style}]",
+        )
+
+    # Add separator and totals row
+    table.add_section()
+    total_total = total_realized + total_unrealized
+    total_realized_style = "green" if total_realized >= 0 else "red"
+    total_unrealized_style = "green" if total_unrealized >= 0 else "red"
+    total_total_style = "green" if total_total >= 0 else "red"
+
+    table.add_row(
+        "[bold]TOTAL[/bold]",
+        f"[bold {total_realized_style}]${total_realized:+,.2f}[/bold {total_realized_style}]",
+        f"[bold {total_unrealized_style}]${total_unrealized:+,.2f}[/bold {total_unrealized_style}]",
+        f"[bold {total_total_style}]${total_total:+,.2f}[/bold {total_total_style}]",
+    )
+
+    console.print(table)
