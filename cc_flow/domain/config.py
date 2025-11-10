@@ -39,6 +39,24 @@ from pydantic import BaseModel, ConfigDict, Field
 from .orders import OrderType, TimeInForce
 
 
+class UIPreferences(BaseModel):
+    """UI preferences for the TUI application.
+
+    Configures visual preferences and user interface settings.
+
+    Attributes:
+        theme: Selected theme name (e.g., "brutalist", "nord", "dracula")
+
+    Example:
+        >>> prefs = UIPreferences(theme="nord")
+        >>> assert prefs.theme == "nord"
+    """
+
+    model_config = ConfigDict(frozen=False)
+
+    theme: str = "brutalist"
+
+
 class DataSourceConfig(BaseModel):
     """Data source configuration for predictions.
 
@@ -220,7 +238,7 @@ class TradingConfig(BaseModel):
 
     Top-level configuration model that combines all configuration
     components including profiles, data sources, portfolio settings,
-    and execution parameters.
+    execution parameters, and UI preferences.
 
     Attributes:
         active_profile: Name of the currently active profile
@@ -228,6 +246,7 @@ class TradingConfig(BaseModel):
         data_source: Data source configuration
         portfolio: Portfolio construction configuration
         execution: Order execution configuration
+        ui: UI preferences configuration
 
     Properties:
         current_profile: Get the active ExchangeProfile
@@ -260,6 +279,7 @@ class TradingConfig(BaseModel):
     data_source: DataSourceConfig = Field(default_factory=DataSourceConfig)
     portfolio: PortfolioConfig = Field(default_factory=PortfolioConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
+    ui: UIPreferences = Field(default_factory=UIPreferences)
 
     @property
     def current_profile(self) -> ExchangeProfile:

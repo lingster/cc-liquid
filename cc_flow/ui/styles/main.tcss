@@ -1,49 +1,87 @@
-/* cc-liquid Brutalist Theme
- * High-contrast, functional design
- * Colors: Cyan (#62e4fb), Deep Purple (#4152A8), Dark Abyss (#001926)
+/* cc-liquid Dynamic Theming System
+ *
+ * This stylesheet uses CSS variables for all colors, allowing dynamic theme switching.
+ * Variables are defined in themes.py and applied via app._apply_theme()
+ *
+ * Available CSS Variables:
+ * - $background: Main background color
+ * - $surface: Secondary background (panels, containers)
+ * - $primary: Primary accent color
+ * - $secondary: Secondary accent color
+ * - $text: Default text color
+ * - $text-muted: Muted/secondary text color
+ * - $success: Success state color
+ * - $warning: Warning state color
+ * - $error: Error state color
+ * - $border: Border color
+ * - $border-focus: Focused element border color
+ * - $header-bg: Header background
+ * - $header-fg: Header text color
+ * - $footer-bg: Footer background
+ * - $footer-fg: Footer text color
  *
  * Design Philosophy:
- * - Stark, brutal aesthetics with high contrast
+ * - Stark, brutal aesthetics with high contrast (default brutalist theme)
  * - Functional over decorative
  * - Edward Tufte-inspired data density
+ * - Fully customizable via theme system
  */
+
+/* === Default Theme Variables (Brutalist) === */
+/* These are overridden at runtime by selected theme */
+
+$background: #001926;
+$surface: #002030;
+$primary: #62e4fb;
+$secondary: #4152A8;
+$text: #62e4fb;
+$text-muted: #aaaaaa;
+$success: #00ff00;
+$warning: #ffaa00;
+$error: #ff0000;
+$border: #62e4fb;
+$border-focus: #62e4fb;
+$header-bg: #4152A8;
+$header-fg: #62e4fb;
+$footer-bg: #002030;
+$footer-fg: #62e4fb;
 
 /* === Global Styles === */
 
 Screen {
-    background: #001926;
+    background: $background;
 }
 
 Header {
-    background: #4152A8;
-    color: #62e4fb;
+    background: $header-bg;
+    color: $header-fg;
 }
 
 Footer {
-    background: #002030;
-    color: #62e4fb;
+    background: $footer-bg;
+    color: $footer-fg;
 }
 
 /* === Panels and Containers === */
 
 .panel {
-    background: #002030;
-    border: solid #62e4fb;
+    background: $surface;
+    border: solid $border;
     padding: 1;
     margin: 1;
 }
 
 .section-title {
     text-style: bold;
-    color: #62e4fb;
-    background: #4152A8;
+    color: $primary;
+    background: $secondary;
     padding: 0 1;
 }
 
 .screen-title {
     text-style: bold;
-    color: #62e4fb;
-    background: #4152A8;
+    color: $primary;
+    background: $secondary;
     padding: 0 1;
     margin-bottom: 1;
 }
@@ -51,78 +89,98 @@ Footer {
 /* === Color Classes === */
 
 .success {
-    color: #00ff00;
+    color: $success;
 }
 
 .error {
-    color: #ff0000;
+    color: $error;
 }
 
 .warning {
-    color: #ffaa00;
+    color: $warning;
 }
 
 .info {
-    color: #62e4fb;
+    color: $primary;
 }
 
 /* === Buttons === */
 
 Button {
-    background: #4152A8;
-    color: #62e4fb;
-    border: solid #62e4fb;
+    background: $secondary;
+    color: $primary;
+    border: solid $border;
 }
 
 Button:hover {
-    background: #62e4fb;
-    color: #001926;
+    background: $primary;
+    color: $background;
 }
 
 Button:disabled {
-    background: #002030;
-    color: #666666;
-    border: solid #444444;
+    background: $surface;
+    color: $text-muted;
+    border: solid $border;
 }
 
 /* === DataTables === */
 
 DataTable {
-    background: #001926;
+    background: $background;
 }
 
 DataTable > .datatable--header {
-    background: #4152A8;
-    color: #62e4fb;
+    background: $secondary;
+    color: $primary;
     text-style: bold;
 }
 
 DataTable > .datatable--cursor {
-    background: #002030;
+    background: $surface;
 }
 
 DataTable > .datatable--odd-row {
-    background: #001926;
+    background: $background;
 }
 
 DataTable > .datatable--even-row {
-    background: #001520;
+    background: $surface;
 }
 
 /* === Inputs === */
 
 Input {
-    background: #002030;
-    color: #62e4fb;
-    border: solid #62e4fb;
+    background: $surface;
+    color: $text;
+    border: solid $border;
 }
 
 Input:focus {
-    border: thick #62e4fb;
+    border: thick $border-focus;
 }
 
 Label {
-    color: #62e4fb;
+    color: $text;
+}
+
+/* === Select / OptionList === */
+
+OptionList {
+    background: $background;
+    border: solid $border;
+}
+
+OptionList > .option-list--option {
+    color: $text;
+}
+
+OptionList > .option-list--option-highlighted {
+    background: $surface;
+    color: $primary;
+}
+
+OptionList > .option-list--option-hover {
+    background: $surface;
 }
 
 /* Dashboard Screen */
@@ -134,29 +192,13 @@ Label {
     padding: 1;
 }
 
-.section-title {
-    text-style: bold;
-    color: #62e4fb;
-    background: #4152A8;
-    padding: 0 1;
-}
-
 #account-summary {
     padding: 1;
-    color: #62e4fb;
+    color: $text;
 }
 
 #positions-table {
     height: 100%;
-}
-
-DataTable > .datatable--header {
-    background: #4152A8;
-    color: #62e4fb;
-}
-
-DataTable > .datatable--cursor {
-    background: #002030;
 }
 
 /* Trading Screen */
@@ -185,12 +227,12 @@ DataTable > .datatable--cursor {
 
 #plan-status {
     padding: 1;
-    color: #62e4fb;
+    color: $text;
 }
 
 #execution-summary {
     padding: 1;
-    color: #62e4fb;
+    color: $text;
 }
 
 /* Confirmation Modal */
@@ -198,15 +240,15 @@ DataTable > .datatable--cursor {
 #confirm-modal {
     width: 60;
     height: auto;
-    background: #002030;
-    border: solid #62e4fb;
+    background: $surface;
+    border: solid $border-focus;
     padding: 2;
 }
 
 #confirm-message {
     padding: 1;
     text-align: center;
-    color: #62e4fb;
+    color: $text;
 }
 
 /* Account Screen */
@@ -223,12 +265,12 @@ DataTable > .datatable--cursor {
 
 #account-metrics {
     padding: 1;
-    color: #62e4fb;
+    color: $text;
 }
 
 #margin-breakdown {
     padding: 1;
-    color: #62e4fb;
+    color: $text;
 }
 
 #positions-detail-table {
@@ -256,12 +298,12 @@ DataTable > .datatable--cursor {
 #date-filters > Label {
     margin-right: 1;
     padding-top: 1;
-    color: #62e4fb;
+    color: $text;
 }
 
 #history-summary {
     padding: 1;
-    color: #62e4fb;
+    color: $text;
 }
 
 #history-table {
@@ -292,7 +334,7 @@ DataTable > .datatable--cursor {
 
 #performance-metrics, #risk-metrics {
     padding: 1;
-    color: #62e4fb;
+    color: $text;
 }
 
 /* Optimize Screen */
@@ -311,7 +353,7 @@ DataTable > .datatable--cursor {
 #param-ranges-grid > Label {
     text-align: right;
     padding-right: 1;
-    color: #62e4fb;
+    color: $text;
 }
 
 #param-ranges-grid > Input {
@@ -327,7 +369,7 @@ DataTable > .datatable--cursor {
 #metric-container > Label {
     padding-right: 1;
     padding-top: 1;
-    color: #62e4fb;
+    color: $text;
 }
 
 #metric-select {
@@ -341,19 +383,11 @@ DataTable > .datatable--cursor {
 
 #optimization-status {
     padding: 1;
-    color: #62e4fb;
+    color: $text;
 }
 
 #results-table {
     min-height: 15;
-}
-
-.screen-title {
-    text-style: bold;
-    color: #62e4fb;
-    background: #4152A8;
-    padding: 0 1;
-    margin-bottom: 1;
 }
 
 /* === Config Screen === */
@@ -366,17 +400,17 @@ DataTable > .datatable--cursor {
 .config-section {
     margin: 1;
     padding: 1;
-    border: solid #62e4fb;
-    background: #002030;
+    border: solid $border;
+    background: $surface;
 }
 
 .config-label {
-    color: #62e4fb;
+    color: $primary;
     text-style: bold;
 }
 
 .config-value {
-    color: #ffffff;
+    color: $text;
     padding-left: 2;
 }
 
@@ -385,31 +419,36 @@ DataTable > .datatable--cursor {
     margin: 1;
 }
 
+#config-display {
+    padding: 1;
+    color: $text;
+}
+
 /* === Modal Styles === */
 
 #confirmation-modal, #result-modal {
     width: 60;
     height: auto;
-    background: #002030;
-    border: thick #62e4fb;
+    background: $surface;
+    border: thick $border-focus;
     padding: 2;
 }
 
 #modal-title {
     text-style: bold;
-    color: #62e4fb;
+    color: $primary;
     text-align: center;
     padding: 1;
 }
 
 #modal-message {
-    color: #ffffff;
+    color: $text;
     text-align: center;
     padding: 1 2;
 }
 
 #modal-details {
-    color: #aaaaaa;
+    color: $text-muted;
     text-align: center;
     padding: 1 2;
 }
@@ -425,34 +464,36 @@ DataTable > .datatable--cursor {
 }
 
 .success-modal {
-    border: thick #00ff00;
+    border: thick $success;
 }
 
 .error-modal {
-    border: thick #ff0000;
+    border: thick $error;
 }
 
 #btn-yes {
-    background: #00aa00;
+    background: $success;
+    color: $background;
 }
 
 #btn-yes:hover {
-    background: #00ff00;
-    color: #001926;
+    background: $primary;
+    color: $background;
 }
 
 #btn-no {
-    background: #aa0000;
+    background: $error;
+    color: $text;
 }
 
 #btn-no:hover {
-    background: #ff0000;
-    color: #001926;
+    background: $warning;
+    color: $background;
 }
 
 #btn-ok {
-    background: #4152A8;
-    color: #62e4fb;
+    background: $secondary;
+    color: $primary;
 }
 
 /* === Widget Styles === */
@@ -475,9 +516,4 @@ OrderBookWidget {
 #config {
     layout: vertical;
     padding: 1;
-}
-
-#config-display {
-    padding: 1;
-    color: #62e4fb;
 }

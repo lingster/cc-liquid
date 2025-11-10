@@ -60,6 +60,7 @@ class CCLiquidApp(App):
         Binding("o", "show_optimize", "Optimize"),
         Binding("h", "show_history", "History"),
         Binding("c", "show_config", "Config"),
+        Binding("ctrl+t", "show_theme_switcher", "Theme", priority=True),
         Binding("q", "quit", "Quit", priority=True),
     ]
 
@@ -92,6 +93,9 @@ class CCLiquidApp(App):
 
         # Track current screen
         self.current_screen = "dashboard"
+
+        # Track current theme (load from config)
+        self.current_theme = config.ui.theme
 
     def compose(self) -> ComposeResult:
         """Create child widgets.
@@ -158,10 +162,74 @@ class CCLiquidApp(App):
         self.current_screen = "config"
         self.push_screen(ConfigScreen(self.config))
 
+    def action_show_theme_switcher(self) -> None:
+        """Show theme switcher modal."""
+        from cc_flow.ui.widgets.theme_switcher import ThemeSwitcherModal
+
+        log.info("Opening theme switcher")
+
+        def handle_theme_selection(theme_name: str | None) -> None:
+            """Handle theme selection from modal.
+
+            Args:
+                theme_name: Selected theme name, or None if cancelled
+            """
+            if theme_name is not None:
+                log.info(f"Switching to theme: {theme_name}")
+                self._apply_theme(theme_name)
+            else:
+                log.debug("Theme selection cancelled")
+
+        self.push_screen(
+            ThemeSwitcherModal(self.current_theme), handle_theme_selection
+        )
+
+    def _apply_theme(self, theme_name: str) -> None:
+        """Apply a theme to the application.
+
+        Args:
+            theme_name: Name of theme to apply
+        """
+        from cc_flow.ui.themes import get_theme
+
+        try:
+            theme = get_theme(theme_name)
+            self.current_theme = theme_name
+
+            # Save theme preference to config
+            self.config.ui.theme = theme_name
+
+            # Update CSS variables with theme colors
+            # Textual will automatically re-render with new colors
+            self.stylesheet.set_variables({
+                "background": theme.background,
+                "surface": theme.surface,
+                "primary": theme.primary,
+                "secondary": theme.secondary,
+                "text": theme.text,
+                "text-muted": theme.text_muted,
+                "success": theme.success,
+                "warning": theme.warning,
+                "error": theme.error,
+                "border": theme.border,
+                "border-focus": theme.border_focus,
+                "header-bg": theme.header_bg,
+                "header-fg": theme.header_fg,
+                "footer-bg": theme.footer_bg,
+                "footer-fg": theme.footer_fg,
+            })
+
+            log.info(f"Theme '{theme.display_name}' applied successfully")
+
+        except ValueError as e:
+            log.error(f"Failed to apply theme: {e}")
+
     def on_mount(self) -> None:
         """Called when app is mounted.
 
         Set up initial state and show default screen.
         """
         log.info("cc-liquid TUI started")
+        # Apply default theme
+        self._apply_theme(self.current_theme)
         self.action_show_dashboard()

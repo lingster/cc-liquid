@@ -15,6 +15,7 @@ Available Widgets:
     - OrderBookWidget: Display real-time order book bids and asks
     - PortfolioTable: Display portfolio positions in tabular format
     - TradePlanWidget: Display trade plans with executable and skipped trades
+    - ThemeSwitcherModal: Theme selection modal for switching color schemes
 
 Backwards Compatibility:
     - ConfirmationModal: Alias for ConfirmModal
@@ -45,6 +46,7 @@ from cc_flow.ui.widgets.modals import (
 from cc_flow.ui.widgets.modals_compat import ConfirmationModal, ResultModal
 from cc_flow.ui.widgets.order_book import OrderBookWidget
 from cc_flow.ui.widgets.portfolio_table import PortfolioTable
+from cc_flow.ui.widgets.theme_switcher import ThemeSwitcherModal
 from cc_flow.ui.widgets.trade_plan import TradePlanWidget
 
 __all__ = [
@@ -59,5 +61,6 @@ __all__ = [
     "OrderBookWidget",
     "PortfolioTable",
     "ResultModal",  # Backwards compatibility
+    "ThemeSwitcherModal",
     "TradePlanWidget",
 ]
