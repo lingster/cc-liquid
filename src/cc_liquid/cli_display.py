@@ -314,6 +314,91 @@ def create_sidebar_panel(config_dict: dict | None, empty_label: str) -> Panel:
     return Panel(empty_label, box=box.HEAVY)
 
 
+def create_autotrade_footer_panel(
+    mode: str,
+    pnl_pct: float,
+    profit_target_pct: float,
+    days_held: int,
+    max_hold_days: int,
+    next_opening_time: datetime | None,
+    refresh_seconds: float | None,
+) -> Panel:
+    """Create autotrade monitoring footer with PNL, profit target, and days held info.
+
+    Args:
+        mode: "trading" or "waiting"
+        pnl_pct: Current portfolio PNL percentage
+        profit_target_pct: Target PNL percentage for take-profit
+        days_held: Number of calendar days positions have been held
+        max_hold_days: Maximum days before forced rebalance
+        next_opening_time: Next time to open positions (if in waiting mode)
+        refresh_seconds: UI refresh rate
+    """
+    now = datetime.now(timezone.utc)
+
+    if mode == "waiting":
+        # Waiting mode: show countdown to opening time
+        mode_display = "[yellow]WAITING[/yellow]"
+        countdown_str = ""
+        if next_opening_time:
+            time_until = next_opening_time - now
+            if time_until.total_seconds() > 0:
+                total_seconds = int(time_until.total_seconds())
+                hours, remainder = divmod(total_seconds, 3600)
+                minutes, seconds = divmod(remainder, 60)
+
+                if hours > 24:
+                    days = hours // 24
+                    hours = hours % 24
+                    countdown = f"{days}d {hours:02d}:{minutes:02d}:{seconds:02d}"
+                else:
+                    countdown = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+                countdown_str = f"[cyan]Next opening in:[/cyan] [bold yellow]{countdown}[/bold yellow]"
+            else:
+                countdown_str = "[yellow]Opening now...[/yellow]"
+
+        status_text = f"{mode_display}  [dim]│[/dim]  {countdown_str}"
+    else:
+        # Trading mode: show PNL progress and days held
+        mode_display = "[green]TRADING[/green]"
+
+        # PNL display with progress bar
+        pnl_color = "green" if pnl_pct >= 0 else "red"
+        pnl_bar_width = 20
+
+        # Calculate bar fill based on progress to target
+        if profit_target_pct > 0:
+            progress = min(1.0, pnl_pct / profit_target_pct)
+            filled_width = int(progress * pnl_bar_width)
+        else:
+            filled_width = 0
+
+        empty_width = pnl_bar_width - filled_width
+        pnl_bar = f"[{pnl_color}]{'█' * filled_width}[/{pnl_color}]{'░' * empty_width}"
+
+        # Days held status
+        days_remaining = max_hold_days - days_held
+        days_color = "green" if days_remaining > 3 else "yellow" if days_remaining > 1 else "red"
+
+        status_text = (
+            f"{mode_display}  [dim]│[/dim]  "
+            f"PNL: [{pnl_color}]{pnl_pct:+.2f}%[/{pnl_color}] / [cyan]{profit_target_pct:.0f}%[/cyan]  "
+            f"{pnl_bar}  [dim]│[/dim]  "
+            f"Days: [{days_color}]{days_held}[/{days_color}] / [cyan]{max_hold_days}[/cyan]"
+        )
+
+    # Add refresh rate
+    if refresh_seconds:
+        status_text += f"  [dim]│[/dim]  [dim]refresh: {refresh_seconds:.1f}s[/dim]"
+
+    return Panel(
+        Text(status_text, justify="center"),
+        box=DOUBLE,
+        style="cyan",
+    )
+
+
 def create_footer_panel(
     next_rebalance_time: datetime | None,
     last_rebalance_time: datetime | None,
@@ -376,6 +461,83 @@ def create_footer_panel(
     )
 
     return Panel(status_grid, box=box.HEAVY)
+
+
+def create_autotrade_dashboard_layout(
+    portfolio: "PortfolioInfo",
+    mode: str,
+    pnl_pct: float,
+    profit_target_pct: float,
+    days_held: int,
+    max_hold_days: int,
+    next_opening_time: datetime | None,
+    config_dict: dict | None = None,
+    refresh_seconds: float | None = None,
+    open_orders: list[dict] | None = None,
+) -> Layout:
+    """Build autotrade-specific dashboard with PNL tracking and profit target monitoring.
+
+    Args:
+        portfolio: Current portfolio information
+        mode: "trading" or "waiting"
+        pnl_pct: Current portfolio PNL percentage
+        profit_target_pct: Target PNL percentage for take-profit
+        days_held: Number of calendar days positions have been held
+        max_hold_days: Maximum days before forced rebalance
+        next_opening_time: Next time to open positions (if in waiting mode)
+        config_dict: Configuration dictionary for sidebar
+        refresh_seconds: UI refresh rate
+        open_orders: List of open orders
+    """
+    layout = Layout()
+
+    layout.split_column(
+        Layout(name="header", size=3),
+        Layout(name="body"),
+        Layout(name="footer", size=3),
+    )
+
+    # Header
+    header_title = "CC-LIQUID AUTOTRADE :: PROFIT TAKING REBALANCER"
+    layout["header"].update(create_header_panel(header_title, is_rebalancing=False))
+
+    # Body: split into main area and sidebar
+    layout["body"].split_row(
+        Layout(name="main", ratio=2), Layout(name="sidebar", ratio=1)
+    )
+
+    # Main area: metrics + positions
+    layout["main"].split_column(
+        Layout(name="metrics", size=8), Layout(name="positions")
+    )
+
+    layout["metrics"].update(create_metrics_panel(portfolio))
+    layout["positions"].update(create_positions_panel(portfolio))
+
+    # Sidebar: split into config (top) and open orders (bottom)
+    layout["sidebar"].split_column(
+        Layout(name="config", ratio=2),
+        Layout(name="open_orders", ratio=1)
+    )
+
+    layout["sidebar"]["config"].update(create_sidebar_panel(config_dict, "[dim]No config loaded[/dim]"))
+    layout["sidebar"]["open_orders"].update(
+        create_open_orders_panel(open_orders or [])
+    )
+
+    # Footer with autotrade-specific metrics
+    footer = create_autotrade_footer_panel(
+        mode=mode,
+        pnl_pct=pnl_pct,
+        profit_target_pct=profit_target_pct,
+        days_held=days_held,
+        max_hold_days=max_hold_days,
+        next_opening_time=next_opening_time,
+        refresh_seconds=refresh_seconds,
+    )
+    layout["footer"].update(footer)
+
+    return layout
 
 
 def create_dashboard_layout(

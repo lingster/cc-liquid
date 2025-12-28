@@ -42,6 +42,17 @@ class StopLossConfig:
 
 
 @dataclass
+class AutotradeConfig:
+    """Autotrade configuration for take-profit cycling."""
+
+    profit_target_pct: float = 15.0  # Close all and restart when portfolio PNL >= this %
+    max_hold_days: int = 10  # Force rebalance after this many calendar days
+    opening_time: str = "00:00"  # UTC time to open new positions after taking profit
+    monitor_interval_seconds: float = 5.0  # How often to check PNL
+    enable_rebalance: bool = True  # If true, rebalance on max_hold_days; if false, wait for profit
+
+
+@dataclass
 class PortfolioConfig:
     """Portfolio construction parameters."""
 
@@ -93,6 +104,7 @@ class Config:
     data: DataSourceConfig = field(default_factory=DataSourceConfig)
     portfolio: PortfolioConfig = field(default_factory=PortfolioConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    autotrade: AutotradeConfig = field(default_factory=AutotradeConfig)
 
     def __post_init__(self):
         """Load environment variables and YAML config after initialization."""
@@ -257,6 +269,7 @@ class Config:
             "data": self.data.__dict__,
             "portfolio": portfolio_dict,
             "execution": self.execution.__dict__,
+            "autotrade": self.autotrade.__dict__,
         }
 
 

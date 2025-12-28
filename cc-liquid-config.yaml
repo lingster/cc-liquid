@@ -27,3 +27,12 @@ execution:
   order_type: limit
   time_in_force: Gtc
   limit_price_offset: 0.0
+
+# Autotrade: Profit-taking cycle strategy
+# Opens positions at opening_time, monitors PNL, closes when profit target hit
+autotrade:
+  profit_target_pct: 5.0        # Close all positions and take profit when portfolio PNL >= this % (default: 15.0)
+  max_hold_days: 10              # Force rebalance after this many calendar days (default: 10)
+  opening_time: '00:00'          # UTC time to open new positions after taking profit (HH:MM format)
+  monitor_interval_seconds: 5.0  # How often to check PNL and update dashboard (default: 5.0)
+  enable_rebalance: true         # If true, rebalance on max_hold_days; if false, wait for profit target indefinitely

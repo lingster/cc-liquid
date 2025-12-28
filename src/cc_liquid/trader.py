@@ -1701,3 +1701,111 @@ class CCLiquid:
         except Exception as e:
             self.logger.error(f"Error loading predictions: {e}")
             return None
+
+    # --- Autotrade methods ---
+
+    def get_portfolio_pnl_pct(self) -> float:
+        """Calculate total portfolio unrealized PNL percentage.
+
+        Returns:
+            PNL as percentage of account value (e.g., 15.5 for 15.5%)
+        """
+        portfolio = self.get_portfolio_info()
+        account_value = portfolio.account.account_value
+
+        if account_value <= 0:
+            return 0.0
+
+        total_unrealized_pnl = portfolio.total_unrealized_pnl
+        pnl_pct = (total_unrealized_pnl / account_value) * 100
+
+        return pnl_pct
+
+    def get_position_age_days(self) -> int:
+        """Get the age in calendar days of the oldest position.
+
+        Uses position entry times from Hyperliquid API to calculate age.
+        Returns 0 if no positions.
+
+        Returns:
+            Number of calendar days since oldest position was opened
+        """
+        positions = self.get_positions()
+
+        if not positions:
+            return 0
+
+        # Get the oldest position entry date
+        # Note: Hyperliquid doesn't directly provide entry timestamp in user_state
+        # So we'll use the autotrade state entry_date as the reference
+        # This assumes all positions were opened together in the autotrade cycle
+
+        state = self._load_autotrade_state()
+        entry_date_str = state.get("entry_date")
+
+        if not entry_date_str:
+            # No state, assume fresh start (0 days)
+            return 0
+
+        try:
+            from datetime import date as date_type
+            entry_date = date_type.fromisoformat(entry_date_str)
+            today = datetime.now(timezone.utc).date()
+            age_days = (today - entry_date).days
+            return max(0, age_days)
+        except Exception as e:
+            self.logger.warning(f"Could not calculate position age: {e}")
+            return 0
+
+    def _load_autotrade_state(self) -> dict[str, Any]:
+        """Load autotrade state from persistent storage.
+
+        Returns:
+            Dict with keys:
+            - mode: "trading" or "waiting"
+            - entry_date: ISO date string (YYYY-MM-DD) when positions were opened
+        """
+        import json
+        import os
+
+        state_file = ".cc_liquid_state.json"
+        if not os.path.exists(state_file):
+            return {"mode": "waiting", "entry_date": None}
+
+        try:
+            with open(state_file) as f:
+                state = json.load(f)
+                return state.get("autotrade", {"mode": "waiting", "entry_date": None})
+        except Exception as e:
+            self.logger.warning(f"Could not load autotrade state: {e}")
+            return {"mode": "waiting", "entry_date": None}
+
+    def _save_autotrade_state(self, mode: str, entry_date: str | None = None) -> None:
+        """Save autotrade state to persistent storage.
+
+        Args:
+            mode: "trading" or "waiting"
+            entry_date: ISO date string (YYYY-MM-DD) when positions were opened, or None
+        """
+        import json
+        import os
+
+        state_file = ".cc_liquid_state.json"
+
+        # Load existing state to preserve other fields
+        existing_state = {}
+        if os.path.exists(state_file):
+            try:
+                with open(state_file) as f:
+                    existing_state = json.load(f)
+            except Exception:
+                pass
+
+        # Update autotrade state
+        existing_state["autotrade"] = {
+            "mode": mode,
+            "entry_date": entry_date
+        }
+
+        with open(state_file, "w") as f:
+            json.dump(existing_state, f)
