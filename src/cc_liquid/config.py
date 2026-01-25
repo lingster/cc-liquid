@@ -50,6 +50,8 @@ class AutotradeConfig:
     opening_time: str = "00:00"  # UTC time to open new positions after taking profit
     monitor_interval_seconds: float = 5.0  # How often to check PNL
     enable_rebalance: bool = True  # If true, rebalance on max_hold_days; if false, wait for profit
+    trailing_stop_enabled: bool = False  # If true, use trailing stop after profit target is hit
+    trailing_stop_offset_pct: float = 0.5  # Trailing stop offset in percentage points below peak
 
 
 @dataclass

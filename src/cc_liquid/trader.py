@@ -241,7 +241,11 @@ class CCLiquid:
             )
 
         margin_summary = user_state.get("marginSummary", {}) if user_state else {}
-        all_mids = self.info.all_mids() if user_state else {}
+        try:
+            all_mids = self.info.all_mids() if user_state else {}
+        except Exception as e:
+            self.logger.warning(f"Could not load mids: {e}")
+            all_mids = {}
 
         # Build account info
         account_info = AccountInfo(
@@ -1062,8 +1066,18 @@ class CCLiquid:
         cfg = self.config.portfolio.rebalancing
         now_utc = now or datetime.now(timezone.utc)
 
-        hour, minute = map(int, cfg.at_time.split(":"))
-        rebalance_time = time(hour=hour, minute=minute)
+        try:
+            parts = cfg.at_time.split(":")
+            if len(parts) < 2:
+                raise ValueError("Expected HH:MM format")
+            hour = int(parts[0])
+            minute = int(parts[1])
+            rebalance_time = time(hour=hour, minute=minute)
+        except Exception as e:
+            self.logger.warning(
+                f"Invalid rebalancing time '{cfg.at_time}': {e}. Using 00:00 UTC."
+            )
+            rebalance_time = time(hour=0, minute=0)
 
         if last_rebalance_date is None:
             today_at = datetime.combine(
@@ -1388,7 +1402,11 @@ class CCLiquid:
         owner = self.config.HYPERLIQUID_VAULT_ADDRESS or self.config.HYPERLIQUID_ADDRESS
         if not owner:
             raise ValueError("Missing portfolio owner address")
-        return self.info.frontend_open_orders(owner)
+        try:
+            return self.info.frontend_open_orders(owner)
+        except Exception as e:
+            self.logger.warning(f"Could not get open orders: {e}")
+            return []
 
     def cancel_open_orders(self, coin: str | None = None) -> dict[str, Any]:
         """Cancel open orders, optionally filtered by coin.
@@ -1730,7 +1748,11 @@ class CCLiquid:
         Returns:
             Number of calendar days since oldest position was opened
         """
-        positions = self.get_positions()
+        try:
+            positions = self.get_positions()
+        except Exception as e:
+            self.logger.warning(f"Could not load positions: {e}")
+            return 0
 
         if not positions:
             return 0
@@ -1764,28 +1786,50 @@ class CCLiquid:
             Dict with keys:
             - mode: "trading" or "waiting"
             - entry_date: ISO date string (YYYY-MM-DD) when positions were opened
+            - trailing_active: bool, whether trailing stop mode is active
+            - peak_profit_pct: float, highest profit seen since trailing activated
+            - last_profit_info: dict with keys: profit, fees, date (last profit taken)
         """
         import json
         import os
 
         state_file = ".cc_liquid_state.json"
+        default_state = {
+            "mode": "waiting",
+            "entry_date": None,
+            "trailing_active": False,
+            "peak_profit_pct": None,
+            "last_profit_info": None,
+        }
         if not os.path.exists(state_file):
-            return {"mode": "waiting", "entry_date": None}
+            return default_state
 
         try:
             with open(state_file) as f:
                 state = json.load(f)
-                return state.get("autotrade", {"mode": "waiting", "entry_date": None})
+                loaded = state.get("autotrade", {})
+                # Merge with defaults for backwards compatibility
+                return {**default_state, **loaded}
         except Exception as e:
             self.logger.warning(f"Could not load autotrade state: {e}")
-            return {"mode": "waiting", "entry_date": None}
+            return default_state
 
-    def _save_autotrade_state(self, mode: str, entry_date: str | None = None) -> None:
+    def _save_autotrade_state(
+        self,
+        mode: str,
+        entry_date: str | None = None,
+        trailing_active: bool = False,
+        peak_profit_pct: float | None = None,
+        last_profit_info: dict | None = None,
+    ) -> None:
         """Save autotrade state to persistent storage.
 
         Args:
             mode: "trading" or "waiting"
             entry_date: ISO date string (YYYY-MM-DD) when positions were opened, or None
+            trailing_active: Whether trailing stop mode is active
+            peak_profit_pct: Highest profit seen since trailing activated
+            last_profit_info: Dict with profit, fees, date from last profit take (preserved if None)
         """
         import json
         import os
@@ -1801,10 +1845,18 @@ class CCLiquid:
             except Exception:
                 pass
 
+        # Get existing last_profit_info if not provided (preserve across state changes)
+        if last_profit_info is None:
+            existing_autotrade = existing_state.get("autotrade", {})
+            last_profit_info = existing_autotrade.get("last_profit_info")
+
         # Update autotrade state
         existing_state["autotrade"] = {
             "mode": mode,
-            "entry_date": entry_date
+            "entry_date": entry_date,
+            "trailing_active": trailing_active,
+            "peak_profit_pct": peak_profit_pct,
+            "last_profit_info": last_profit_info,
         }
 
         with open(state_file, "w") as f:

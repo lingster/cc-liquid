@@ -225,6 +225,60 @@ def create_metrics_panel(portfolio: "PortfolioInfo") -> Panel:
     )
 
 
+def create_last_profit_table(last_profit_info: dict | None) -> Table:
+    """Create a compact table showing last profit taken info."""
+    table = Table(show_header=False, box=None, padding=(0, 1))
+    table.add_column("", width=12)
+    table.add_column("", justify="right")
+
+    if not last_profit_info:
+        table.add_row("[dim]LAST PROFIT[/dim]", "[dim]N/A[/dim]")
+        return table
+
+    profit = last_profit_info.get("profit", 0.0)
+    fees = last_profit_info.get("fees", 0.0)
+    net_profit = profit - fees
+    profit_date = last_profit_info.get("date", "")
+
+    # Profit color
+    profit_color = "green" if profit >= 0 else "red"
+    net_color = "green" if net_profit >= 0 else "red"
+
+    rows = [
+        create_metric_row("LAST PROFIT", f"${profit:+,.2f}", profit_color),
+        create_metric_row("FEES PAID", f"${fees:,.2f}", "yellow"),
+        create_metric_row("NET PROFIT", f"${net_profit:+,.2f}", net_color),
+    ]
+
+    if profit_date:
+        rows.append(create_metric_row("DATE", profit_date, "dim"))
+
+    for row in rows:
+        table.add_row(*row)
+
+    return table
+
+
+def create_autotrade_metrics_panel(
+    portfolio: "PortfolioInfo", last_profit_info: dict | None = None
+) -> Panel:
+    """Create autotrade metrics panel (account + exposure + last profit) for the dashboard view."""
+    columns = [
+        create_account_metrics_table(portfolio.account),
+        create_account_exposure_table(portfolio),
+    ]
+
+    # Add last profit info column if available
+    if last_profit_info:
+        columns.append(create_last_profit_table(last_profit_info))
+
+    return Panel(
+        Columns(columns, expand=True),
+        title="[bold cyan]METRICS[/bold cyan]",
+        box=box.HEAVY,
+    )
+
+
 def create_positions_panel(portfolio: "PortfolioInfo") -> Panel:
     """Create a panel displaying all open positions with summary statistics.
 
@@ -322,6 +376,11 @@ def create_autotrade_footer_panel(
     max_hold_days: int,
     next_opening_time: datetime | None,
     refresh_seconds: float | None,
+    trailing_active: bool = False,
+    peak_profit_pct: float | None = None,
+    trailing_stop_offset_pct: float = 0.5,
+    entry_date: str | None = None,
+    enable_rebalance: bool = True,
 ) -> Panel:
     """Create autotrade monitoring footer with PNL, profit target, and days held info.
 
@@ -333,6 +392,11 @@ def create_autotrade_footer_panel(
         max_hold_days: Maximum days before forced rebalance
         next_opening_time: Next time to open positions (if in waiting mode)
         refresh_seconds: UI refresh rate
+        trailing_active: Whether trailing stop mode is active
+        peak_profit_pct: Highest profit seen since trailing activated
+        trailing_stop_offset_pct: Trailing stop offset in percentage points
+        entry_date: ISO date string (YYYY-MM-DD) when positions were opened
+        enable_rebalance: Whether rebalancing is enabled on max_hold_days
     """
     now = datetime.now(timezone.utc)
 
@@ -361,32 +425,82 @@ def create_autotrade_footer_panel(
         status_text = f"{mode_display}  [dim]│[/dim]  {countdown_str}"
     else:
         # Trading mode: show PNL progress and days held
-        mode_display = "[green]TRADING[/green]"
-
-        # PNL display with progress bar
         pnl_color = "green" if pnl_pct >= 0 else "red"
         pnl_bar_width = 20
 
-        # Calculate bar fill based on progress to target
-        if profit_target_pct > 0:
-            progress = min(1.0, pnl_pct / profit_target_pct)
-            filled_width = int(progress * pnl_bar_width)
+        if trailing_active and peak_profit_pct is not None:
+            # Trailing stop mode: show peak and trailing stop level
+            mode_display = "[bold magenta]TRAILING[/bold magenta]"
+            trailing_stop_level = peak_profit_pct - trailing_stop_offset_pct
+
+            # Calculate bar fill: show how close we are to trailing stop
+            # Full bar = at peak, empty bar = at trailing stop
+            if trailing_stop_offset_pct > 0:
+                distance_from_stop = pnl_pct - trailing_stop_level
+                progress = max(0.0, min(1.0, distance_from_stop / trailing_stop_offset_pct))
+                filled_width = int(progress * pnl_bar_width)
+            else:
+                filled_width = pnl_bar_width
+
+            empty_width = pnl_bar_width - filled_width
+            # Use magenta for trailing mode bar
+            pnl_bar = f"[magenta]{'█' * filled_width}[/magenta]{'░' * empty_width}"
+
+            status_text = (
+                f"{mode_display}  [dim]│[/dim]  "
+                f"PNL: [{pnl_color}]{pnl_pct:+.2f}%[/{pnl_color}]  "
+                f"Peak: [cyan]{peak_profit_pct:+.2f}%[/cyan]  "
+                f"Stop: [yellow]{trailing_stop_level:+.2f}%[/yellow]  "
+                f"{pnl_bar}"
+            )
         else:
-            filled_width = 0
+            # Normal trading mode
+            mode_display = "[green]TRADING[/green]"
 
-        empty_width = pnl_bar_width - filled_width
-        pnl_bar = f"[{pnl_color}]{'█' * filled_width}[/{pnl_color}]{'░' * empty_width}"
+            # Calculate bar fill based on progress to target
+            if profit_target_pct > 0:
+                progress = min(1.0, pnl_pct / profit_target_pct)
+                filled_width = int(progress * pnl_bar_width)
+            else:
+                filled_width = 0
 
-        # Days held status
-        days_remaining = max_hold_days - days_held
-        days_color = "green" if days_remaining > 3 else "yellow" if days_remaining > 1 else "red"
+            empty_width = pnl_bar_width - filled_width
+            pnl_bar = f"[{pnl_color}]{'█' * filled_width}[/{pnl_color}]{'░' * empty_width}"
 
-        status_text = (
-            f"{mode_display}  [dim]│[/dim]  "
-            f"PNL: [{pnl_color}]{pnl_pct:+.2f}%[/{pnl_color}] / [cyan]{profit_target_pct:.0f}%[/cyan]  "
-            f"{pnl_bar}  [dim]│[/dim]  "
-            f"Days: [{days_color}]{days_held}[/{days_color}] / [cyan]{max_hold_days}[/cyan]"
-        )
+            # Days held status
+            days_remaining = max_hold_days - days_held
+            days_color = "green" if days_remaining > 3 else "yellow" if days_remaining > 1 else "red"
+
+            # Calculate time till next rebalance (if enabled)
+            rebalance_countdown_str = ""
+            if enable_rebalance and entry_date:
+                try:
+                    from datetime import date as date_type, timedelta
+                    entry_dt = date_type.fromisoformat(entry_date)
+                    rebalance_date = entry_dt + timedelta(days=max_hold_days)
+                    # Rebalance happens at start of that day (00:00 UTC)
+                    rebalance_datetime = datetime.combine(rebalance_date, datetime.min.time(), tzinfo=timezone.utc)
+                    time_until = rebalance_datetime - now
+                    if time_until.total_seconds() > 0:
+                        total_seconds = int(time_until.total_seconds())
+                        hours, remainder = divmod(total_seconds, 3600)
+                        minutes, seconds = divmod(remainder, 60)
+                        if hours >= 24:
+                            days = hours // 24
+                            hours = hours % 24
+                            rebalance_countdown_str = f"  [dim]│[/dim]  Rebalance: [cyan]{days}d {hours:02d}:{minutes:02d}:{seconds:02d}[/cyan]"
+                        else:
+                            rebalance_countdown_str = f"  [dim]│[/dim]  Rebalance: [yellow]{hours:02d}:{minutes:02d}:{seconds:02d}[/yellow]"
+                except Exception:
+                    pass
+
+            status_text = (
+                f"{mode_display}  [dim]│[/dim]  "
+                f"PNL: [{pnl_color}]{pnl_pct:+.2f}%[/{pnl_color}] / [cyan]{profit_target_pct:.0f}%[/cyan]  "
+                f"{pnl_bar}  [dim]│[/dim]  "
+                f"Days: [{days_color}]{days_held}[/{days_color}] / [cyan]{max_hold_days}[/cyan]"
+                f"{rebalance_countdown_str}"
+            )
 
     # Add refresh rate
     if refresh_seconds:
@@ -474,6 +588,12 @@ def create_autotrade_dashboard_layout(
     config_dict: dict | None = None,
     refresh_seconds: float | None = None,
     open_orders: list[dict] | None = None,
+    trailing_active: bool = False,
+    peak_profit_pct: float | None = None,
+    trailing_stop_offset_pct: float = 0.5,
+    entry_date: str | None = None,
+    enable_rebalance: bool = True,
+    last_profit_info: dict | None = None,
 ) -> Layout:
     """Build autotrade-specific dashboard with PNL tracking and profit target monitoring.
 
@@ -488,6 +608,12 @@ def create_autotrade_dashboard_layout(
         config_dict: Configuration dictionary for sidebar
         refresh_seconds: UI refresh rate
         open_orders: List of open orders
+        trailing_active: Whether trailing stop mode is active
+        peak_profit_pct: Highest profit seen since trailing activated
+        trailing_stop_offset_pct: Trailing stop offset in percentage points
+        entry_date: ISO date string (YYYY-MM-DD) when positions were opened
+        enable_rebalance: Whether rebalancing is enabled on max_hold_days
+        last_profit_info: Dict with last profit taken info (profit, fees, date)
     """
     layout = Layout()
 
@@ -511,7 +637,7 @@ def create_autotrade_dashboard_layout(
         Layout(name="metrics", size=8), Layout(name="positions")
     )
 
-    layout["metrics"].update(create_metrics_panel(portfolio))
+    layout["metrics"].update(create_autotrade_metrics_panel(portfolio, last_profit_info))
     layout["positions"].update(create_positions_panel(portfolio))
 
     # Sidebar: split into config (top) and open orders (bottom)
@@ -534,6 +660,11 @@ def create_autotrade_dashboard_layout(
         max_hold_days=max_hold_days,
         next_opening_time=next_opening_time,
         refresh_seconds=refresh_seconds,
+        trailing_active=trailing_active,
+        peak_profit_pct=peak_profit_pct,
+        trailing_stop_offset_pct=trailing_stop_offset_pct,
+        entry_date=entry_date,
+        enable_rebalance=enable_rebalance,
     )
     layout["footer"].update(footer)
 

@@ -8,6 +8,8 @@ from datetime import datetime, timezone, timedelta, time as time_cls
 import subprocess
 import shutil
 import shlex
+import logging
+import random
 
 import click
 from rich.console import Console
@@ -45,6 +47,61 @@ from .completion import detect_shell_from_env, install_completion
 
 TMUX_SESSION_NAME = "cc-liquid"
 TMUX_WINDOW_NAME = "cc-liquid"
+
+
+def _setup_file_logging(log_dir: str = "logs") -> str:
+    """Ensure log file handler is configured and return log path."""
+    log_date = datetime.now(timezone.utc).strftime("%Y%m%d")
+    log_path = os.path.join(log_dir, f"cc-liquid-{log_date}.log")
+    os.makedirs(log_dir, exist_ok=True)
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+
+    abs_path = os.path.abspath(log_path)
+    already = any(
+        isinstance(h, logging.FileHandler) and h.baseFilename == abs_path
+        for h in root_logger.handlers
+    )
+    if not already:
+        handler = logging.FileHandler(log_path)
+        formatter = logging.Formatter(
+            "%(asctime)sZ [%(levelname)s] %(name)s: %(message)s"
+        )
+        handler.setFormatter(formatter)
+        root_logger.addHandler(handler)
+
+    return log_path
+
+
+class ExponentialBackoff:
+    """Simple exponential backoff with optional jitter."""
+
+    def __init__(
+        self,
+        *,
+        base: float = 1.0,
+        factor: float = 2.0,
+        max_delay: float = 60.0,
+        jitter: float = 0.1,
+    ) -> None:
+        self.base = base
+        self.factor = factor
+        self.max_delay = max_delay
+        self.jitter = jitter
+        self.attempts = 0
+
+    def next_delay(self) -> float:
+        delay = min(self.max_delay, self.base * (self.factor ** self.attempts))
+        self.attempts += 1
+        if self.jitter:
+            jitter_amount = delay * self.jitter
+            delay = delay + random.uniform(-jitter_amount, jitter_amount)
+            delay = max(0.0, delay)
+        return delay
+
+    def reset(self) -> None:
+        self.attempts = 0
 
 
 @click.group()
@@ -417,16 +474,18 @@ def profile_show(name: str | None):
 
 @profile.command(name="use")
 @click.argument("name", required=True)
-def profile_use(name: str):
+@click.pass_context
+def profile_use(ctx, name: str):
     """Set active profile and persist to YAML."""
     console = Console()
     profiles = config.profiles or {}
     if name not in profiles:
-        console.print(f"[red]Profile '{name}' not found in cc-liquid-config.yaml[/red]")
+        console.print(f"[red]Profile '{name}' not found in config file[/red]")
         raise SystemExit(2)
 
-    # Update file
-    cfg_path = "cc-liquid-config.yaml"
+    # Get config path from context or use default
+    config_file = ctx.obj.get('config_file') if ctx.obj else None
+    cfg_path = config_file or "cc-liquid-config.yaml"
     try:
         y: dict = {}
         if os.path.exists(cfg_path):
@@ -1617,8 +1676,12 @@ def optimize(
     is_flag=True,
     help="Run inside a fixed tmux session (attach if exists, else create and run).",
 )
-def run(skip_confirm, set_overrides, refresh, tmux):
+@click.pass_context
+def run(ctx, skip_confirm, set_overrides, refresh, tmux):
     """Start continuous monitoring and automatic rebalancing with live dashboard."""
+    # Get config file from context (set at CLI group level)
+    config_file = ctx.obj.get('config_file') if ctx.obj else None
+
     # Minimal tmux wrapper: attach-or-create a fixed session, with recursion guard
     if tmux and os.environ.get("CCLIQUID_TMUX_CHILD") != "1":
         if shutil.which("tmux") is None:
@@ -1654,8 +1717,11 @@ def run(skip_confirm, set_overrides, refresh, tmux):
             "run",
             "-m",
             "cc_liquid.cli",
-            "run",
         ]
+        # Pass --config if specified (must come before subcommand)
+        if config_file:
+            inner_cmd.extend(["--config", config_file])
+        inner_cmd.append("run")
         if skip_confirm:
             inner_cmd.append("--skip-confirm")
         for override in set_overrides:
@@ -1704,6 +1770,9 @@ def run_live_cli(
         refresh_seconds: UI update cadence in seconds
     """
     console = Console()
+    log_path = _setup_file_logging()
+    logger = logging.getLogger("cc_liquid.run")
+    logger.info("Starting live run loop; log file: %s", log_path)
 
     # Create trader with initial callbacks and load state
     callbacks = RichCLICallbacks()
@@ -1731,95 +1800,118 @@ def run_live_cli(
     ) as live:
         # quick loading screen
         try:
+            backoff = ExponentialBackoff()
             while True:
-                # Get current portfolio state
-                portfolio = trader.get_portfolio_info()
-                
-                # Get open orders
-                open_orders = trader.get_open_orders()
+                try:
+                    # Get current portfolio state
+                    portfolio = trader.get_portfolio_info()
 
-                # Calculate next rebalance time and determine if due
-                next_action_time = trader.compute_next_rebalance_time(
-                    last_rebalance_date
-                )
-                now = datetime.now(timezone.utc)
-                should_rebalance = now >= next_action_time
+                    # Get open orders
+                    open_orders = trader.get_open_orders()
 
-                if should_rebalance:
-                    # Stop the live display to run the standard rebalancing flow
-                    live.stop()
-
-                    try:
-                        console.print(
-                            "\n[bold yellow]-- Scheduled rebalance started --[/bold yellow]"
-                        )
-                        # Preview plan
-                        plan = trader.plan_rebalance_auto()
-                        all_trades = plan["trades"] + plan["skipped_trades"]
-                        callbacks.show_trade_plan(
-                            plan["target_positions"],
-                            all_trades,
-                            plan["account_value"],
-                            plan["leverage"],
-                        )
-
-                        proceed = skip_confirm or callbacks.ask_confirmation(
-                            "Execute these trades?"
-                        )
-                        if proceed:
-                            result = trader.execute_plan(plan)
-                            callbacks.show_execution_summary(
-                                result["successful_trades"],
-                                result["all_trades"],
-                                plan["target_positions"],
-                                plan["account_value"],
-                            )
-                        else:
-                            callbacks.info("Trading cancelled by user")
-
-                        # Update state on successful completion
-                        last_rebalance_date = datetime.now(timezone.utc)
-                        trader.save_state(last_rebalance_date)
-
-                        if not skip_confirm:
-                            console.input(
-                                "\n[bold green]✓ Rebalance cycle finished. Press [bold]Enter[/bold] to resume dashboard...[/bold green]"
-                            )
-
-                    except Exception as e:
-                        console.print(
-                            f"\n[bold red]✗ Rebalancing failed:[/bold red] {e}"
-                        )
-                        traceback.print_exc()
-                        if not skip_confirm:
-                            console.input(
-                                "\n[yellow]Press [bold]Enter[/bold] to resume dashboard...[/yellow]"
-                            )
-                    finally:
-                        # Resume the live dashboard
-                        live.start()
-                        # Continue to the next loop iteration to immediately refresh the dashboard
-                        continue
-
-                else:
-                    # Normal monitoring dashboard
-                    dashboard = create_dashboard_layout(
-                        portfolio=portfolio,
-                        next_rebalance_time=next_action_time,
-                        last_rebalance_time=last_rebalance_date,
-                        is_rebalancing=False,
-                        config_dict=config_obj.to_dict(),
-                        refresh_seconds=refresh_seconds,
-                        open_orders=open_orders,
+                    # Calculate next rebalance time and determine if due
+                    next_action_time = trader.compute_next_rebalance_time(
+                        last_rebalance_date
                     )
-                    live.update(dashboard)
+                    now = datetime.now(timezone.utc)
+                    should_rebalance = now >= next_action_time
 
-                # Sleep to control dashboard update cadence and API usage
-                time.sleep(refresh_seconds if refresh_seconds > 0 else 1)
+                    if should_rebalance:
+                        # Stop the live display to run the standard rebalancing flow
+                        live.stop()
+
+                        try:
+                            console.print(
+                                "\n[bold yellow]-- Scheduled rebalance started --[/bold yellow]"
+                            )
+                            # Preview plan
+                            plan = trader.plan_rebalance_auto()
+                            all_trades = plan["trades"] + plan["skipped_trades"]
+                            callbacks.show_trade_plan(
+                                plan["target_positions"],
+                                all_trades,
+                                plan["account_value"],
+                                plan["leverage"],
+                            )
+
+                            proceed = skip_confirm or callbacks.ask_confirmation(
+                                "Execute these trades?"
+                            )
+                            if proceed:
+                                result = trader.execute_plan(plan)
+                                callbacks.show_execution_summary(
+                                    result["successful_trades"],
+                                    result["all_trades"],
+                                    plan["target_positions"],
+                                    plan["account_value"],
+                                )
+                            else:
+                                callbacks.info("Trading cancelled by user")
+
+                            # Update state on successful completion
+                            last_rebalance_date = datetime.now(timezone.utc)
+                            trader.save_state(last_rebalance_date)
+
+                            if not skip_confirm:
+                                console.input(
+                                    "\n[bold green]✓ Rebalance cycle finished. Press [bold]Enter[/bold] to resume dashboard...[/bold green]"
+                                )
+
+                        except Exception as e:
+                            logger.exception("Rebalancing failed")
+                            console.print(
+                                f"\n[bold red]✗ Rebalancing failed:[/bold red] {e}"
+                            )
+                            traceback.print_exc()
+                            if not skip_confirm:
+                                console.input(
+                                    "\n[yellow]Press [bold]Enter[/bold] to resume dashboard...[/yellow]"
+                                )
+                        finally:
+                            # Resume the live dashboard
+                            live.start()
+                            # Continue to the next loop iteration to immediately refresh the dashboard
+                            continue
+
+                    else:
+                        # Normal monitoring dashboard
+                        dashboard = create_dashboard_layout(
+                            portfolio=portfolio,
+                            next_rebalance_time=next_action_time,
+                            last_rebalance_time=last_rebalance_date,
+                            is_rebalancing=False,
+                            config_dict=config_obj.to_dict(),
+                            refresh_seconds=refresh_seconds,
+                            open_orders=open_orders,
+                        )
+                        live.update(dashboard)
+
+                    # Sleep to control dashboard update cadence and API usage
+                    time.sleep(refresh_seconds if refresh_seconds > 0 else 1)
+                    backoff.reset()
+                except Exception:
+                    delay = backoff.next_delay()
+                    logger.exception(
+                        "Unhandled error in live loop; retrying in %.1fs", delay
+                    )
+                    try:
+                        live.stop()
+                    except Exception:
+                        pass
+                    console.print(
+                        f"[red]Unexpected error; retrying in {delay:.1f}s...[/red]"
+                    )
+                    time.sleep(delay if delay > 0 else 1)
+                    try:
+                        live.start()
+                    except Exception:
+                        pass
+                    continue
 
         except KeyboardInterrupt:
             pass
         except Exception as e:
+            logger.exception("Fatal error in live loop")
             console.print(f"[red]✗ Error:[/red] {e}")
             traceback.print_exc()
 
@@ -1847,7 +1939,8 @@ def run_live_cli(
     is_flag=True,
     help="Run inside a persistent tmux session (attach if exists, else create and run).",
 )
-def autotrade(skip_confirm, set_overrides, refresh, tmux):
+@click.pass_context
+def autotrade(ctx, skip_confirm, set_overrides, refresh, tmux):
     """Autotrade mode: take profit cycling with automatic position management.
 
     This command implements a profit-taking strategy:
@@ -1857,6 +1950,9 @@ def autotrade(skip_confirm, set_overrides, refresh, tmux):
     - Waits until opening_time and repeats
     - Can also force rebalance after max_hold_days if enabled
     """
+    # Get config file from context (set at CLI group level)
+    config_file = ctx.obj.get('config_file') if ctx.obj else None
+
     # Tmux wrapper (same pattern as run command)
     if tmux and os.environ.get("CCLIQUID_TMUX_CHILD") != "1":
         if shutil.which("tmux") is None:
@@ -1895,8 +1991,11 @@ def autotrade(skip_confirm, set_overrides, refresh, tmux):
             "run",
             "-m",
             "cc_liquid.cli",
-            "autotrade",
         ]
+        # Pass --config if specified (must come before subcommand)
+        if config_file:
+            inner_cmd.extend(["--config", config_file])
+        inner_cmd.append("autotrade")
         if skip_confirm:
             inner_cmd.append("--skip-confirm")
         for override in set_overrides:
@@ -1954,6 +2053,9 @@ def run_autotrade_cli(
     from .cli_display import create_autotrade_dashboard_layout
 
     console = Console()
+    log_path = _setup_file_logging()
+    logger = logging.getLogger("cc_liquid.autotrade")
+    logger.info("Starting autotrade loop; log file: %s", log_path)
 
     # Create trader with callbacks
     callbacks = RichCLICallbacks()
@@ -1968,6 +2070,9 @@ def run_autotrade_cli(
     state = trader._load_autotrade_state()
     mode = state.get("mode", "waiting")
     entry_date = state.get("entry_date")
+    trailing_active = state.get("trailing_active", False)
+    peak_profit_pct = state.get("peak_profit_pct")
+    last_profit_info = state.get("last_profit_info")
 
     # Get autotrade config
     profit_target_pct = config_obj.autotrade.profit_target_pct
@@ -1975,6 +2080,11 @@ def run_autotrade_cli(
     opening_time_str = config_obj.autotrade.opening_time
     monitor_interval = config_obj.autotrade.monitor_interval_seconds
     enable_rebalance = config_obj.autotrade.enable_rebalance
+    trailing_stop_enabled = config_obj.autotrade.trailing_stop_enabled
+    trailing_stop_offset_pct = config_obj.autotrade.trailing_stop_offset_pct
+
+    # Track if we've completed a cycle (profit-take or rebalance) - subsequent entries are automatic
+    auto_mode_activated = False
 
     # Use monitor_interval as the refresh rate (override CLI refresh if specified in config)
     refresh_seconds = monitor_interval
@@ -1983,8 +2093,20 @@ def run_autotrade_cli(
     def compute_next_opening_time() -> datetime:
         """Compute next opening time in UTC."""
         now_utc = datetime.now(timezone.utc)
-        hour, minute = map(int, opening_time_str.split(":"))
-        opening_time = time_cls(hour=hour, minute=minute)
+        try:
+            parts = opening_time_str.split(":")
+            if len(parts) < 2:
+                raise ValueError("Expected HH:MM format")
+            hour = int(parts[0])
+            minute = int(parts[1])
+            opening_time = time_cls(hour=hour, minute=minute)
+        except Exception as e:
+            logger.warning(
+                "Invalid opening_time '%s': %s. Using 00:00 UTC.",
+                opening_time_str,
+                e,
+            )
+            opening_time = time_cls(hour=0, minute=0)
 
         today_at = datetime.combine(
             now_utc.date(), opening_time, tzinfo=timezone.utc
@@ -2010,166 +2132,45 @@ def run_autotrade_cli(
         transient=False,
     ) as live:
         try:
+            backoff = ExponentialBackoff()
             while True:
-                # Get current portfolio state
-                portfolio = trader.get_portfolio_info()
-                open_orders = trader.get_open_orders()
-                now = datetime.now(timezone.utc)
+                try:
+                    # Get current portfolio state
+                    portfolio = trader.get_portfolio_info()
+                    open_orders = trader.get_open_orders()
+                    now = datetime.now(timezone.utc)
 
-                # Calculate current metrics
-                pnl_pct = trader.get_portfolio_pnl_pct()
-                days_held = trader.get_position_age_days()
-
-                if mode == "waiting":
-                    # WAITING MODE: Wait until opening time
-                    if now >= next_opening_time:
-                        # Time to open positions
-                        live.stop()
-
-                        try:
-                            console.print(
-                                "\n[bold green]-- Opening time reached, loading predictions --[/bold green]"
-                            )
-
-                            # Load predictions and plan rebalance
-                            plan = trader.plan_rebalance_auto()
-                            all_trades = plan["trades"] + plan["skipped_trades"]
-                            callbacks.show_trade_plan(
-                                plan["target_positions"],
-                                all_trades,
-                                plan["account_value"],
-                                plan["leverage"],
-                            )
-
-                            proceed = skip_confirm or callbacks.ask_confirmation(
-                                "Open these positions?"
-                            )
-                            if proceed:
-                                result = trader.execute_plan(plan)
-                                callbacks.show_execution_summary(
-                                    result["successful_trades"],
-                                    result["all_trades"],
-                                    plan["target_positions"],
-                                    plan["account_value"],
-                                )
-
-                                # Switch to trading mode
-                                mode = "trading"
-                                entry_date = now.date().isoformat()
-                                trader._save_autotrade_state(mode, entry_date)
-
-                                if not skip_confirm:
-                                    console.input(
-                                        "\n[bold green]✓ Positions opened. Press [bold]Enter[/bold] to resume monitoring...[/bold green]"
-                                    )
-                            else:
-                                callbacks.info("Trading cancelled by user")
-                                # Recalculate next opening time
-                                next_opening_time = compute_next_opening_time()
-
-                        except Exception as e:
-                            console.print(
-                                f"\n[bold red]✗ Failed to open positions:[/bold red] {e}"
-                            )
-                            traceback.print_exc()
-                            if not skip_confirm:
-                                console.input(
-                                    "\n[yellow]Press [bold]Enter[/bold] to resume dashboard...[/yellow]"
-                                )
-                        finally:
-                            live.start()
-                            continue
-
-                    # Display waiting dashboard
-                    dashboard = create_autotrade_dashboard_layout(
-                        portfolio=portfolio,
-                        mode=mode,
-                        pnl_pct=pnl_pct,
-                        profit_target_pct=profit_target_pct,
-                        days_held=days_held,
-                        max_hold_days=max_hold_days,
-                        next_opening_time=next_opening_time,
-                        config_dict=config_obj.to_dict(),
-                        refresh_seconds=refresh_seconds,
-                        open_orders=open_orders,
+                    # Calculate current metrics (avoid extra API calls)
+                    account_value = portfolio.account.account_value
+                    pnl_pct = (
+                        (portfolio.total_unrealized_pnl / account_value) * 100
+                        if account_value > 0
+                        else 0.0
                     )
-                    live.update(dashboard)
+                    days_held = trader.get_position_age_days()
 
-                elif mode == "trading":
-                    # TRADING MODE: Monitor PNL and days held
+                    # Guard against corrupted state
+                    if trailing_active and peak_profit_pct is None:
+                        peak_profit_pct = pnl_pct
+                        trader._save_autotrade_state(
+                            mode,
+                            entry_date,
+                            trailing_active=True,
+                            peak_profit_pct=peak_profit_pct,
+                        )
 
-                    # Check if profit target reached
-                    if pnl_pct >= profit_target_pct:
-                        # PROFIT TARGET HIT - TAKE PROFIT
-                        live.stop()
-
-                        try:
-                            console.print(
-                                f"\n[bold green]🎯 PROFIT TARGET REACHED: {pnl_pct:+.2f}% >= {profit_target_pct:.0f}%[/bold green]"
-                            )
-                            console.print("[cyan]Closing all positions to take profit...[/cyan]")
-
-                            # Close all positions
-                            plan = trader.plan_close_all_positions()
-                            all_trades = plan["trades"] + plan["skipped_trades"]
-                            callbacks.show_trade_plan(
-                                plan["target_positions"],
-                                all_trades,
-                                plan["account_value"],
-                                plan["leverage"],
-                            )
-
-                            proceed = skip_confirm or callbacks.ask_confirmation(
-                                "Close all positions and take profit?"
-                            )
-                            if proceed:
-                                result = trader.execute_plan(plan)
-                                callbacks.show_execution_summary(
-                                    result["successful_trades"],
-                                    result["all_trades"],
-                                    plan["target_positions"],
-                                    plan["account_value"],
-                                )
-
-                                # Switch to waiting mode
-                                mode = "waiting"
-                                entry_date = None
-                                trader._save_autotrade_state(mode, entry_date)
-                                next_opening_time = compute_next_opening_time()
-
-                                if not skip_confirm:
-                                    console.input(
-                                        "\n[bold green]✓ Profit taken! Press [bold]Enter[/bold] to resume monitoring...[/bold green]"
-                                    )
-                            else:
-                                callbacks.info("Cancelled by user, continuing to monitor")
-
-                        except Exception as e:
-                            console.print(
-                                f"\n[bold red]✗ Failed to close positions:[/bold red] {e}"
-                            )
-                            traceback.print_exc()
-                            if not skip_confirm:
-                                console.input(
-                                    "\n[yellow]Press [bold]Enter[/bold] to resume dashboard...[/yellow]"
-                                )
-                        finally:
-                            live.start()
-                            continue
-
-                    # Check if max hold days reached
-                    elif days_held >= max_hold_days:
-                        if enable_rebalance:
-                            # REBALANCE POSITIONS
+                    if mode == "waiting":
+                        # WAITING MODE: Wait until opening time
+                        if now >= next_opening_time:
+                            # Time to open positions
                             live.stop()
 
                             try:
                                 console.print(
-                                    f"\n[bold yellow]⏰ MAX HOLD PERIOD REACHED: {days_held} >= {max_hold_days} days[/bold yellow]"
+                                    "\n[bold green]-- Opening time reached, loading predictions --[/bold green]"
                                 )
-                                console.print("[cyan]Rebalancing positions with latest predictions...[/cyan]")
 
-                                # Load predictions and rebalance (adjust existing positions)
+                                # Load predictions and plan rebalance
                                 plan = trader.plan_rebalance_auto()
                                 all_trades = plan["trades"] + plan["skipped_trades"]
                                 callbacks.show_trade_plan(
@@ -2179,10 +2180,208 @@ def run_autotrade_cli(
                                     plan["leverage"],
                                 )
 
-                                proceed = skip_confirm or callbacks.ask_confirmation(
-                                    "Execute rebalance?"
+                                # Auto-mode: skip confirmation after first cycle; otherwise respect skip_confirm
+                                proceed = auto_mode_activated or skip_confirm or callbacks.ask_confirmation(
+                                    "Open these positions?"
                                 )
                                 if proceed:
+                                    result = trader.execute_plan(plan)
+                                    callbacks.show_execution_summary(
+                                        result["successful_trades"],
+                                        result["all_trades"],
+                                        plan["target_positions"],
+                                        plan["account_value"],
+                                    )
+
+                                    # Switch to trading mode
+                                    mode = "trading"
+                                    entry_date = now.date().isoformat()
+                                    trader._save_autotrade_state(mode, entry_date)
+
+                                    # Only pause for user input on first start (not after auto cycle)
+                                    if not auto_mode_activated and not skip_confirm:
+                                        console.input(
+                                            "\n[bold green]✓ Positions opened. Press [bold]Enter[/bold] to resume monitoring...[/bold green]"
+                                        )
+                                else:
+                                    callbacks.info("Trading cancelled by user")
+                                    # Recalculate next opening time
+                                    next_opening_time = compute_next_opening_time()
+
+                            except Exception as e:
+                                logger.exception("Failed to open positions")
+                                console.print(
+                                    f"\n[bold red]✗ Failed to open positions:[/bold red] {e}"
+                                )
+                                traceback.print_exc()
+                                if not skip_confirm:
+                                    console.input(
+                                        "\n[yellow]Press [bold]Enter[/bold] to resume dashboard...[/yellow]"
+                                    )
+                            finally:
+                                live.start()
+                                continue
+
+                        # Display waiting dashboard
+                        dashboard = create_autotrade_dashboard_layout(
+                            portfolio=portfolio,
+                            mode=mode,
+                            pnl_pct=pnl_pct,
+                            profit_target_pct=profit_target_pct,
+                            days_held=days_held,
+                            max_hold_days=max_hold_days,
+                            next_opening_time=next_opening_time,
+                            config_dict=config_obj.to_dict(),
+                            refresh_seconds=refresh_seconds,
+                            open_orders=open_orders,
+                            trailing_active=trailing_active,
+                            peak_profit_pct=peak_profit_pct,
+                            trailing_stop_offset_pct=trailing_stop_offset_pct,
+                            entry_date=entry_date,
+                            enable_rebalance=enable_rebalance,
+                            last_profit_info=last_profit_info,
+                        )
+                        live.update(dashboard)
+
+                    elif mode == "trading":
+                        # TRADING MODE: Monitor PNL and days held
+                        should_close = False
+                        close_reason = ""
+
+                        # Check trailing stop logic first (if active)
+                        if trailing_active:
+                            # Update peak profit if current is higher
+                            if pnl_pct > peak_profit_pct:
+                                peak_profit_pct = pnl_pct
+                                trader._save_autotrade_state(
+                                    mode, entry_date, trailing_active=True, peak_profit_pct=peak_profit_pct
+                                )
+
+                            # Calculate trailing stop level
+                            trailing_stop_level = peak_profit_pct - trailing_stop_offset_pct
+
+                            # Check if trailing stop triggered
+                            if pnl_pct <= trailing_stop_level:
+                                should_close = True
+                                close_reason = f"TRAILING STOP TRIGGERED: {pnl_pct:+.2f}% <= {trailing_stop_level:+.2f}% (peak: {peak_profit_pct:+.2f}%)"
+
+                        # Check if profit target reached (when not already trailing)
+                        elif pnl_pct >= profit_target_pct:
+                            if trailing_stop_enabled:
+                                # Activate trailing stop mode
+                                trailing_active = True
+                                peak_profit_pct = pnl_pct
+                                trader._save_autotrade_state(
+                                    mode, entry_date, trailing_active=True, peak_profit_pct=peak_profit_pct
+                                )
+                                console.print(
+                                    f"\n[bold magenta]📈 TRAILING STOP ACTIVATED: Peak {peak_profit_pct:+.2f}%, "
+                                    f"Stop at {peak_profit_pct - trailing_stop_offset_pct:+.2f}%[/bold magenta]"
+                                )
+                            else:
+                                # No trailing stop - close immediately
+                                should_close = True
+                                close_reason = f"PROFIT TARGET REACHED: {pnl_pct:+.2f}% >= {profit_target_pct:.0f}%"
+
+                        if should_close:
+                            # CLOSE POSITIONS (profit target or trailing stop)
+                            live.stop()
+
+                            try:
+                                console.print(f"\n[bold green]🎯 {close_reason}[/bold green]")
+                                console.print("[cyan]Closing all positions to take profit...[/cyan]")
+
+                                # Capture unrealized PNL before closing (this becomes realized profit)
+                                pre_close_portfolio = trader.get_portfolio_info()
+                                realized_profit = pre_close_portfolio.total_unrealized_pnl
+
+                                # Close all positions
+                                plan = trader.plan_close_all_positions()
+                                all_trades = plan["trades"] + plan["skipped_trades"]
+                                callbacks.show_trade_plan(
+                                    plan["target_positions"],
+                                    all_trades,
+                                    plan["account_value"],
+                                    plan["leverage"],
+                                )
+
+                                # Always execute profit-taking automatically (no confirmation)
+                                result = trader.execute_plan(plan)
+                                callbacks.show_execution_summary(
+                                    result["successful_trades"],
+                                    result["all_trades"],
+                                    plan["target_positions"],
+                                    plan["account_value"],
+                                )
+
+                                # Calculate total fees from successful close trades
+                                total_fees = sum(
+                                    t.get("actual_fee", 0.0)
+                                    for t in result["successful_trades"]
+                                    if t.get("status") == "filled"
+                                )
+
+                                # Create last profit info
+                                profit_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+                                last_profit_info = {
+                                    "profit": realized_profit,
+                                    "fees": total_fees,
+                                    "date": profit_date,
+                                }
+
+                                # Switch to waiting mode and reset trailing state
+                                mode = "waiting"
+                                entry_date = None
+                                trailing_active = False
+                                peak_profit_pct = None
+                                trader._save_autotrade_state(
+                                    mode, entry_date, last_profit_info=last_profit_info
+                                )
+                                next_opening_time = compute_next_opening_time()
+
+                                # Mark auto-mode so subsequent entries don't require confirmation
+                                auto_mode_activated = True
+                                net_profit = realized_profit - total_fees
+                                console.print(
+                                    f"\n[bold green]✓ Profit taken! Realized: ${realized_profit:+,.2f}, "
+                                    f"Fees: ${total_fees:,.2f}, Net: ${net_profit:+,.2f}[/bold green]"
+                                )
+                                console.print("[cyan]Waiting for next entry window...[/cyan]")
+
+                            except Exception as e:
+                                logger.exception("Failed to close positions")
+                                console.print(
+                                    f"\n[bold red]✗ Failed to close positions:[/bold red] {e}"
+                                )
+                                traceback.print_exc()
+                                # Continue automatically - will retry on next cycle
+                            finally:
+                                live.start()
+                                continue
+
+                        # Check if max hold days reached (skip if trailing stop is active)
+                        elif not trailing_active and days_held >= max_hold_days:
+                            if enable_rebalance:
+                                # REBALANCE POSITIONS
+                                live.stop()
+
+                                try:
+                                    console.print(
+                                        f"\n[bold yellow]⏰ MAX HOLD PERIOD REACHED: {days_held} >= {max_hold_days} days[/bold yellow]"
+                                    )
+                                    console.print("[cyan]Rebalancing positions with latest predictions...[/cyan]")
+
+                                    # Load predictions and rebalance (adjust existing positions)
+                                    plan = trader.plan_rebalance_auto()
+                                    all_trades = plan["trades"] + plan["skipped_trades"]
+                                    callbacks.show_trade_plan(
+                                        plan["target_positions"],
+                                        all_trades,
+                                        plan["account_value"],
+                                        plan["leverage"],
+                                    )
+
+                                    # Always execute rebalance automatically (no confirmation)
                                     result = trader.execute_plan(plan)
                                     callbacks.show_execution_summary(
                                         result["successful_trades"],
@@ -2195,51 +2394,74 @@ def run_autotrade_cli(
                                     entry_date = now.date().isoformat()
                                     trader._save_autotrade_state(mode, entry_date)
 
-                                    if not skip_confirm:
-                                        console.input(
-                                            "\n[bold green]✓ Rebalanced. Press [bold]Enter[/bold] to resume monitoring...[/bold green]"
-                                        )
-                                else:
-                                    callbacks.info("Cancelled by user, continuing to monitor")
-
-                            except Exception as e:
-                                console.print(
-                                    f"\n[bold red]✗ Rebalancing failed:[/bold red] {e}"
-                                )
-                                traceback.print_exc()
-                                if not skip_confirm:
-                                    console.input(
-                                        "\n[yellow]Press [bold]Enter[/bold] to resume dashboard...[/yellow]"
+                                    # Mark auto-mode so subsequent entries don't require confirmation
+                                    auto_mode_activated = True
+                                    console.print(
+                                        "\n[bold green]✓ Rebalanced. Continuing to monitor...[/bold green]"
                                     )
-                            finally:
-                                live.start()
-                                continue
 
-                        else:
-                            # enable_rebalance is False - continue monitoring
-                            pass
+                                except Exception as e:
+                                    logger.exception("Rebalancing failed")
+                                    console.print(
+                                        f"\n[bold red]✗ Rebalancing failed:[/bold red] {e}"
+                                    )
+                                    traceback.print_exc()
+                                    # Continue automatically - will retry on next cycle
+                                finally:
+                                    live.start()
+                                    continue
 
-                    # Display trading dashboard
-                    dashboard = create_autotrade_dashboard_layout(
-                        portfolio=portfolio,
-                        mode=mode,
-                        pnl_pct=pnl_pct,
-                        profit_target_pct=profit_target_pct,
-                        days_held=days_held,
-                        max_hold_days=max_hold_days,
-                        next_opening_time=next_opening_time,
-                        config_dict=config_obj.to_dict(),
-                        refresh_seconds=refresh_seconds,
-                        open_orders=open_orders,
+                            else:
+                                # enable_rebalance is False - continue monitoring
+                                pass
+
+                        # Display trading dashboard
+                        dashboard = create_autotrade_dashboard_layout(
+                            portfolio=portfolio,
+                            mode=mode,
+                            pnl_pct=pnl_pct,
+                            profit_target_pct=profit_target_pct,
+                            days_held=days_held,
+                            max_hold_days=max_hold_days,
+                            next_opening_time=next_opening_time,
+                            config_dict=config_obj.to_dict(),
+                            refresh_seconds=refresh_seconds,
+                            open_orders=open_orders,
+                            trailing_active=trailing_active,
+                            peak_profit_pct=peak_profit_pct,
+                            trailing_stop_offset_pct=trailing_stop_offset_pct,
+                            entry_date=entry_date,
+                            enable_rebalance=enable_rebalance,
+                            last_profit_info=last_profit_info,
+                        )
+                        live.update(dashboard)
+
+                    # Sleep to control dashboard update cadence and API usage
+                    time.sleep(refresh_seconds if refresh_seconds > 0 else 1)
+                    backoff.reset()
+                except Exception:
+                    delay = backoff.next_delay()
+                    logger.exception(
+                        "Unhandled error in autotrade loop; retrying in %.1fs", delay
                     )
-                    live.update(dashboard)
-
-                # Sleep to control dashboard update cadence and API usage
-                time.sleep(refresh_seconds if refresh_seconds > 0 else 1)
+                    try:
+                        live.stop()
+                    except Exception:
+                        pass
+                    console.print(
+                        f"[red]Unexpected error; retrying in {delay:.1f}s...[/red]"
+                    )
+                    time.sleep(delay if delay > 0 else 1)
+                    try:
+                        live.start()
+                    except Exception:
+                        pass
+                    continue
 
         except KeyboardInterrupt:
             console.print("\n[yellow]Autotrade stopped by user[/yellow]")
         except Exception as e:
+            logger.exception("Fatal error in autotrade loop")
             console.print(f"[red]✗ Error:[/red] {e}")
             traceback.print_exc()
 
