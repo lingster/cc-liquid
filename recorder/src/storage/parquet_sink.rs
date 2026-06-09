@@ -1,211 +1,20 @@
-//! Parquet implementation of [`EventSink`].
+//! Single-file Parquet implementation of [`EventSink`].
 //!
 //! Events are written to three flat ("exploded") tables in a session directory,
-//! as specified in `PRD_HYPERLIQUID_DIGITAL_TWIN.md` §5.4:
-//!
-//! - `all_mids.parquet` — one row per (event, coin) mid price.
-//! - `l2_book.parquet`   — one row per book level (`side`, `level_idx`, px/sz/n).
-//! - `trades.parquet`    — one row per trade print.
-//!
-//! Common columns (`seq`, `ts_event_ms`, `ts_recv_ms`, `coin`) are shared across
-//! tables so a replay engine can fold events back into market state by `seq`.
-//! Row groups are flushed periodically to bound memory and limit data loss on
-//! crash.
+//! as specified in `PRD_HYPERLIQUID_DIGITAL_TWIN.md` §5.4. The reusable column
+//! buffers and schemas live in [`crate::storage::tables`]; for a parallel,
+//! partitioned L2 writer see [`crate::storage::sharded`].
 
-use std::fs::File;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
-use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray, UInt32Array, UInt64Array};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
-use parquet::arrow::ArrowWriter;
-use parquet::basic::{Compression, ZstdLevel};
-use parquet::file::properties::WriterProperties;
+use std::path::Path;
 
 use crate::events::{MarketEvent, RecordedEvent};
 use crate::sink::EventSink;
+use crate::storage::tables::{BookBuffer, MidsBuffer, TableFile, TradesBuffer};
+// Re-export the table file names so existing `storage::parquet_sink::*` paths
+// continue to resolve.
+pub use crate::storage::tables::{ALL_MIDS_FILE, L2_BOOK_FILE, TRADES_FILE};
 
 const DEFAULT_FLUSH_THRESHOLD: usize = 10_000;
-
-pub const ALL_MIDS_FILE: &str = "all_mids.parquet";
-pub const L2_BOOK_FILE: &str = "l2_book.parquet";
-pub const TRADES_FILE: &str = "trades.parquet";
-
-fn writer_props() -> WriterProperties {
-    WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::default()))
-        .build()
-}
-
-/// Manages a single Parquet file: lazily opens on first write, guarantees the
-/// file exists (with schema) even when no rows were produced.
-struct TableFile {
-    path: PathBuf,
-    schema: Arc<Schema>,
-    writer: Option<ArrowWriter<File>>,
-}
-
-impl TableFile {
-    fn new(path: PathBuf, schema: Arc<Schema>) -> Self {
-        Self {
-            path,
-            schema,
-            writer: None,
-        }
-    }
-
-    fn write_batch(&mut self, batch: &RecordBatch) -> anyhow::Result<()> {
-        if self.writer.is_none() {
-            let file = File::create(&self.path)?;
-            self.writer = Some(ArrowWriter::try_new(
-                file,
-                self.schema.clone(),
-                Some(writer_props()),
-            )?);
-        }
-        self.writer.as_mut().unwrap().write(batch)?;
-        Ok(())
-    }
-
-    /// Close the file, ensuring it exists with at least an (empty) schema.
-    fn close(&mut self) -> anyhow::Result<()> {
-        if self.writer.is_none() {
-            let empty = RecordBatch::new_empty(self.schema.clone());
-            self.write_batch(&empty)?;
-        }
-        if let Some(w) = self.writer.take() {
-            w.close()?;
-        }
-        Ok(())
-    }
-}
-
-/// Column buffers for the `all_mids` table.
-#[derive(Default)]
-struct MidsBuffer {
-    seq: Vec<u64>,
-    ts_event_ms: Vec<i64>,
-    ts_recv_ms: Vec<i64>,
-    coin: Vec<String>,
-    mid: Vec<f64>,
-}
-
-impl MidsBuffer {
-    fn len(&self) -> usize {
-        self.seq.len()
-    }
-    fn schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("seq", DataType::UInt64, false),
-            Field::new("ts_event_ms", DataType::Int64, false),
-            Field::new("ts_recv_ms", DataType::Int64, false),
-            Field::new("coin", DataType::Utf8, false),
-            Field::new("mid", DataType::Float64, false),
-        ]))
-    }
-    fn drain_to_batch(&mut self) -> anyhow::Result<RecordBatch> {
-        let cols: Vec<ArrayRef> = vec![
-            Arc::new(UInt64Array::from(std::mem::take(&mut self.seq))),
-            Arc::new(Int64Array::from(std::mem::take(&mut self.ts_event_ms))),
-            Arc::new(Int64Array::from(std::mem::take(&mut self.ts_recv_ms))),
-            Arc::new(StringArray::from(std::mem::take(&mut self.coin))),
-            Arc::new(Float64Array::from(std::mem::take(&mut self.mid))),
-        ];
-        Ok(RecordBatch::try_new(Self::schema(), cols)?)
-    }
-}
-
-/// Column buffers for the `l2_book` table.
-#[derive(Default)]
-struct BookBuffer {
-    seq: Vec<u64>,
-    ts_event_ms: Vec<i64>,
-    ts_recv_ms: Vec<i64>,
-    coin: Vec<String>,
-    side: Vec<String>,
-    level_idx: Vec<u32>,
-    px: Vec<f64>,
-    sz: Vec<f64>,
-    n: Vec<u32>,
-}
-
-impl BookBuffer {
-    fn len(&self) -> usize {
-        self.seq.len()
-    }
-    fn schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("seq", DataType::UInt64, false),
-            Field::new("ts_event_ms", DataType::Int64, false),
-            Field::new("ts_recv_ms", DataType::Int64, false),
-            Field::new("coin", DataType::Utf8, false),
-            Field::new("side", DataType::Utf8, false),
-            Field::new("level_idx", DataType::UInt32, false),
-            Field::new("px", DataType::Float64, false),
-            Field::new("sz", DataType::Float64, false),
-            Field::new("n", DataType::UInt32, false),
-        ]))
-    }
-    fn drain_to_batch(&mut self) -> anyhow::Result<RecordBatch> {
-        let cols: Vec<ArrayRef> = vec![
-            Arc::new(UInt64Array::from(std::mem::take(&mut self.seq))),
-            Arc::new(Int64Array::from(std::mem::take(&mut self.ts_event_ms))),
-            Arc::new(Int64Array::from(std::mem::take(&mut self.ts_recv_ms))),
-            Arc::new(StringArray::from(std::mem::take(&mut self.coin))),
-            Arc::new(StringArray::from(std::mem::take(&mut self.side))),
-            Arc::new(UInt32Array::from(std::mem::take(&mut self.level_idx))),
-            Arc::new(Float64Array::from(std::mem::take(&mut self.px))),
-            Arc::new(Float64Array::from(std::mem::take(&mut self.sz))),
-            Arc::new(UInt32Array::from(std::mem::take(&mut self.n))),
-        ];
-        Ok(RecordBatch::try_new(Self::schema(), cols)?)
-    }
-}
-
-/// Column buffers for the `trades` table.
-#[derive(Default)]
-struct TradesBuffer {
-    seq: Vec<u64>,
-    ts_event_ms: Vec<i64>,
-    ts_recv_ms: Vec<i64>,
-    coin: Vec<String>,
-    side: Vec<String>,
-    px: Vec<f64>,
-    sz: Vec<f64>,
-    trade_time_ms: Vec<i64>,
-}
-
-impl TradesBuffer {
-    fn len(&self) -> usize {
-        self.seq.len()
-    }
-    fn schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("seq", DataType::UInt64, false),
-            Field::new("ts_event_ms", DataType::Int64, false),
-            Field::new("ts_recv_ms", DataType::Int64, false),
-            Field::new("coin", DataType::Utf8, false),
-            Field::new("side", DataType::Utf8, false),
-            Field::new("px", DataType::Float64, false),
-            Field::new("sz", DataType::Float64, false),
-            Field::new("trade_time_ms", DataType::Int64, false),
-        ]))
-    }
-    fn drain_to_batch(&mut self) -> anyhow::Result<RecordBatch> {
-        let cols: Vec<ArrayRef> = vec![
-            Arc::new(UInt64Array::from(std::mem::take(&mut self.seq))),
-            Arc::new(Int64Array::from(std::mem::take(&mut self.ts_event_ms))),
-            Arc::new(Int64Array::from(std::mem::take(&mut self.ts_recv_ms))),
-            Arc::new(StringArray::from(std::mem::take(&mut self.coin))),
-            Arc::new(StringArray::from(std::mem::take(&mut self.side))),
-            Arc::new(Float64Array::from(std::mem::take(&mut self.px))),
-            Arc::new(Float64Array::from(std::mem::take(&mut self.sz))),
-            Arc::new(Int64Array::from(std::mem::take(&mut self.trade_time_ms))),
-        ];
-        Ok(RecordBatch::try_new(Self::schema(), cols)?)
-    }
-}
 
 /// Writes recorded events to a session directory as three Parquet tables.
 pub struct ParquetSink {
@@ -246,40 +55,11 @@ impl ParquetSink {
         match &event.payload {
             MarketEvent::AllMids(m) => {
                 for (coin, mid) in &m.mids {
-                    self.mids_buf.seq.push(seq);
-                    self.mids_buf.ts_event_ms.push(te);
-                    self.mids_buf.ts_recv_ms.push(tr);
-                    self.mids_buf.coin.push(coin.clone());
-                    self.mids_buf.mid.push(*mid);
+                    self.mids_buf.push(seq, te, tr, coin, *mid);
                 }
             }
-            MarketEvent::L2Book(b) => {
-                for (side, levels) in [("bid", &b.bids), ("ask", &b.asks)] {
-                    for (idx, lvl) in levels.iter().enumerate() {
-                        self.book_buf.seq.push(seq);
-                        self.book_buf.ts_event_ms.push(te);
-                        self.book_buf.ts_recv_ms.push(tr);
-                        self.book_buf.coin.push(b.coin.clone());
-                        self.book_buf.side.push(side.to_string());
-                        self.book_buf.level_idx.push(idx as u32);
-                        self.book_buf.px.push(lvl.px);
-                        self.book_buf.sz.push(lvl.sz);
-                        self.book_buf.n.push(lvl.n);
-                    }
-                }
-            }
-            MarketEvent::Trades(ts) => {
-                for t in ts {
-                    self.trades_buf.seq.push(seq);
-                    self.trades_buf.ts_event_ms.push(te);
-                    self.trades_buf.ts_recv_ms.push(tr);
-                    self.trades_buf.coin.push(t.coin.clone());
-                    self.trades_buf.side.push(t.side.as_str().to_string());
-                    self.trades_buf.px.push(t.px);
-                    self.trades_buf.sz.push(t.sz);
-                    self.trades_buf.trade_time_ms.push(t.time_ms);
-                }
-            }
+            MarketEvent::L2Book(b) => self.book_buf.push_book(seq, te, tr, b),
+            MarketEvent::Trades(ts) => self.trades_buf.push_trades(seq, te, tr, ts),
         }
     }
 
@@ -307,15 +87,15 @@ impl EventSink for ParquetSink {
     }
 
     fn finalize(&mut self) -> anyhow::Result<()> {
-        if self.mids_buf.len() > 0 {
+        if !self.mids_buf.is_empty() {
             let batch = self.mids_buf.drain_to_batch()?;
             self.mids_file.write_batch(&batch)?;
         }
-        if self.book_buf.len() > 0 {
+        if !self.book_buf.is_empty() {
             let batch = self.book_buf.drain_to_batch()?;
             self.book_file.write_batch(&batch)?;
         }
-        if self.trades_buf.len() > 0 {
+        if !self.trades_buf.is_empty() {
             let batch = self.trades_buf.drain_to_batch()?;
             self.trades_file.write_batch(&batch)?;
         }
@@ -331,6 +111,7 @@ mod tests {
     use super::*;
     use crate::events::{AllMids, L2Book, Level, MarketEvent, Side, Trade};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::fs::File;
 
     fn read_row_count(path: &Path) -> usize {
         let file = File::open(path).unwrap();
@@ -393,7 +174,6 @@ mod tests {
         .unwrap();
         sink.finalize().unwrap();
 
-        // 2 mids rows, 2 book levels (1 bid + 1 ask), 1 trade row.
         assert_eq!(read_row_count(&dir.path().join(ALL_MIDS_FILE)), 2);
         assert_eq!(read_row_count(&dir.path().join(L2_BOOK_FILE)), 2);
         assert_eq!(read_row_count(&dir.path().join(TRADES_FILE)), 1);
@@ -405,7 +185,6 @@ mod tests {
         let mut sink = ParquetSink::create(dir.path()).unwrap();
         sink.finalize().unwrap();
 
-        // Files exist with zero rows.
         assert_eq!(read_row_count(&dir.path().join(ALL_MIDS_FILE)), 0);
         assert_eq!(read_row_count(&dir.path().join(L2_BOOK_FILE)), 0);
         assert_eq!(read_row_count(&dir.path().join(TRADES_FILE)), 0);
@@ -414,7 +193,6 @@ mod tests {
     #[test]
     fn periodic_flush_preserves_all_rows() {
         let dir = tempfile::tempdir().unwrap();
-        // Flush every 2 buffered rows to exercise multi-row-group writes.
         let mut sink = ParquetSink::with_flush_threshold(dir.path(), 2).unwrap();
         for seq in 0..5 {
             sink.write(&rec(

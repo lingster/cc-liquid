@@ -8,11 +8,13 @@ use anyhow::Context;
 use clap::Parser;
 use tracing::info;
 
-use hl_recorder::client::WsSource;
+use hl_recorder::client::{connect_sharded, WsSource};
 use hl_recorder::config::{Network, RecordConfig};
 use hl_recorder::manifest::{Counts, Manifest, SCHEMA_VERSION};
 use hl_recorder::recorder::Recorder;
-use hl_recorder::storage::ParquetSink;
+use hl_recorder::sink::EventSink;
+use hl_recorder::source::EventSource;
+use hl_recorder::storage::{ParquetSink, ShardedParquetSink};
 use hl_recorder::subscription::{build_subscriptions, StreamSelection};
 
 const MANIFEST_FILE: &str = "manifest.json";
@@ -48,6 +50,16 @@ struct Cli {
     /// Skip the all-mids stream.
     #[arg(long, default_value_t = false)]
     no_mids: bool,
+
+    /// Coins per WebSocket connection. `0` = single connection. Use a smaller
+    /// value to shard full-universe L2 capture across many connections.
+    #[arg(long, default_value_t = 0)]
+    shard_size: usize,
+
+    /// Number of parallel L2 Parquet part-files. `1` = single `l2_book.parquet`;
+    /// higher values fan L2 writes across that many worker threads/files.
+    #[arg(long, default_value_t = 1)]
+    l2_shards: usize,
 }
 
 impl Cli {
@@ -78,27 +90,48 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let cfg = Cli::parse().into_config();
-    run(cfg).await
+    let cli = Cli::parse();
+    let (shard_size, l2_shards) = (cli.shard_size, cli.l2_shards);
+    run(cli.into_config(), shard_size, l2_shards).await
 }
 
-async fn run(cfg: RecordConfig) -> anyhow::Result<()> {
+async fn run(cfg: RecordConfig, shard_size: usize, l2_shards: usize) -> anyhow::Result<()> {
     let endpoint = cfg.network.ws_endpoint();
-    let subs = build_subscriptions(&cfg.coins, &cfg.streams);
 
     info!(
-        "recording {} coin(s) on {} for {}s -> {}",
+        "recording {} coin(s) on {} for {}s (shard_size={}, l2_shards={}) -> {}",
         cfg.coins.len(),
         cfg.network.as_str(),
         cfg.duration_secs,
+        shard_size,
+        l2_shards,
         cfg.out_dir.display()
     );
 
     let started_at = chrono::Utc::now();
-    let mut source = WsSource::connect(endpoint, &subs)
-        .await
-        .with_context(|| format!("connecting to {endpoint}"))?;
-    let mut sink = ParquetSink::create(&cfg.out_dir)?;
+
+    // Choose transport: single connection, or sharded across many.
+    let mut source: Box<dyn EventSource + Send> = if shard_size > 0 {
+        Box::new(
+            connect_sharded(endpoint, &cfg.coins, &cfg.streams, shard_size)
+                .await
+                .with_context(|| format!("connecting (sharded) to {endpoint}"))?,
+        )
+    } else {
+        let subs = build_subscriptions(&cfg.coins, &cfg.streams);
+        Box::new(
+            WsSource::connect(endpoint, &subs)
+                .await
+                .with_context(|| format!("connecting to {endpoint}"))?,
+        )
+    };
+
+    // Choose storage: single-file, or partitioned/parallel L2.
+    let mut sink: Box<dyn EventSink> = if l2_shards > 1 {
+        Box::new(ShardedParquetSink::create(&cfg.out_dir, l2_shards)?)
+    } else {
+        Box::new(ParquetSink::create(&cfg.out_dir)?)
+    };
 
     let deadline = tokio::time::sleep(Duration::from_secs(cfg.duration_secs));
     let stats = Recorder::new()

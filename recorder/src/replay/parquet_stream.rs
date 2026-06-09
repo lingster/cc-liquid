@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context};
 use arrow::array::{Float64Array, Int64Array, StringArray, UInt32Array, UInt64Array};
@@ -16,18 +16,37 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::events::{AllMids, L2Book, Level, MarketEvent, RecordedEvent, Side, Trade};
 use crate::replay::stream::VecEventStream;
-use crate::storage::parquet_sink::{ALL_MIDS_FILE, L2_BOOK_FILE, TRADES_FILE};
+use crate::storage::tables::{ALL_MIDS_FILE, L2_BOOK_DIR, L2_BOOK_FILE, TRADES_FILE};
 
 /// Load a session directory into events ordered by `seq`.
+///
+/// Supports both L2 layouts: a single `l2_book.parquet` (single-file sink) or a
+/// partitioned `l2_book/part-*.parquet` directory (sharded sink).
 pub fn load_session(dir: impl AsRef<Path>) -> anyhow::Result<Vec<RecordedEvent>> {
     let dir = dir.as_ref();
     let mut by_seq: BTreeMap<u64, RecordedEvent> = BTreeMap::new();
 
     load_all_mids(&dir.join(ALL_MIDS_FILE), &mut by_seq)?;
-    load_l2_book(&dir.join(L2_BOOK_FILE), &mut by_seq)?;
+    for part in l2_book_parts(dir)? {
+        load_l2_book(&part, &mut by_seq)?;
+    }
     load_trades(&dir.join(TRADES_FILE), &mut by_seq)?;
 
     Ok(by_seq.into_values().collect())
+}
+
+/// Resolve the L2 part-file(s) for a session, supporting both layouts.
+fn l2_book_parts(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let part_dir = dir.join(L2_BOOK_DIR);
+    if part_dir.is_dir() {
+        let mut parts: Vec<PathBuf> = std::fs::read_dir(&part_dir)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "parquet"))
+            .collect();
+        parts.sort();
+        return Ok(parts);
+    }
+    Ok(vec![dir.join(L2_BOOK_FILE)])
 }
 
 /// Convenience: load a session straight into an [`EventStream`].

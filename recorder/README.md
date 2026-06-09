@@ -150,3 +150,39 @@ The recorder can stop on a count (`Recorder::with_max_events(n)`) as well as a
 duration. The `tests/twin.rs` integration tests assert the output Parquet holds
 exactly 1000 gap-free, sequentially-numbered ticks whose timestamps match the
 saved prices, in both tick and realtime modes.
+
+## Scaling to many currencies
+
+The whole pipeline is coin-keyed, and two features let it scale to the full
+Hyperliquid universe:
+
+**Connection sharding** — `--shard-size N` splits the coins across multiple
+WebSocket connections (one per group), merged concurrently via
+`merge_source::MergeSource` (one reader task per shard). `allMids` is global, so
+it is subscribed only on the first shard. This parallelizes network I/O for
+full-universe L2 capture.
+
+**Parallel partitioned L2 storage** — `--l2-shards N` writes the heavy L2 stream
+to **N Parquet part-files** under `l2_book/`, each written by its own background
+worker thread (`storage::ShardedParquetSink`). The recording thread only buffers
+rows and ships `RecordBatch`es to workers over bounded channels, so ZSTD
+compression and disk I/O run in parallel across cores. A coin always hashes to the
+same part, so ordering per coin is preserved and each coin lives in exactly one
+file. Mids/trades stay single-file (they are light). The replay loader reads both
+the single-file and partitioned layouts transparently.
+
+```bash
+# Full-universe-style capture: many connections + parallel L2 writers
+hl-recorder --assets BTC,ETH,SOL,DOGE --duration 300 \
+    --shard-size 2 --l2-shards 4 --out sessions/universe
+# -> sessions/universe/l2_book/part-0000.parquet .. part-0003.parquet
+```
+
+**Multi-coin synthetic FX** — `replay::MultiCoinSyntheticStream` broadcasts mids
+for an arbitrary set of pairs in one `allMids` event per tick (each coin on its
+own ramp), so the twin can synthesize FX for many pairs without a recording.
+
+What scales now: mids/FX for the entire universe (one global subscription),
+multi-coin record/replay, and parallel L2 writes. The remaining bottleneck for
+the *full* universe with L2 is central JSON parsing (single consumer); parsing in
+the shard tasks would be the next step.

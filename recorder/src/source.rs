@@ -13,6 +13,15 @@ pub trait EventSource {
     async fn next_message(&mut self) -> Option<anyhow::Result<String>>;
 }
 
+/// Allow a boxed source to be used wherever an `EventSource` is expected
+/// (lets callers choose between e.g. single vs sharded transport at runtime).
+#[async_trait]
+impl EventSource for Box<dyn EventSource + Send> {
+    async fn next_message(&mut self) -> Option<anyhow::Result<String>> {
+        (**self).next_message().await
+    }
+}
+
 /// A scripted source that yields a fixed list of messages, for tests.
 pub struct ScriptedSource {
     messages: std::collections::VecDeque<String>,

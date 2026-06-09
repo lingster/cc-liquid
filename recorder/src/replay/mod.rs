@@ -6,6 +6,7 @@
 
 pub mod clock;
 pub mod engine;
+pub mod multi_synthetic;
 pub mod parquet_stream;
 pub mod state;
 pub mod stream;
@@ -13,6 +14,7 @@ pub mod synthetic;
 
 pub use clock::{Clock, ManualClock, NoopClock, RealtimeClock};
 pub use engine::ReplayEngine;
+pub use multi_synthetic::{CoinRamp, MultiCoinSyntheticStream};
 pub use parquet_stream::{load_session, load_session_stream};
 pub use state::{BookState, MarketState};
 pub use stream::{EventStream, VecEventStream};

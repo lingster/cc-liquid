@@ -16,6 +16,17 @@ pub trait EventSink {
     fn finalize(&mut self) -> anyhow::Result<()>;
 }
 
+/// Allow a boxed sink to be used wherever an `EventSink` is expected (lets
+/// callers choose between e.g. single-file vs sharded storage at runtime).
+impl EventSink for Box<dyn EventSink> {
+    fn write(&mut self, event: &RecordedEvent) -> anyhow::Result<()> {
+        (**self).write(event)
+    }
+    fn finalize(&mut self) -> anyhow::Result<()> {
+        (**self).finalize()
+    }
+}
+
 /// In-memory sink that simply collects events. Used by tests and as a reference
 /// implementation of the trait contract.
 #[derive(Debug, Default)]

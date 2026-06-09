@@ -8,6 +8,7 @@ pub mod client;
 pub mod config;
 pub mod events;
 pub mod manifest;
+pub mod merge_source;
 pub mod parser;
 pub mod recorder;
 pub mod replay;
