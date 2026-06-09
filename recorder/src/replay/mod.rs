@@ -11,7 +11,7 @@ pub mod state;
 pub mod stream;
 pub mod synthetic;
 
-pub use clock::{Clock, ManualClock, RealtimeClock};
+pub use clock::{Clock, ManualClock, NoopClock, RealtimeClock};
 pub use engine::ReplayEngine;
 pub use parquet_stream::{load_session, load_session_stream};
 pub use state::{BookState, MarketState};

@@ -128,3 +128,25 @@ Replay a recorded session from the CLI:
 ```bash
 cargo run --example replay_session -- sessions/demo BTC
 ```
+
+## Digital-twin loop (playback → recorder)
+
+`twin::PlaybackSource` makes a playback stream *look like the live exchange*: it
+serializes events to Hyperliquid JSON (via `wire`) and feeds them to the recorder
+through the same `EventSource` trait the live WebSocket client implements — so the
+recorder cannot tell replay from live. It also publishes its logical clock, which
+the recorder uses for `ts_recv_ms`, keeping replay deterministic and making
+time-encoded prices line up exactly with recorded timestamps.
+
+```bash
+# Tick mode: increasing price 0.0 +0.0001/tick -> 1000 sequential ticks
+cargo run --example twin_record -- sessions/twin_tick tick 1000
+
+# Realtime mode: price encodes time as ss.mmm, paced by the clock
+cargo run --example twin_record -- sessions/twin_realtime realtime 1000
+```
+
+The recorder can stop on a count (`Recorder::with_max_events(n)`) as well as a
+duration. The `tests/twin.rs` integration tests assert the output Parquet holds
+exactly 1000 gap-free, sequentially-numbered ticks whose timestamps match the
+saved prices, in both tick and realtime modes.

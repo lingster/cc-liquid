@@ -39,6 +39,7 @@ impl RecordingStats {
 pub struct Recorder {
     sequencer: Sequencer,
     stats: RecordingStats,
+    max_events: Option<u64>,
 }
 
 impl Default for Recorder {
@@ -52,7 +53,15 @@ impl Recorder {
         Self {
             sequencer: Sequencer::new(),
             stats: RecordingStats::default(),
+            max_events: None,
         }
+    }
+
+    /// Stop automatically after `n` events have been recorded (a count-based
+    /// limit, complementary to the duration deadline).
+    pub fn with_max_events(mut self, n: u64) -> Self {
+        self.max_events = Some(n);
+        self
     }
 
     /// Record until the source is exhausted, returning the run statistics.
@@ -103,6 +112,11 @@ impl Recorder {
                         Some(Ok(raw)) => {
                             if let Err(e) = self.ingest(&raw, &mut now_ms, sink) {
                                 break Err(e);
+                            }
+                            if let Some(max) = self.max_events {
+                                if self.stats.recorded >= max {
+                                    break Ok(());
+                                }
                             }
                         }
                         Some(Err(e)) => {

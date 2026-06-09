@@ -50,6 +50,16 @@ impl Clock for RealtimeClock {
     }
 }
 
+/// Immediate clock: never waits. Used for tick-mode / as-fast-as-possible
+/// playback where pacing is irrelevant.
+#[derive(Default)]
+pub struct NoopClock;
+
+#[async_trait]
+impl Clock for NoopClock {
+    async fn sleep_ms(&self, _ms: i64) {}
+}
+
 /// Test clock: never actually sleeps, but records every requested duration so
 /// tests can assert pacing deterministically.
 #[derive(Default)]

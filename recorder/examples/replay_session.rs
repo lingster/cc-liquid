@@ -10,7 +10,9 @@ use hl_recorder::replay::{load_session_stream, ReplayEngine};
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
-    let dir = args.next().expect("usage: replay_session <session_dir> <coin>");
+    let dir = args
+        .next()
+        .expect("usage: replay_session <session_dir> <coin>");
     let coin = args.next().unwrap_or_else(|| "BTC".to_string());
 
     let stream = load_session_stream(&dir)?;
