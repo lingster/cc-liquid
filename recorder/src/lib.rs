@@ -6,6 +6,7 @@
 
 pub mod client;
 pub mod config;
+pub mod crowdcent;
 pub mod events;
 pub mod info;
 pub mod manifest;

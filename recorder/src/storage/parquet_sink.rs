@@ -78,15 +78,10 @@ impl ParquetSink {
         }
         Ok(())
     }
-}
 
-impl EventSink for ParquetSink {
-    fn write(&mut self, event: &RecordedEvent) -> anyhow::Result<()> {
-        self.append(event);
-        self.flush_full_buffers()
-    }
-
-    fn finalize(&mut self) -> anyhow::Result<()> {
+    /// Drain every non-empty buffer into its file (encoding a row group) without
+    /// closing. Shared by the periodic `flush` and the final drain.
+    fn drain_all(&mut self) -> anyhow::Result<()> {
         if !self.mids_buf.is_empty() {
             let batch = self.mids_buf.drain_to_batch()?;
             self.mids_file.write_batch(&batch)?;
@@ -99,6 +94,26 @@ impl EventSink for ParquetSink {
             let batch = self.trades_buf.drain_to_batch()?;
             self.trades_file.write_batch(&batch)?;
         }
+        Ok(())
+    }
+}
+
+impl EventSink for ParquetSink {
+    fn write(&mut self, event: &RecordedEvent) -> anyhow::Result<()> {
+        self.append(event);
+        self.flush_full_buffers()
+    }
+
+    fn flush(&mut self) -> anyhow::Result<()> {
+        self.drain_all()?;
+        self.mids_file.flush()?;
+        self.book_file.flush()?;
+        self.trades_file.flush()?;
+        Ok(())
+    }
+
+    fn finalize(&mut self) -> anyhow::Result<()> {
+        self.drain_all()?;
         self.mids_file.close()?;
         self.book_file.close()?;
         self.trades_file.close()?;
@@ -188,6 +203,42 @@ mod tests {
         assert_eq!(read_row_count(&dir.path().join(ALL_MIDS_FILE)), 0);
         assert_eq!(read_row_count(&dir.path().join(L2_BOOK_FILE)), 0);
         assert_eq!(read_row_count(&dir.path().join(TRADES_FILE)), 0);
+    }
+
+    #[test]
+    fn explicit_flush_between_writes_preserves_all_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = ParquetSink::create(dir.path()).unwrap();
+        for seq in 0..3 {
+            sink.write(&rec(
+                seq,
+                MarketEvent::Trades(vec![Trade {
+                    coin: "BTC".into(),
+                    side: Side::Buy,
+                    px: 100.0,
+                    sz: 1.0,
+                    time_ms: seq as i64,
+                }]),
+            ))
+            .unwrap();
+        }
+        // Mid-session flush (e.g. the time-based flush) writes a row group...
+        sink.flush().unwrap();
+        // ...and recording continues into a second row group.
+        sink.write(&rec(
+            3,
+            MarketEvent::Trades(vec![Trade {
+                coin: "ETH".into(),
+                side: Side::Sell,
+                px: 50.0,
+                sz: 2.0,
+                time_ms: 3,
+            }]),
+        ))
+        .unwrap();
+        sink.finalize().unwrap();
+
+        assert_eq!(read_row_count(&dir.path().join(TRADES_FILE)), 4);
     }
 
     #[test]

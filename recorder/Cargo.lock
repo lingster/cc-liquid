@@ -1952,6 +1952,7 @@ dependencies = [
  "anyhow",
  "arrow",
  "async-trait",
+ "bytes",
  "chrono",
  "clap",
  "eframe",

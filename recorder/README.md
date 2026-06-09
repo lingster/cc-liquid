@@ -22,19 +22,43 @@ cargo test --test integration -- --ignored live_   # live mainnet smoke test
 ```bash
 # Record a 5-minute mainnet session for three assets
 hl-recorder --assets BTC,ETH,SOL --duration 300 --network mainnet --out sessions/demo
+
+# Record until you stop it with Ctrl-C (no --duration); finalizes on exit
+hl-recorder --assets BTC,ETH,SOL --out sessions/demo
+
+# Or record the CrowdCent meta-model universe (coins of its latest release)
+hl-recorder --cc --duration 300 --out sessions/crowdcent
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--assets` | (required) | Comma-separated coins, e.g. `BTC,ETH,SOL` |
-| `--duration` | `300` | Recording length in seconds |
+| `--assets` | — | Comma-separated coins, e.g. `BTC,ETH,SOL`. Optional when `--cc` is used |
+| `--cc` | off | Source the coin list from the CrowdCent meta model instead of `--assets` |
+| `--cc-challenge` | `hyperliquid-ranking` | CrowdCent challenge slug to pull the universe from |
+| `--cc-url` | `https://crowdcent.com/api` | CrowdCent API base URL |
+| `--duration` | `0` | Recording length in seconds. `0` = record until stopped by a signal (Ctrl-C / SIGTERM) |
 | `--network` | `mainnet` | `mainnet` or `testnet` |
 | `--out` | (required) | Output session directory |
 | `--no-l2` / `--no-trades` / `--no-mids` | off | Drop a stream from the recording |
 | `--shard-size` | `0` | Coins per WebSocket connection (`0` = single); see *Scaling* |
 | `--l2-shards` | `1` | Parallel L2 Parquet part-files; see *Scaling* |
+| `--flush-interval` | `300` | Flush buffered rows to disk at least every N seconds (`0` disables); see *Durability* |
 
 Set `RUST_LOG=debug` for verbose subscription/transport logging.
+
+**CrowdCent coin universe (`--cc`)** — downloads the challenge's consolidated
+meta-model parquet, takes the unique asset ids of its most recent `release_date`,
+and uses them as the recording coin list (then validated against the live perp
+universe like any `--assets` list). Requires a `CROWDCENT_API_KEY`, read from the
+environment or, as a fallback, a nearby `.env` file (searched from the working
+directory upward). The same `.env` fallback applies to every env var, so e.g.
+`RUST_LOG` can live there too.
+
+```text
+INFO  fetching coin universe from CrowdCent challenge `hyperliquid-ranking`
+INFO  CrowdCent meta model yielded 172 coin(s)
+INFO  recording 172 coin(s) on mainnet for 300s ...
+```
 
 **Coin validation** — requested `--assets` are checked against the live perp
 universe (fetched from the `info` endpoint) before subscribing. Coins that are
@@ -52,6 +76,39 @@ INFO  recording 3 coin(s) on mainnet for 300s ...
 transparently reconnects with exponential backoff and re-sends all
 subscriptions, so a transient disconnect no longer ends a long recording — the
 `--duration` deadline remains the authoritative stop.
+
+## Durability
+
+Rows are buffered in memory and written to Parquet on **three** triggers:
+
+1. **Row-count threshold** — a per-table buffer reaching ~10k rows is encoded as
+   a row group (bounds memory under bursty load).
+2. **Time-based flush** (`--flush-interval`, default **300s**) — every N seconds
+   all buffered rows are drained and the current row group is pushed to disk, so
+   data lands incrementally even when no buffer hits the row-count threshold.
+   `--flush-interval 0` disables it.
+3. **Finalize on stop** — when the `--duration` deadline fires *or* a graceful
+   shutdown signal arrives, buffers are drained and each file's **footer** is
+   written, producing a valid, readable Parquet.
+
+With `--duration 0` (the default) there is no deadline: the recorder runs
+indefinitely and stops only on a shutdown signal, finalizing at that point.
+
+**Graceful shutdown** — `SIGTERM`, `SIGINT` (Ctrl-C), `SIGHUP` and `SIGQUIT` are
+caught and trigger the same finalize path as the deadline, so stopping a
+recording (systemd stop, Ctrl-C, container shutdown) — including an unlimited
+run — still writes the footer instead of leaving a truncated file.
+
+```text
+WARN  received SIGTERM; finalizing session early (writing Parquet footer)
+INFO  done: recorded=23 (mids=7, l2=0, trades=16), ignored=3, errors=0
+```
+
+> A Parquet file is only valid once its footer is written, which happens at
+> finalize. The periodic flush bounds memory and persists row groups, but a file
+> is guaranteed readable only after a finalize. `SIGKILL` (`kill -9`) **cannot**
+> be intercepted by any process, so a hard-kill mid-recording can still leave an
+> unfinalized file — use a graceful signal to stop a session.
 
 ## Output session layout
 

@@ -61,6 +61,16 @@ impl TableFile {
         Ok(())
     }
 
+    /// Finish the current row group and push it to the OS, without writing the
+    /// footer. No-op if nothing has been written yet (so we never create an
+    /// empty file mid-session).
+    pub fn flush(&mut self) -> anyhow::Result<()> {
+        if let Some(w) = self.writer.as_mut() {
+            w.flush()?;
+        }
+        Ok(())
+    }
+
     /// Close the file, ensuring it exists with at least an (empty) schema.
     pub fn close(&mut self) -> anyhow::Result<()> {
         if self.writer.is_none() {

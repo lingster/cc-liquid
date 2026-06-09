@@ -10,6 +10,7 @@ use tracing::{info, warn};
 
 use hl_recorder::client::{connect_sharded, WsSource};
 use hl_recorder::config::{Network, RecordConfig};
+use hl_recorder::crowdcent;
 use hl_recorder::info::fetch_perp_universe;
 use hl_recorder::manifest::{Counts, Manifest, SCHEMA_VERSION};
 use hl_recorder::reconnect::{ReconnectPolicy, ReconnectSource};
@@ -29,12 +30,29 @@ const MANIFEST_FILE: &str = "manifest.json";
 #[derive(Parser, Debug)]
 #[command(name = "hl-recorder", version)]
 struct Cli {
-    /// Comma-separated coins, e.g. `BTC,ETH,SOL`.
-    #[arg(long, value_delimiter = ',', required = true)]
+    /// Comma-separated coins, e.g. `BTC,ETH,SOL`. Optional when `--cc` is given.
+    #[arg(long, value_delimiter = ',')]
     assets: Vec<String>,
 
-    /// Recording duration in seconds (e.g. 300 for 5 minutes).
-    #[arg(long, default_value_t = 300)]
+    /// Source the coin list from the CrowdCent meta model instead of `--assets`.
+    /// Downloads the challenge's consolidated meta model and records the coins of
+    /// its latest release. Requires `CROWDCENT_API_KEY` (read from the
+    /// environment or a `.env` file).
+    #[arg(long, default_value_t = false)]
+    cc: bool,
+
+    /// CrowdCent challenge slug to pull the coin universe from (with `--cc`).
+    #[arg(long, default_value = crowdcent::DEFAULT_CHALLENGE_SLUG)]
+    cc_challenge: String,
+
+    /// CrowdCent API base URL (with `--cc`).
+    #[arg(long, default_value = crowdcent::DEFAULT_BASE_URL)]
+    cc_url: String,
+
+    /// Recording duration in seconds (e.g. 300 for 5 minutes). `0` (the default)
+    /// records until stopped by a shutdown signal (Ctrl-C / SIGTERM), finalizing
+    /// the Parquet at that point.
+    #[arg(long, default_value_t = 0)]
     duration: u64,
 
     /// Target network.
@@ -66,6 +84,12 @@ struct Cli {
     /// higher values fan L2 writes across that many worker threads/files.
     #[arg(long, default_value_t = 1)]
     l2_shards: usize,
+
+    /// Flush buffered rows to disk at least this often (seconds). `0` disables
+    /// the time-based flush (rows are still flushed at the row-count threshold
+    /// and on shutdown). The Parquet footer is only written on shutdown.
+    #[arg(long, default_value_t = 300)]
+    flush_interval: u64,
 }
 
 impl Cli {
@@ -90,18 +114,112 @@ fn now_ms() -> i64 {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Make a nearby `.env` a fallback for every env var (e.g. CROWDCENT_API_KEY,
+    // RUST_LOG) before anything reads the environment. Real env vars still win.
+    crowdcent::apply_dotenv_fallback();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    if cli.cc {
+        cli.assets = resolve_crowdcent_coins(&cli.cc_url, &cli.cc_challenge).await?;
+    }
+    if cli.assets.is_empty() {
+        anyhow::bail!("no coins to record: pass --assets BTC,ETH,... or --cc");
+    }
+
     let (shard_size, l2_shards) = (cli.shard_size, cli.l2_shards);
-    run(cli.into_config(), shard_size, l2_shards).await
+    let flush_interval = (cli.flush_interval > 0).then(|| Duration::from_secs(cli.flush_interval));
+    run(cli.into_config(), shard_size, l2_shards, flush_interval).await
 }
 
-async fn run(cfg: RecordConfig, shard_size: usize, l2_shards: usize) -> anyhow::Result<()> {
+/// Resolve when a recording session should stop: the duration deadline (when
+/// set), or a graceful shutdown signal. `duration_secs == 0` means run until a
+/// signal arrives. SIGKILL cannot be caught, but SIGTERM/SIGINT/SIGHUP/SIGQUIT
+/// let us finalize the Parquet footer instead of leaving a truncated file.
+async fn wait_for_stop(duration_secs: u64) {
+    if duration_secs == 0 {
+        // Unlimited: only a shutdown signal stops the session.
+        let sig = wait_for_shutdown_signal().await;
+        warn!("received {sig}; finalizing session (writing Parquet footer)");
+        return;
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_secs(duration_secs)) =>
+            info!("duration of {duration_secs}s reached; finalizing session"),
+        sig = wait_for_shutdown_signal() =>
+            warn!("received {sig}; finalizing session early (writing Parquet footer)"),
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> &'static str {
+    use tokio::signal::unix::{signal, SignalKind};
+    // If a handler cannot be installed we fall back to a never-resolving future
+    // for that signal rather than aborting the whole recording.
+    let mut term = signal(SignalKind::terminate()).ok();
+    let mut int = signal(SignalKind::interrupt()).ok();
+    let mut hup = signal(SignalKind::hangup()).ok();
+    let mut quit = signal(SignalKind::quit()).ok();
+
+    async fn recv(s: &mut Option<tokio::signal::unix::Signal>) {
+        match s {
+            Some(s) => {
+                s.recv().await;
+            }
+            None => std::future::pending().await,
+        }
+    }
+
+    tokio::select! {
+        _ = recv(&mut term) => "SIGTERM",
+        _ = recv(&mut int) => "SIGINT",
+        _ = recv(&mut hup) => "SIGHUP",
+        _ = recv(&mut quit) => "SIGQUIT",
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> &'static str {
+    let _ = tokio::signal::ctrl_c().await;
+    "Ctrl-C"
+}
+
+/// Resolve the recording coin list from the CrowdCent meta model.
+async fn resolve_crowdcent_coins(cc_url: &str, cc_challenge: &str) -> anyhow::Result<Vec<String>> {
+    let api_key = std::env::var(crowdcent::API_KEY_ENV_VAR).map_err(|_| {
+        anyhow::anyhow!(
+            "--cc requires {} (set it in the environment or a .env file)",
+            crowdcent::API_KEY_ENV_VAR
+        )
+    })?;
+
+    info!("fetching coin universe from CrowdCent challenge `{cc_challenge}`");
+    let coins = crowdcent::fetch_crowdcent_coins(
+        cc_url,
+        cc_challenge,
+        &api_key,
+        crowdcent::DEFAULT_ID_COLUMN,
+        crowdcent::DEFAULT_DATE_COLUMN,
+    )
+    .await
+    .context("fetching CrowdCent coin universe")?;
+
+    info!("CrowdCent meta model yielded {} coin(s)", coins.len());
+    Ok(coins)
+}
+
+async fn run(
+    cfg: RecordConfig,
+    shard_size: usize,
+    l2_shards: usize,
+    flush_interval: Option<Duration>,
+) -> anyhow::Result<()> {
     let endpoint = cfg.network.ws_endpoint();
 
     // Validate requested coins against the live universe so one bad coin (e.g. a
@@ -131,13 +249,20 @@ async fn run(cfg: RecordConfig, shard_size: usize, l2_shards: usize) -> anyhow::
     }
     let coins = validation.kept;
 
+    let flush_secs = flush_interval.map_or(0, |d| d.as_secs());
+    let duration_label = if cfg.duration_secs == 0 {
+        "until stopped".to_string()
+    } else {
+        format!("for {}s", cfg.duration_secs)
+    };
     info!(
-        "recording {} coin(s) on {} for {}s (shard_size={}, l2_shards={}) -> {}",
+        "recording {} coin(s) on {} {} (shard_size={}, l2_shards={}, flush_interval={}s) -> {}",
         coins.len(),
         cfg.network.as_str(),
-        cfg.duration_secs,
+        duration_label,
         shard_size,
         l2_shards,
+        flush_secs,
         cfg.out_dir.display()
     );
 
@@ -176,11 +301,16 @@ async fn run(cfg: RecordConfig, shard_size: usize, l2_shards: usize) -> anyhow::
         Box::new(ParquetSink::create(&cfg.out_dir)?)
     };
 
-    let deadline = tokio::time::sleep(Duration::from_secs(cfg.duration_secs));
+    // Stop on the duration deadline *or* a graceful shutdown signal; either way
+    // `run_until` finalizes the sink so the Parquet footer is written.
     let stats = Recorder::new()
-        .run_until(&mut source, &mut sink, now_ms, deadline)
+        .with_flush_interval(flush_interval)
+        .run_until(&mut source, &mut sink, now_ms, wait_for_stop(cfg.duration_secs))
         .await?;
     let ended_at = chrono::Utc::now();
+    // Record the actual elapsed wall-clock, which is the only meaningful value
+    // when running unlimited (`--duration 0`) and matches the target otherwise.
+    let actual_duration_secs = (ended_at - started_at).num_seconds().max(0) as u64;
 
     let manifest = Manifest {
         schema_version: SCHEMA_VERSION,
@@ -190,7 +320,7 @@ async fn run(cfg: RecordConfig, shard_size: usize, l2_shards: usize) -> anyhow::
         streams: cfg.stream_names(),
         started_at: started_at.to_rfc3339(),
         ended_at: ended_at.to_rfc3339(),
-        duration_secs: cfg.duration_secs,
+        duration_secs: actual_duration_secs,
         counts: Counts::from(&stats),
         recorder_version: env!("CARGO_PKG_VERSION").to_string(),
     };

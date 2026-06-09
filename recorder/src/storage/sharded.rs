@@ -49,19 +49,30 @@ pub fn part_file_name(shard: usize) -> String {
     format!("part-{shard:04}.parquet")
 }
 
+/// Work item sent to an L2 writer thread.
+enum BookMsg {
+    /// Append a batch of rows to the part-file.
+    Batch(RecordBatch),
+    /// Finish the current row group and push it to disk (no footer).
+    Flush,
+}
+
 /// A background L2 writer owning one part-file.
 struct BookWorker {
-    tx: SyncSender<RecordBatch>,
+    tx: SyncSender<BookMsg>,
     handle: JoinHandle<anyhow::Result<()>>,
 }
 
 impl BookWorker {
     fn spawn(path: PathBuf) -> Self {
-        let (tx, rx) = sync_channel::<RecordBatch>(WORKER_QUEUE_DEPTH);
+        let (tx, rx) = sync_channel::<BookMsg>(WORKER_QUEUE_DEPTH);
         let handle = std::thread::spawn(move || -> anyhow::Result<()> {
             let mut file = TableFile::new(path, BookBuffer::schema());
-            while let Ok(batch) = rx.recv() {
-                file.write_batch(&batch)?;
+            while let Ok(msg) = rx.recv() {
+                match msg {
+                    BookMsg::Batch(batch) => file.write_batch(&batch)?,
+                    BookMsg::Flush => file.flush()?,
+                }
             }
             // Channel closed: flush and finalize (writes an empty schema file
             // if this shard never received any rows).
@@ -72,7 +83,13 @@ impl BookWorker {
 
     fn send(&self, batch: RecordBatch) -> anyhow::Result<()> {
         self.tx
-            .send(batch)
+            .send(BookMsg::Batch(batch))
+            .map_err(|_| anyhow::anyhow!("L2 writer worker terminated early"))
+    }
+
+    fn send_flush(&self) -> anyhow::Result<()> {
+        self.tx
+            .send(BookMsg::Flush)
             .map_err(|_| anyhow::anyhow!("L2 writer worker terminated early"))
     }
 
@@ -147,6 +164,29 @@ impl ShardedParquetSink {
 }
 
 impl EventSink for ShardedParquetSink {
+    fn flush(&mut self) -> anyhow::Result<()> {
+        // Drain and hand off every L2 shard buffer, then tell each worker to
+        // finish its current row group on disk.
+        for shard in 0..self.num_shards() {
+            self.flush_shard(shard)?;
+        }
+        for worker in &self.workers {
+            worker.send_flush()?;
+        }
+        // Drain and flush the light single-file streams.
+        if !self.mids_buf.is_empty() {
+            let batch = self.mids_buf.drain_to_batch()?;
+            self.mids_file.write_batch(&batch)?;
+        }
+        if !self.trades_buf.is_empty() {
+            let batch = self.trades_buf.drain_to_batch()?;
+            self.trades_file.write_batch(&batch)?;
+        }
+        self.mids_file.flush()?;
+        self.trades_file.flush()?;
+        Ok(())
+    }
+
     fn write(&mut self, event: &RecordedEvent) -> anyhow::Result<()> {
         let (seq, te, tr) = (event.seq, event.ts_event_ms, event.ts_recv_ms);
         match &event.payload {
@@ -283,6 +323,30 @@ mod tests {
 
         let expected_rows = coins.len() * 10 * 2;
         assert_eq!(total_l2_rows(dir.path(), shards), expected_rows);
+    }
+
+    #[test]
+    fn flush_between_writes_preserves_all_l2_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let shards = 3;
+        let mut sink = ShardedParquetSink::create(dir.path(), shards).unwrap();
+
+        let coins = ["BTC", "ETH", "SOL", "DOGE"];
+        let mut seq = 0u64;
+        for c in coins {
+            sink.write(&book(c, seq)).unwrap();
+            seq += 1;
+        }
+        // Mid-session flush drains shard buffers and flushes each part-file.
+        sink.flush().unwrap();
+        for c in coins {
+            sink.write(&book(c, seq)).unwrap();
+            seq += 1;
+        }
+        sink.finalize().unwrap();
+
+        // 4 coins * 2 ticks * 2 levels = 16 rows survive the flush.
+        assert_eq!(total_l2_rows(dir.path(), shards), coins.len() * 2 * 2);
     }
 
     #[test]

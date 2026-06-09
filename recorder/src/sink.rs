@@ -11,8 +11,16 @@ pub trait EventSink {
     /// Persist a single event.
     fn write(&mut self, event: &RecordedEvent) -> anyhow::Result<()>;
 
-    /// Flush buffers and finalize the underlying artifact. Called once at the
-    /// end of a session.
+    /// Flush buffered rows to durable storage *without* finalizing. May be
+    /// called periodically during a session (e.g. on a timer); the artifact
+    /// stays open for more writes. The default is a no-op for sinks that do not
+    /// buffer.
+    fn flush(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Flush buffers and finalize the underlying artifact (e.g. write the
+    /// Parquet footer). Called once at the end of a session.
     fn finalize(&mut self) -> anyhow::Result<()>;
 }
 
@@ -21,6 +29,9 @@ pub trait EventSink {
 impl EventSink for Box<dyn EventSink> {
     fn write(&mut self, event: &RecordedEvent) -> anyhow::Result<()> {
         (**self).write(event)
+    }
+    fn flush(&mut self) -> anyhow::Result<()> {
+        (**self).flush()
     }
     fn finalize(&mut self) -> anyhow::Result<()> {
         (**self).finalize()
@@ -32,6 +43,7 @@ impl EventSink for Box<dyn EventSink> {
 #[derive(Debug, Default)]
 pub struct MemorySink {
     pub events: Vec<RecordedEvent>,
+    pub flushes: usize,
     pub finalized: bool,
 }
 
@@ -44,6 +56,11 @@ impl MemorySink {
 impl EventSink for MemorySink {
     fn write(&mut self, event: &RecordedEvent) -> anyhow::Result<()> {
         self.events.push(event.clone());
+        Ok(())
+    }
+
+    fn flush(&mut self) -> anyhow::Result<()> {
+        self.flushes += 1;
         Ok(())
     }
 
