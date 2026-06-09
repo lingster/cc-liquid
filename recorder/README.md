@@ -31,8 +31,27 @@ hl-recorder --assets BTC,ETH,SOL --duration 300 --network mainnet --out sessions
 | `--network` | `mainnet` | `mainnet` or `testnet` |
 | `--out` | (required) | Output session directory |
 | `--no-l2` / `--no-trades` / `--no-mids` | off | Drop a stream from the recording |
+| `--shard-size` | `0` | Coins per WebSocket connection (`0` = single); see *Scaling* |
+| `--l2-shards` | `1` | Parallel L2 Parquet part-files; see *Scaling* |
 
 Set `RUST_LOG=debug` for verbose subscription/transport logging.
+
+**Coin validation** — requested `--assets` are checked against the live perp
+universe (fetched from the `info` endpoint) before subscribing. Coins that are
+not tradeable on the target network are dropped with a warning rather than
+subscribed; a single bad symbol can no longer reset the shared connection. If
+none of the requested coins are valid, the recorder exits with an error.
+
+```text
+WARN  ignoring coin(s) not tradeable on mainnet: ["NMR"]
+INFO  recording 3 coin(s) on mainnet for 300s ...
+```
+
+**Self-healing transport** — the live source is wrapped in a reconnecting
+`EventSource` (`reconnect::ReconnectSource`). On a dropped/reset connection it
+transparently reconnects with exponential backoff and re-sends all
+subscriptions, so a transient disconnect no longer ends a long recording — the
+`--duration` deadline remains the authoritative stop.
 
 ## Output session layout
 
@@ -47,6 +66,30 @@ sessions/demo/
 Every event carries a monotonic, gap-free `seq` plus the exchange event time
 (`ts_event_ms`) and local receive time (`ts_recv_ms`), so a replay engine can
 deterministically fold the events back into market state.
+
+## Inspecting a session (`hl-viewer`)
+
+`hl-viewer` is a desktop GUI ([egui](https://github.com/emilk/egui)) for
+examining a recorded session tick-by-tick.
+
+```bash
+cargo run --bin hl-viewer -- sessions/demo
+```
+
+- **Coin picker** — choose any coin present in the session.
+- **Order book** — the L2 book at the current tick: bids (descending) and asks
+  (ascending) with `px` / `sz` / `n`, plus best bid, best ask and mid.
+- **Price ladder** — every distinct price the coin trades at across the file.
+- **Tick navigation** — *Prev* / *Next* step one L2 snapshot at a time (clamped
+  at both ends).
+- **Timeline** — drag the slider to scrub the current tick to any point in time
+  (jumps to the nearest snapshot).
+- **Playback** — *Play* / *Pause* replays the book in real time with a speed
+  multiplier, animating the order-book movements.
+
+All navigation, indexing and playback-pacing logic lives in the pure,
+unit-tested `viewer` module (`session_data`, `navigator`, `playback`); the egui
+binary is a thin rendering shell over it (Dependency Inversion again).
 
 ## Architecture
 
@@ -70,6 +113,9 @@ EventSource (trait)            EventSink (trait)
 | `recorder` | Orchestrate source → parse → sink, with deadline support |
 | `sink` / `storage::parquet_sink` | `EventSink` trait + Parquet writer |
 | `source` / `client` | `EventSource` trait + live WebSocket client |
+| `reconnect` | Self-healing `EventSource` wrapper (backoff reconnect) |
+| `universe` / `info` | Fetch + validate the tradeable coin universe |
+| `viewer` | Pure model for the `hl-viewer` GUI (session, navigation, playback) |
 | `manifest` | Self-describing session metadata |
 | `config` | Network endpoints + session config |
 
