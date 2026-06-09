@@ -7,9 +7,11 @@
 pub mod client;
 pub mod config;
 pub mod events;
+pub mod info;
 pub mod manifest;
 pub mod merge_source;
 pub mod parser;
+pub mod reconnect;
 pub mod recorder;
 pub mod replay;
 pub mod sequencer;
@@ -18,4 +20,6 @@ pub mod source;
 pub mod storage;
 pub mod subscription;
 pub mod twin;
+pub mod universe;
+pub mod viewer;
 pub mod wire;

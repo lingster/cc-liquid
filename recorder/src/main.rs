@@ -6,16 +6,22 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
-use tracing::info;
+use tracing::{info, warn};
 
 use hl_recorder::client::{connect_sharded, WsSource};
 use hl_recorder::config::{Network, RecordConfig};
+use hl_recorder::info::fetch_perp_universe;
 use hl_recorder::manifest::{Counts, Manifest, SCHEMA_VERSION};
+use hl_recorder::reconnect::{ReconnectPolicy, ReconnectSource};
 use hl_recorder::recorder::Recorder;
 use hl_recorder::sink::EventSink;
 use hl_recorder::source::EventSource;
 use hl_recorder::storage::{ParquetSink, ShardedParquetSink};
 use hl_recorder::subscription::{build_subscriptions, StreamSelection};
+use hl_recorder::universe::validate_coins;
+
+/// A boxed source so single-connection and sharded transports share one type.
+type BoxedSource = Box<dyn EventSource + Send>;
 
 const MANIFEST_FILE: &str = "manifest.json";
 
@@ -98,9 +104,36 @@ async fn main() -> anyhow::Result<()> {
 async fn run(cfg: RecordConfig, shard_size: usize, l2_shards: usize) -> anyhow::Result<()> {
     let endpoint = cfg.network.ws_endpoint();
 
+    // Validate requested coins against the live universe so one bad coin (e.g. a
+    // symbol not listed on Hyperliquid) can never poison the whole connection.
+    let universe = fetch_perp_universe(cfg.network.info_endpoint())
+        .await
+        .with_context(|| {
+            format!(
+                "fetching perp universe from {}",
+                cfg.network.info_endpoint()
+            )
+        })?;
+    let validation = validate_coins(&cfg.coins, &universe);
+    if !validation.dropped.is_empty() {
+        warn!(
+            "ignoring coin(s) not tradeable on {}: {:?}",
+            cfg.network.as_str(),
+            validation.dropped
+        );
+    }
+    if validation.kept.is_empty() {
+        anyhow::bail!(
+            "none of the requested coins are on Hyperliquid {}: {:?}",
+            cfg.network.as_str(),
+            cfg.coins
+        );
+    }
+    let coins = validation.kept;
+
     info!(
         "recording {} coin(s) on {} for {}s (shard_size={}, l2_shards={}) -> {}",
-        cfg.coins.len(),
+        coins.len(),
         cfg.network.as_str(),
         cfg.duration_secs,
         shard_size,
@@ -110,21 +143,31 @@ async fn run(cfg: RecordConfig, shard_size: usize, l2_shards: usize) -> anyhow::
 
     let started_at = chrono::Utc::now();
 
-    // Choose transport: single connection, or sharded across many.
-    let mut source: Box<dyn EventSource + Send> = if shard_size > 0 {
-        Box::new(
-            connect_sharded(endpoint, &cfg.coins, &cfg.streams, shard_size)
-                .await
-                .with_context(|| format!("connecting (sharded) to {endpoint}"))?,
-        )
-    } else {
-        let subs = build_subscriptions(&cfg.coins, &cfg.streams);
-        Box::new(
-            WsSource::connect(endpoint, &subs)
-                .await
-                .with_context(|| format!("connecting to {endpoint}"))?,
-        )
+    // A `connect` factory used for the initial connect *and* every reconnect:
+    // it re-builds subscriptions each time so a fresh socket is fully resubscribed.
+    let streams = cfg.streams.clone();
+    let connect_coins = coins.clone();
+    let connect = move || {
+        let endpoint = endpoint.to_string();
+        let coins = connect_coins.clone();
+        let streams = streams.clone();
+        async move {
+            let src: BoxedSource = if shard_size > 0 {
+                Box::new(connect_sharded(&endpoint, &coins, &streams, shard_size).await?)
+            } else {
+                let subs = build_subscriptions(&coins, &streams);
+                Box::new(WsSource::connect(&endpoint, &subs).await?)
+            };
+            Ok::<BoxedSource, anyhow::Error>(src)
+        }
     };
+
+    // Fail fast if we cannot connect even once; otherwise wrap in a self-healing
+    // source that survives transient disconnects for the full duration.
+    let initial = connect()
+        .await
+        .with_context(|| format!("connecting to {endpoint}"))?;
+    let mut source = ReconnectSource::new(initial, connect, ReconnectPolicy::default());
 
     // Choose storage: single-file, or partitioned/parallel L2.
     let mut sink: Box<dyn EventSink> = if l2_shards > 1 {
@@ -143,7 +186,7 @@ async fn run(cfg: RecordConfig, shard_size: usize, l2_shards: usize) -> anyhow::
         schema_version: SCHEMA_VERSION,
         network: cfg.network.as_str().to_string(),
         endpoint: endpoint.to_string(),
-        coins: cfg.coins.clone(),
+        coins: coins.clone(),
         streams: cfg.stream_names(),
         started_at: started_at.to_rfc3339(),
         ended_at: ended_at.to_rfc3339(),
