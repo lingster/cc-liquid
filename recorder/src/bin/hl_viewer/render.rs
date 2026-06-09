@@ -70,7 +70,7 @@ pub fn render_depth_chart(ui: &mut egui::Ui, book: &L2Book, max_size: f64) {
     let ask_color = egui::Color32::from_rgb(220, 90, 90);
 
     let width = ui.available_width();
-    let (rect, _resp) =
+    let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(width, HEIGHT), egui::Sense::hover());
     let painter = ui.painter_at(rect);
 
@@ -85,29 +85,43 @@ pub fn render_depth_chart(ui: &mut egui::Ui, book: &L2Book, max_size: f64) {
     let safe_max = if max_size > 0.0 { max_size } else { 1.0 };
     let bar_height = |sz: f64| ((sz / safe_max).clamp(0.0, 1.0) as f32) * usable_h;
 
-    let draw_bar = |x: f32, sz: f64, color: egui::Color32| {
-        if !sz.is_finite() {
-            return;
-        }
-        let h = bar_height(sz);
-        let bar = egui::Rect::from_min_max(
-            egui::pos2(x, baseline - h),
-            egui::pos2(x + (bar_w - 1.0).max(1.0), baseline),
+    // Draw each level and record its full-height column rect so the whole
+    // column is hoverable (even when the bar itself is only a few px tall).
+    struct Hit {
+        col: egui::Rect,
+        px: f64,
+        sz: f64,
+        is_bid: bool,
+    }
+    let mut hits: Vec<Hit> = Vec::with_capacity(total);
+
+    let mut draw_bar = |x: f32, px: f64, sz: f64, color: egui::Color32, is_bid: bool| {
+        let col = egui::Rect::from_min_max(
+            egui::pos2(x, rect.top()),
+            egui::pos2(x + bar_w, baseline),
         );
-        painter.rect_filled(bar, 0.0, color);
+        if sz.is_finite() {
+            let h = bar_height(sz);
+            let bar = egui::Rect::from_min_max(
+                egui::pos2(x, baseline - h),
+                egui::pos2(x + (bar_w - 1.0).max(1.0), baseline),
+            );
+            painter.rect_filled(bar, 0.0, color);
+        }
+        hits.push(Hit { col, px, sz, is_bid });
     };
 
     // Left half: bids worst→best (best ends up adjacent to the centre). Book
     // bids are best-first, so iterate reversed.
     let mut x = rect.left();
     for lvl in book.bids.iter().rev() {
-        draw_bar(x, lvl.sz, bid_color);
+        draw_bar(x, lvl.px, lvl.sz, bid_color, true);
         x += bar_w;
     }
     // Right half: asks best→worst (best adjacent to the centre). Already
     // best-first, so iterate as delivered.
     for lvl in &book.asks {
-        draw_bar(x, lvl.sz, ask_color);
+        draw_bar(x, lvl.px, lvl.sz, ask_color, false);
         x += bar_w;
     }
 
@@ -117,6 +131,28 @@ pub fn render_depth_chart(ui: &mut egui::Ui, book: &L2Book, max_size: f64) {
         [egui::pos2(center_x, rect.top()), egui::pos2(center_x, baseline)],
         egui::Stroke::new(1.0, egui::Color32::GRAY),
     );
+
+    // Hover: highlight the column under the pointer and show price/volume.
+    if let Some(pos) = resp.hover_pos() {
+        if let Some(hit) = hits.iter().find(|h| h.col.contains(pos)) {
+            painter.rect_stroke(
+                hit.col,
+                0.0,
+                egui::Stroke::new(1.0, egui::Color32::from_white_alpha(160)),
+            );
+            let side = if hit.is_bid { "bid" } else { "ask" };
+            egui::show_tooltip_at_pointer(
+                ui.ctx(),
+                ui.layer_id(),
+                egui::Id::new("depth_chart_tooltip"),
+                |ui| {
+                    ui.monospace(side);
+                    ui.monospace(format!("price  {:.4}", hit.px));
+                    ui.monospace(format!("volume {:.4}", hit.sz));
+                },
+            );
+        }
+    }
 }
 
 /// Render one side of the book (bids or asks) as a px/sz/n grid in delivered

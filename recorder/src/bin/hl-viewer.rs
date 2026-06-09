@@ -308,9 +308,10 @@ impl ViewerApp {
             .id_salt("ladders")
             // Shrink vertically to the actual rows (~20) so the depth chart
             // sits directly beneath the ladders; the max_height only caps
-            // pathologically deep books.
+            // pathologically deep books (raised so a typical full book isn't
+            // clipped behind the scrollbar).
             .auto_shrink([false, true])
-            .max_height(420.0)
+            .max_height(600.0)
             .show(ui, |ui| {
                 ui.horizontal_top(|ui| {
                     render_side(ui, "BIDS", &book.bids, egui::Color32::from_rgb(80, 200, 120));
