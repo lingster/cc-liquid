@@ -130,6 +130,8 @@ impl eframe::App for ViewerApp {
 
         egui::TopBottomPanel::top("controls").show(ctx, |ui| self.controls(ui));
 
+        egui::TopBottomPanel::bottom("footer").show(ctx, |ui| self.footer(ui));
+
         egui::CentralPanel::default().show(ctx, |ui| self.book_view(ui));
     }
 }
@@ -267,6 +269,23 @@ impl ViewerApp {
         }
     }
 
+    /// Persistent footer showing the version and exact build so it is always
+    /// obvious which binary is running (e.g. when a stale release lingers).
+    fn footer(&self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "hl-viewer v{}  ·  built {}  ·  {}",
+                    env!("CARGO_PKG_VERSION"),
+                    env!("HL_BUILD_DATETIME"),
+                    env!("HL_GIT_HASH"),
+                ))
+                .monospace()
+                .weak(),
+            );
+        });
+    }
+
     fn book_view(&mut self, ui: &mut egui::Ui) {
         let Some(book) = self.nav.current_book(&self.data).cloned() else {
             ui.centered_and_justified(|ui| {
@@ -281,11 +300,24 @@ impl ViewerApp {
 
         // Place BIDS and ASKS directly next to each other (rather than each
         // filling half the panel) so the two ladders are easy to compare.
-        ui.horizontal_top(|ui| {
-            render_side(ui, "BIDS", &book.bids, egui::Color32::from_rgb(80, 200, 120));
-            ui.separator();
-            render_side(ui, "ASKS", &book.asks, egui::Color32::from_rgb(220, 90, 90));
-        });
+        // The grids live in a fixed-height ScrollArea: a bare `Grid` inside a
+        // horizontal layout can misreport its height and shove every later
+        // widget (the depth chart) off the bottom of the panel, so we pin the
+        // region's height to keep the layout cursor predictable.
+        egui::ScrollArea::vertical()
+            .id_salt("ladders")
+            // Shrink vertically to the actual rows (~20) so the depth chart
+            // sits directly beneath the ladders; the max_height only caps
+            // pathologically deep books.
+            .auto_shrink([false, true])
+            .max_height(420.0)
+            .show(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    render_side(ui, "BIDS", &book.bids, egui::Color32::from_rgb(80, 200, 120));
+                    ui.separator();
+                    render_side(ui, "ASKS", &book.asks, egui::Color32::from_rgb(220, 90, 90));
+                });
+            });
 
         ui.separator();
         // Depth chart: bids left / asks right, volume axis fixed to the coin's
