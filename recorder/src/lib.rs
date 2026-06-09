@@ -10,6 +10,7 @@ pub mod events;
 pub mod manifest;
 pub mod parser;
 pub mod recorder;
+pub mod replay;
 pub mod sequencer;
 pub mod sink;
 pub mod source;

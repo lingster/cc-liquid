@@ -74,3 +74,57 @@ EventSource (trait)            EventSink (trait)
 | `config` | Network endpoints + session config |
 
 Built with red-green TDD: see the `#[cfg(test)]` modules and `tests/integration.rs`.
+
+## Replay engine
+
+The `replay` module is the *replay* half of the pipeline: it folds a recorded
+(or synthetic) event stream into market state and plays it back. Hyperliquid's
+smallest time unit is **1 ms** (every `time` field is a ms epoch), so that is the
+tick resolution.
+
+Two orthogonal abstractions compose into the playback modes (SOLID):
+
+| Abstraction | Implementations |
+|-------------|-----------------|
+| `EventStream` (source) | `ParquetEventStream` (recorded session) · `SyntheticEventStream` (ramp) · `TimeRampEventStream` (time-encoded) |
+| `Clock` (pacing) | `RealtimeClock` (wall-clock, speed-scaled) · `ManualClock` (deterministic tests) |
+
+### Playback modes
+
+1. **Tick mode** (`engine.step()` / `engine.next_price(coin)`) — pull-based; each
+   call applies the next event and advances the cursor by one tick. `next_price`
+   returns the *current* price then increments. Pairs naturally with the
+   arithmetic ramp.
+2. **Realtime mode** (`engine.run_realtime(&clock, on_tick)`) — push-based; paces
+   the gaps between events via the clock so ticks elapse in real (or scaled)
+   time. Pairs naturally with the time-encoded stream.
+
+### Synthetic streams (no Parquet needed)
+
+- **Ramp / test mode** — `SyntheticEventStream::ramp(coin, n)`: price starts at
+  `0.0` and rises by `0.0001` each tick, `+1 ms` per tick. Best in tick mode.
+- **Time-to-price mode** — `TimeRampEventStream`: price encodes the event's
+  timestamp as `seconds.milliseconds` (e.g. `12_345 ms -> 12.345`, wrapping each
+  minute). Best in realtime mode, where the reported price tracks the clock.
+
+```rust
+use hl_recorder::replay::{load_session_stream, ReplayEngine, RealtimeClock};
+
+// Recorded session, tick mode:
+let mut engine = ReplayEngine::new(load_session_stream("sessions/demo")?);
+while engine.step() {
+    let _btc = engine.price("BTC");
+}
+
+// Recorded session, realtime mode at 2x speed:
+let clock = RealtimeClock::new(2.0);
+engine.run_realtime(&clock, |state| {
+    let _ = state.price("BTC");
+}).await;
+```
+
+Replay a recorded session from the CLI:
+
+```bash
+cargo run --example replay_session -- sessions/demo BTC
+```
