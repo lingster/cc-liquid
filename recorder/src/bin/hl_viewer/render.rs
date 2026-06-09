@@ -5,6 +5,7 @@
 //! slice and paint widgets. All navigation/playback decisions live in the
 //! pure `hl_recorder::viewer` model.
 
+use chrono::{DateTime, Utc};
 use eframe::egui;
 use hl_recorder::events::{L2Book, Level};
 use hl_recorder::viewer::SessionData;
@@ -12,6 +13,16 @@ use hl_recorder::viewer::SessionData;
 /// The per-coin snapshot timeline (ts_event_ms) the playback clock runs over.
 pub fn timeline_for(data: &SessionData, coin: &str) -> Vec<i64> {
     data.snapshots(coin).iter().map(|s| s.ts_event_ms).collect()
+}
+
+/// Format a unix-millisecond timestamp as a human-readable UTC string, e.g.
+/// `2024-01-02 03:04:05.678 UTC`. Falls back to the raw value if it is out of
+/// chrono's representable range.
+pub fn format_utc_ms(ts_ms: i64) -> String {
+    match DateTime::<Utc>::from_timestamp_millis(ts_ms) {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M:%S%.3f UTC").to_string(),
+        None => format!("{ts_ms} (raw)"),
+    }
 }
 
 // Hyperliquid delivers L2 levels best-first, and the recorder preserves that
@@ -43,7 +54,69 @@ pub fn render_top_of_book(ui: &mut egui::Ui, book: &L2Book) {
         ));
         ui.separator();
         ui.monospace(format!("t={}", book.time_ms));
+        ui.separator();
+        ui.monospace(format_utc_ms(book.time_ms));
     });
+}
+
+/// Draw the L2 book as a depth bar chart: bids on the left, asks on the right,
+/// best prices meeting at the centre divider. Each bar's height is the level's
+/// volume (`sz`), scaled so `max_size` fills the chart — `max_size` is the
+/// session-wide max for the coin, so bars keep a stable scale across playback.
+pub fn render_depth_chart(ui: &mut egui::Ui, book: &L2Book, max_size: f64) {
+    const HEIGHT: f32 = 160.0;
+    const TOP_PAD: f32 = 6.0;
+    let bid_color = egui::Color32::from_rgb(80, 200, 120);
+    let ask_color = egui::Color32::from_rgb(220, 90, 90);
+
+    let width = ui.available_width();
+    let (rect, _resp) =
+        ui.allocate_exact_size(egui::vec2(width, HEIGHT), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+
+    let n_bids = book.bids.len();
+    let n_asks = book.asks.len();
+    let total = (n_bids + n_asks).max(1);
+    let bar_w = rect.width() / total as f32;
+    let baseline = rect.bottom();
+    let usable_h = HEIGHT - TOP_PAD;
+    // Guard against a flat/empty session (max_size <= 0) so we never divide by
+    // zero; bars simply render at zero height.
+    let safe_max = if max_size > 0.0 { max_size } else { 1.0 };
+    let bar_height = |sz: f64| ((sz / safe_max).clamp(0.0, 1.0) as f32) * usable_h;
+
+    let draw_bar = |x: f32, sz: f64, color: egui::Color32| {
+        if !sz.is_finite() {
+            return;
+        }
+        let h = bar_height(sz);
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(x, baseline - h),
+            egui::pos2(x + (bar_w - 1.0).max(1.0), baseline),
+        );
+        painter.rect_filled(bar, 0.0, color);
+    };
+
+    // Left half: bids worst→best (best ends up adjacent to the centre). Book
+    // bids are best-first, so iterate reversed.
+    let mut x = rect.left();
+    for lvl in book.bids.iter().rev() {
+        draw_bar(x, lvl.sz, bid_color);
+        x += bar_w;
+    }
+    // Right half: asks best→worst (best adjacent to the centre). Already
+    // best-first, so iterate as delivered.
+    for lvl in &book.asks {
+        draw_bar(x, lvl.sz, ask_color);
+        x += bar_w;
+    }
+
+    // Centre divider between the bid and ask halves.
+    let center_x = rect.left() + bar_w * n_bids as f32;
+    painter.line_segment(
+        [egui::pos2(center_x, rect.top()), egui::pos2(center_x, baseline)],
+        egui::Stroke::new(1.0, egui::Color32::GRAY),
+    );
 }
 
 /// Render one side of the book (bids or asks) as a px/sz/n grid in delivered

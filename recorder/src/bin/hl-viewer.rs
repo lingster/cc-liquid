@@ -15,7 +15,7 @@ use hl_recorder::viewer::{Navigator, PlaybackClock, SessionData};
 
 #[path = "hl_viewer/render.rs"]
 mod render;
-use render::{render_side, render_top_of_book, timeline_for};
+use render::{render_depth_chart, render_side, render_top_of_book, timeline_for};
 
 fn main() -> eframe::Result<()> {
     let dir = std::env::args().nth(1).unwrap_or_else(|| {
@@ -50,6 +50,8 @@ struct ViewerApp {
     playback: PlaybackClock,
     /// Stopwatch reset to `now` whenever Play (re)starts.
     play_started: Option<Instant>,
+    /// Case-insensitive substring filter applied to the coin list.
+    coin_filter: String,
 }
 
 impl ViewerApp {
@@ -63,6 +65,7 @@ impl ViewerApp {
             nav,
             playback,
             play_started: None,
+            coin_filter: String::new(),
         }
     }
 
@@ -119,6 +122,10 @@ impl eframe::App for ViewerApp {
         egui::SidePanel::left("coins_ladder")
             .resizable(true)
             .default_width(220.0)
+            // Bound the width so a child widget that wants to expand (the coin
+            // filter box) can never drive the panel into a grow-every-frame
+            // feedback loop that swallows the central book view.
+            .width_range(160.0..=400.0)
             .show(ctx, |ui| self.left_panel(ui));
 
         egui::TopBottomPanel::top("controls").show(ctx, |ui| self.controls(ui));
@@ -134,27 +141,67 @@ impl ViewerApp {
         ui.separator();
 
         ui.label("coins");
-        let coins = self.data.coins();
-        let mut pending: Option<String> = None;
-        for coin in &coins {
-            let selected = coin == self.nav.coin();
-            if ui.selectable_label(selected, coin).clicked() && !selected {
-                pending = Some(coin.clone());
+        ui.horizontal(|ui| {
+            // Reserve room for the clear button; use a finite width (never
+            // f32::INFINITY, which makes the resizable panel grow each frame).
+            let field_width = (ui.available_width() - 28.0).max(40.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.coin_filter)
+                    .hint_text("filter…")
+                    .desired_width(field_width),
+            );
+            if !self.coin_filter.is_empty() && ui.small_button("✕").clicked() {
+                self.coin_filter.clear();
             }
-        }
+        });
+        let coins = self.data.coins();
+        let needle = self.coin_filter.to_lowercase();
+        let mut pending: Option<String> = None;
+        let mut shown = 0usize;
+        egui::ScrollArea::vertical()
+            .max_height(220.0)
+            .id_salt("coin_list")
+            .show(ui, |ui| {
+                for coin in &coins {
+                    if !needle.is_empty() && !coin.to_lowercase().contains(&needle) {
+                        continue;
+                    }
+                    shown += 1;
+                    let selected = coin == self.nav.coin();
+                    if ui.selectable_label(selected, coin).clicked() && !selected {
+                        pending = Some(coin.clone());
+                    }
+                }
+                if shown == 0 {
+                    ui.weak("no matches");
+                }
+            });
         if let Some(c) = pending {
             self.switch_coin(&c);
         }
 
         ui.separator();
         ui.label("price ladder (all ticks)");
-        let ladder = self.data.price_ladder(self.nav.coin());
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            // Show highest price first, like a depth ladder.
-            for px in ladder.iter().rev() {
-                ui.monospace(format!("{px:>12.4}"));
-            }
-        });
+        let ladder = self.data.price_ladder_counts(self.nav.coin());
+        egui::ScrollArea::vertical()
+            .id_salt("price_ladder")
+            .show(ui, |ui| {
+                // Show highest price first, like a depth ladder, with an
+                // aggregated occurrence count to the right of each rung.
+                egui::Grid::new("price_ladder_grid")
+                    .num_columns(2)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.monospace("price");
+                        ui.monospace("count");
+                        ui.end_row();
+                        for (px, count) in ladder.iter().rev() {
+                            ui.monospace(format!("{px:>12.4}"));
+                            ui.monospace(format!("{count:>6}"));
+                            ui.end_row();
+                        }
+                    });
+            });
     }
 
     fn controls(&mut self, ui: &mut egui::Ui) {
@@ -232,19 +279,23 @@ impl ViewerApp {
         render_top_of_book(ui, &book);
         ui.separator();
 
-        ui.columns(2, |cols| {
-            render_side(
-                &mut cols[0],
-                "BIDS",
-                &book.bids,
-                egui::Color32::from_rgb(80, 200, 120),
-            );
-            render_side(
-                &mut cols[1],
-                "ASKS",
-                &book.asks,
-                egui::Color32::from_rgb(220, 90, 90),
-            );
+        // Place BIDS and ASKS directly next to each other (rather than each
+        // filling half the panel) so the two ladders are easy to compare.
+        ui.horizontal_top(|ui| {
+            render_side(ui, "BIDS", &book.bids, egui::Color32::from_rgb(80, 200, 120));
+            ui.separator();
+            render_side(ui, "ASKS", &book.asks, egui::Color32::from_rgb(220, 90, 90));
         });
+
+        ui.separator();
+        // Depth chart: bids left / asks right, volume axis fixed to the coin's
+        // session-wide size range so bars don't rescale during playback.
+        let (vol_min, vol_max) = self.data.size_range(&book.coin).unwrap_or((0.0, 0.0));
+        ui.horizontal(|ui| {
+            ui.label("depth (volume)");
+            ui.separator();
+            ui.monospace(format!("vol {vol_min:.4} … {vol_max:.4}"));
+        });
+        render_depth_chart(ui, &book, vol_max);
     }
 }

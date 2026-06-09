@@ -8,7 +8,7 @@
 //! It is pure: construction takes already-loaded events; `from_dir` is the only
 //! I/O entry point and simply defers to [`crate::replay::load_session`].
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::events::{L2Book, MarketEvent, RecordedEvent};
@@ -24,9 +24,17 @@ pub struct Snapshot {
 #[derive(Debug, Clone, Default)]
 struct CoinIndex {
     snapshots: Vec<Snapshot>,
-    /// Distinct prices, stored as integer-keyed bits to keep the ladder sorted
-    /// and de-duplicated despite `f64` not being `Ord`.
-    prices: BTreeSet<OrderedPrice>,
+    /// Price ladder as `price -> occurrence count`. Keyed by [`OrderedPrice`] to
+    /// keep rungs sorted and de-duplicated despite `f64` not being `Ord`; the
+    /// value counts how many times that price appeared across every level of
+    /// every snapshot, so the UI can aggregate duplicates with a count column.
+    prices: BTreeMap<OrderedPrice, usize>,
+    /// Smallest/largest finite level `sz` (volume) seen across every level of
+    /// every snapshot. `None` until at least one finite size is observed. Used
+    /// to scale the depth chart's volume axis to a fixed range so bars don't
+    /// rescale frame-to-frame during playback.
+    size_min: Option<f64>,
+    size_max: Option<f64>,
 }
 
 /// Wrapper giving a genuine total order over price `f64`s for ladder
@@ -81,7 +89,15 @@ impl SessionData {
                     // Skip NaN / ±Inf prices so corrupt parquet can never inject
                     // a non-finite rung into the ladder (M1).
                     if level.px.is_finite() {
-                        idx.prices.insert(OrderedPrice::new(level.px));
+                        *idx.prices.entry(OrderedPrice::new(level.px)).or_insert(0) += 1;
+                    }
+                    // Track the volume (size) range; skip non-finite so corrupt
+                    // parquet can never poison the chart's axis scaling.
+                    if level.sz.is_finite() {
+                        idx.size_min =
+                            Some(idx.size_min.map_or(level.sz, |m| m.min(level.sz)));
+                        idx.size_max =
+                            Some(idx.size_max.map_or(level.sz, |m| m.max(level.sz)));
                     }
                 }
                 idx.snapshots.push(Snapshot {
@@ -121,13 +137,32 @@ impl SessionData {
     pub fn price_ladder(&self, coin: &str) -> Vec<f64> {
         self.coins
             .get(coin)
-            .map(|c| c.prices.iter().map(|p| p.0).collect())
+            .map(|c| c.prices.keys().map(|p| p.0).collect())
+            .unwrap_or_default()
+    }
+
+    /// Price ladder with aggregated occurrence counts: `(price, count)` pairs
+    /// sorted ascending by price. `count` is how many times the price appeared
+    /// across every level of every snapshot for `coin`.
+    pub fn price_ladder_counts(&self, coin: &str) -> Vec<(f64, usize)> {
+        self.coins
+            .get(coin)
+            .map(|c| c.prices.iter().map(|(p, n)| (p.0, *n)).collect())
             .unwrap_or_default()
     }
 
     /// Number of snapshots (ticks) for `coin`.
     pub fn tick_count(&self, coin: &str) -> usize {
         self.snapshots(coin).len()
+    }
+
+    /// Inclusive `(min, max)` of level volume (`sz`) across every level of
+    /// every snapshot for `coin`. `None` when the coin has no finite sizes.
+    pub fn size_range(&self, coin: &str) -> Option<(f64, f64)> {
+        self.coins.get(coin).and_then(|c| match (c.size_min, c.size_max) {
+            (Some(lo), Some(hi)) => Some((lo, hi)),
+            _ => None,
+        })
     }
 
     /// Inclusive `(min, max)` of `ts_event_ms` across `coin`'s snapshots.
@@ -233,6 +268,60 @@ mod tests {
             s.price_ladder("BTC"),
             vec![98.0, 99.0, 100.0, 101.0, 102.0, 103.0]
         );
+    }
+
+    #[test]
+    fn price_ladder_counts_aggregate_duplicates() {
+        let events = vec![
+            book_event(0, 10, "BTC", &[100.0, 99.0], &[101.0, 102.0]),
+            // 100.0 and 101.0 repeat; 98.0 and 103.0 are new.
+            book_event(1, 20, "BTC", &[100.0, 98.0], &[101.0, 103.0]),
+        ];
+        let s = SessionData::from_events(&events);
+        assert_eq!(
+            s.price_ladder_counts("BTC"),
+            vec![
+                (98.0, 1),
+                (99.0, 1),
+                (100.0, 2),
+                (101.0, 2),
+                (102.0, 1),
+                (103.0, 1),
+            ]
+        );
+        // Unknown coin yields an empty ladder, not a panic.
+        assert!(s.price_ladder_counts("ETH").is_empty());
+    }
+
+    #[test]
+    fn size_range_spans_min_max_volume_skipping_non_finite() {
+        // Build books with explicit, varying sizes (the book_event helper fixes
+        // sz=1.0, so construct levels directly here).
+        let lvl = |px: f64, sz: f64| Level { px, sz, n: 1 };
+        let mk = |seq: u64, ts: i64, bids: Vec<Level>, asks: Vec<Level>| RecordedEvent {
+            seq,
+            ts_event_ms: ts,
+            ts_recv_ms: ts,
+            payload: MarketEvent::L2Book(L2Book {
+                coin: "BTC".into(),
+                time_ms: ts,
+                bids,
+                asks,
+            }),
+        };
+        let events = vec![
+            mk(0, 10, vec![lvl(100.0, 2.5)], vec![lvl(101.0, 8.0)]),
+            // 0.5 is the new min; f64::NAN/INFINITY must be ignored.
+            mk(
+                1,
+                20,
+                vec![lvl(100.0, 0.5), lvl(99.0, f64::NAN)],
+                vec![lvl(101.0, f64::INFINITY)],
+            ),
+        ];
+        let s = SessionData::from_events(&events);
+        assert_eq!(s.size_range("BTC"), Some((0.5, 8.0)));
+        assert_eq!(s.size_range("ETH"), None);
     }
 
     #[test]
