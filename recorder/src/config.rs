@@ -21,6 +21,14 @@ impl Network {
         }
     }
 
+    /// HTTP API base URL for this network (REST `/info` + `/exchange`).
+    pub fn api_endpoint(&self) -> &'static str {
+        match self {
+            Network::Mainnet => "https://api.hyperliquid.xyz",
+            Network::Testnet => "https://api.hyperliquid-testnet.xyz",
+        }
+    }
+
     /// HTTP `info` endpoint for this network (used to fetch the coin universe).
     pub fn info_endpoint(&self) -> &'static str {
         match self {

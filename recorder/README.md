@@ -175,6 +175,7 @@ EventSource (trait)            EventSink (trait)
 | `viewer` | Pure model for the `hl-viewer` GUI (session, navigation, playback) |
 | `manifest` | Self-describing session metadata |
 | `config` | Network endpoints + session config |
+| `proxy` | Digital Twin Proxy (`hl-proxy`): wire-level capture, forward & playback |
 
 Built with red-green TDD: see the `#[cfg(test)]` modules and `tests/integration.rs`.
 
@@ -231,6 +232,63 @@ Replay a recorded session from the CLI:
 ```bash
 cargo run --example replay_session -- sessions/demo BTC
 ```
+
+## Digital Twin Proxy (`hl-proxy`)
+
+The wire-level half of the twin (PRD **Appendix B**): a standalone loopback
+HTTP process speaking Hyperliquid's REST surface (`POST /info`,
+`POST /exchange`), so **cc-liquid runs against it with zero code changes** —
+only `base_url` is repointed:
+
+```bash
+uv run cc-liquid account --set base_url=http://127.0.0.1:8088
+```
+
+Two orthogonal knobs:
+
+1. **Market source** — `/info` market reads (`allMids`, `meta`, `spotMeta`) are
+   either **forwarded** to the live exchange (default) or served from a
+   **playback** of a recorded session via the replay engine (deterministic,
+   fully offline). Account reads (`clearinghouseState`, `userFills`, …) always
+   forward in v1.
+2. **Capture logging (always on)** — every round-trip (forwarded, played back,
+   or rejected) is appended to `rpc_log.jsonl`, self-classified by Appendix A
+   method tag (`all_mids`, `bulk_orders`, …). `--redact-signatures` stores a
+   hash placeholder instead of raw signatures for shareable traces.
+
+> ⚠️ **Writes are testnet-only in v1.** `POST /exchange` forwards only with
+> `--network testnet --allow-trading`; otherwise the proxy answers a
+> live-shaped `{"status":"err",…}` and logs the attempt, making accidental
+> mainnet order placement structurally impossible.
+
+```bash
+# Capture real testnet traffic (incl. orders) while forwarding live:
+hl-proxy --listen 127.0.0.1:8088 --network testnet --allow-trading \
+    --out sessions/proxy-demo
+
+# Serve a recorded session as the market feed, log everything:
+hl-proxy --listen 127.0.0.1:8088 --market-source playback \
+    --session sessions/demo --out sessions/proxy-replay
+```
+
+Generate a synthetic session and prove the full loop end-to-end (builds the
+proxy, mocks the upstream exchange, runs the real `cc-liquid account` and
+`rebalance` through it, then checks the capture log):
+
+```bash
+cargo run --example make_demo_session -- sessions/demo 300
+uv run python recorder/scripts/e2e_cc_liquid.py   # from the repo root
+```
+
+Module layout mirrors the crate's style — pure, individually-tested pieces:
+`proxy::request` (classification), `proxy::log` (`RpcSink`: JSONL/memory),
+`proxy::upstream` (`Upstream`: reqwest/scripted), `proxy::market`
+(`MarketDataProvider`: playback over the replay engine), `proxy::handler`
+(routing + write guard), `proxy::server` (minimal loopback HTTP).
+
+If a session directory contains a `meta.json` (a verbatim live `meta`
+response), playback serves it; otherwise a universe is synthesized from the
+session manifest's coin list.
 
 ## Digital-twin loop (playback → recorder)
 

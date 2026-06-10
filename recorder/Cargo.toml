@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "hl-viewer"
 path = "src/bin/hl-viewer.rs"
 
+[[bin]]
+name = "hl-proxy"
+path = "src/bin/hl-proxy.rs"
+
 [lib]
 name = "hl_recorder"
 path = "src/lib.rs"

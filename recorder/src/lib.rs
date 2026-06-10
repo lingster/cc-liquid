@@ -12,6 +12,7 @@ pub mod info;
 pub mod manifest;
 pub mod merge_source;
 pub mod parser;
+pub mod proxy;
 pub mod reconnect;
 pub mod recorder;
 pub mod replay;
