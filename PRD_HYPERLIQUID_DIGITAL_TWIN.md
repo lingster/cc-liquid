@@ -346,4 +346,107 @@ a `cc_flow`-protocol adapter wraps the same engine.
 
 All overlay/queue/end-of-window models are config-driven and seeded for
 deterministic, reproducible runs (see §7.1.1–7.1.2, §6).
+
+---
+
+## Appendix A — Hyperliquid API Surface Used by cc-liquid
+
+This appendix catalogues every Hyperliquid endpoint and SDK method called by
+`src/cc_liquid/trader.py` (`CCLiquid` class). The digital twin's
+`TwinInfo` / `TwinExchange` shims must reproduce every response shape listed here
+so that downstream business logic in `trader.py` is exercised without change.
+
+### A.1 Base URLs
+
+| Environment | REST / info base URL | WebSocket URL |
+|-------------|----------------------|---------------|
+| Mainnet (default) | `https://api.hyperliquid.xyz` | `wss://api.hyperliquid.xyz/ws` |
+| Testnet | `https://api.hyperliquid-testnet.xyz` | `wss://api.hyperliquid-testnet.xyz/ws` |
+
+The active URL is set by `Config._set_base_url()` and passed to both SDK
+objects at construction time. The recorder uses the same WS URLs for its live
+capture streams.
+
+### A.2 Read-Only Interface — `hyperliquid.info.Info`
+
+Constructed once in `CCLiquid.__init__` as:
+
+```python
+self.info = Info(self.config.base_url, skip_ws=True)
 ```
+
+| Method | Call site(s) | Purpose | Response shape (relevant fields) |
+|--------|-------------|---------|----------------------------------|
+| `Info(base_url, skip_ws=True)` | `__init__` | Constructor | — |
+| `info.user_state(owner)` | `get_raw_user_state()`, `get_portfolio_info()` | Full account snapshot | `{marginSummary:{accountValue,totalNtlPos,totalMarginUsed,totalRawUsd}, crossMarginSummary:{accountValue,totalNtlPos,totalMarginUsed,totalRawUsd}, assetPositions:[{position:{coin,szi,entryPx,liquidationPx,marginUsed,unrealizedPnl}}], withdrawable}` |
+| `info.all_mids()` | `get_portfolio_info()`, `plan_rebalance()`, `execute_plan()`, `aggregate_pnl_by_currency()` | Current mid prices for all perp pairs | `{"BTC": "95000.0", "ETH": "3200.5", …}` — coin → price string |
+| `info.meta()` | `_get_sz_decimals()`, `plan_rebalance()` | Tradeable universe and size-decimal rules | `{universe:[{name:str, szDecimals:int, isDelisted:bool}, …]}` |
+| `info.frontend_open_orders(owner)` | `get_open_orders()` | Open orders including TP/SL triggers | `[{coin, oid, side, limitPx, sz, isTrigger, triggerPx, tpsl, reduceOnly, orderType, timestamp}, …]` |
+| `info.user_fills(owner)` | `get_fills()` | Complete fill history | `[{coin, px, sz, side, time, startPosition, dir, closedPnl, hash, oid, crossed, fee, tid}, …]` |
+| `info.user_fills_by_time(owner, start_time_ms, end_time_ms)` | `get_fills()` (when date range given) | Fills in a time window | same shape as `user_fills` |
+| `info.user_fees(owner)` | `plan_rebalance()` | Fee tier / taker rate | `{userCrossRate:str, userAddRate:str, feeSchedule:{…}}` |
+
+**Derived usage:** `_get_sz_decimals()` caches `info.meta()["universe"]` as
+`{coin: szDecimals}` for order-size rounding; `get_portfolio_info()` computes
+`cross_leverage`, `cross_margin_used`, and `cross_maintenance_margin` from the
+`crossMarginSummary` fields; `plan_rebalance()` reads `userCrossRate` from fees.
+
+### A.3 Write Interface — `hyperliquid.exchange.Exchange`
+
+Constructed once in `CCLiquid.__init__` as:
+
+```python
+self.exchange = Exchange(
+    self.account,                              # eth_account.LocalAccount (agent wallet)
+    self.config.base_url,
+    vault_address=self.config.HYPERLIQUID_VAULT_ADDRESS or None,
+    account_address=self.config.HYPERLIQUID_ADDRESS,   # owner / vault address
+)
+```
+
+| Method | Call site(s) | Purpose | Key arguments | Response shape |
+|--------|-------------|---------|---------------|----------------|
+| `Exchange(account, base_url, vault_address, account_address)` | `__init__` | Constructor — binds agent key for signing | agent `LocalAccount`, base URL, optional vault, owner address | — |
+| `exchange.bulk_orders(orders)` | `execute_plan()`, `_place_resting_orders()` | Submit one or more orders atomically | `orders: [{coin, is_buy, sz, limit_px, order_type, reduce_only}]`; `order_type` is `{"limit":{"tif":"Ioc"}}` for market fills or `{"trigger":{…}}` for TP/SL | `{status:"ok", response:{type:"order", data:{statuses:[{filled:{totalSz,avgPx,fee}}|{resting:{oid}}|{error:str}]}}}` |
+| `exchange.bulk_cancel(cancels)` | `cancel_all_orders()`, `_cancel_stale_orders()` | Cancel one or more open orders | `cancels: [{coin, oid}]` | `{status:"ok", response:{type:"cancel", data:{statuses:["success"|{error:str}]}}}` |
+| `exchange._slippage_price(coin, is_buy, slippage)` | `execute_plan()` | Compute slippage-adjusted limit price for market-order semantics | `coin: str`, `is_buy: bool`, `slippage: float` (e.g. 0.001) | `float` — rounded limit px |
+
+**Note on `_slippage_price`:** this is a private SDK helper (`_`-prefixed). It
+reads the current mid from `info.all_mids()` internally and applies the
+configured `execution.slippage_tolerance`. The twin's `TwinExchange` must
+replicate this method signature and behaviour (using the virtual mid) so that
+`execute_plan()` can call it without modification.
+
+### A.4 WebSocket Subscriptions (recorder)
+
+The recorder (`hl-recorder`) connects to the exchange WS endpoint and subscribes
+to the following channels. These are the same data feeds that the digital twin
+replays:
+
+| Channel | Subscription payload | One event covers |
+|---------|----------------------|-----------------|
+| `allMids` | `{"method":"subscribe","subscription":{"type":"allMids"}}` | All current mid prices — one map per push |
+| `l2Book` | `{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC"}}` (one per coin) | Full L2 order book snapshot for one coin |
+| `trades` | `{"method":"subscribe","subscription":{"type":"trades","coin":"BTC"}}` (one per coin) | Batch of recent trades for one coin |
+
+`allMids` is global (one subscription regardless of how many coins are recorded).
+`l2Book` and `trades` subscriptions are per-coin; with connection sharding
+(`--shard-size N`) they are split across multiple WS connections while `allMids`
+remains on the first connection only.
+
+### A.5 Twin Compatibility Requirements
+
+For the twin to be a transparent drop-in for `trader.py`:
+
+1. **`TwinInfo`** must implement every method in §A.2, returning identical Python
+   types and field names. Response values are derived from the virtual `MarketState`
+   (folded from the replay stream) and the `VirtualAccount`.
+2. **`TwinExchange`** must implement `bulk_orders`, `bulk_cancel`, and
+   `_slippage_price` from §A.3. Orders are routed to the `MatchingEngine` (§7.1);
+   fills update `VirtualAccount` (§7.2); returned `statuses` shapes are identical
+   to live responses.
+3. **Address semantics are preserved:** the owner / vault address is used for
+   `Info` queries; the agent wallet is used only for signing. The twin reads both
+   from the same `Config` object and applies the same routing.
+4. **`skip_ws=True`** on `Info` construction is respected (no live WS needed for
+   the read path in the twin).
