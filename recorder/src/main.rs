@@ -11,7 +11,7 @@ use tracing::{info, warn};
 use hl_recorder::client::{connect_sharded, WsSource};
 use hl_recorder::config::{Network, RecordConfig};
 use hl_recorder::crowdcent;
-use hl_recorder::info::fetch_perp_universe;
+use hl_recorder::info::fetch_meta_body;
 use hl_recorder::manifest::{Counts, Manifest, SCHEMA_VERSION};
 use hl_recorder::reconnect::{ReconnectPolicy, ReconnectSource};
 use hl_recorder::recorder::Recorder;
@@ -224,7 +224,7 @@ async fn run(
 
     // Validate requested coins against the live universe so one bad coin (e.g. a
     // symbol not listed on Hyperliquid) can never poison the whole connection.
-    let universe = fetch_perp_universe(cfg.network.info_endpoint())
+    let meta_body = fetch_meta_body(cfg.network.info_endpoint())
         .await
         .with_context(|| {
             format!(
@@ -232,6 +232,11 @@ async fn run(
                 cfg.network.info_endpoint()
             )
         })?;
+    let universe = hl_recorder::universe::parse_perp_universe(&meta_body)?;
+    // Persist the verbatim `meta` snapshot (PRD §5.2 meta_snapshot) so twin
+    // playback serves the exact universe/szDecimals seen at record time.
+    std::fs::create_dir_all(&cfg.out_dir)?;
+    std::fs::write(cfg.out_dir.join("meta.json"), &meta_body)?;
     let validation = validate_coins(&cfg.coins, &universe);
     if !validation.dropped.is_empty() {
         warn!(
@@ -305,7 +310,12 @@ async fn run(
     // `run_until` finalizes the sink so the Parquet footer is written.
     let stats = Recorder::new()
         .with_flush_interval(flush_interval)
-        .run_until(&mut source, &mut sink, now_ms, wait_for_stop(cfg.duration_secs))
+        .run_until(
+            &mut source,
+            &mut sink,
+            now_ms,
+            wait_for_stop(cfg.duration_secs),
+        )
         .await?;
     let ended_at = chrono::Utc::now();
     // Record the actual elapsed wall-clock, which is the only meaningful value

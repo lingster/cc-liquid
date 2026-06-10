@@ -65,6 +65,17 @@ class ExecutionConfig:
 
 
 @dataclass
+class TwinProxyConfig:
+    """Digital Twin Proxy connection (see PRD_HYPERLIQUID_DIGITAL_TWIN.md §B).
+
+    The hl-proxy process speaks the Hyperliquid wire protocol on loopback;
+    pointing cc-liquid at it requires no other application change.
+    """
+
+    url: str = "http://127.0.0.1:8088"
+
+
+@dataclass
 class Config:
     """
     Manages configuration for the trading bot, loading from a YAML file
@@ -80,6 +91,10 @@ class Config:
     # Environment
     is_testnet: bool = False
     base_url: str = "https://api.hyperliquid.xyz"
+    # Exchange provider: "live" talks to Hyperliquid; "twin" routes all
+    # traffic to the local Digital Twin Proxy (twin_proxy.url).
+    provider: str = "live"
+    twin_proxy: TwinProxyConfig = field(default_factory=TwinProxyConfig)
 
     # Profiles (addresses in config; secrets remain in env)
     active_profile: str | None = "default"
@@ -141,8 +156,15 @@ class Config:
                         setattr(self, key, value)
 
     def _set_base_url(self):
-        """Sets the base URL based on the is_testnet flag."""
-        if self.is_testnet:
+        """Sets the base URL from the provider and is_testnet flags.
+
+        provider=twin wins: all traffic goes to the local Digital Twin Proxy
+        (which itself decides what forwards to mainnet/testnet or is played
+        back from a recorded session).
+        """
+        if self.provider == "twin":
+            self.base_url = self.twin_proxy.url
+        elif self.is_testnet:
             self.base_url = "https://api.hyperliquid-testnet.xyz"
 
     def _resolve_profile(self):
@@ -189,6 +211,11 @@ class Config:
                 raise ValueError(
                     f"Active profile '{self.active_profile}' not found. Available profiles: {available}"
                 )
+
+        if self.provider not in ("live", "twin"):
+            raise ValueError(
+                f"Invalid provider: {self.provider}. Must be 'live' or 'twin'"
+            )
 
         # Don't validate addresses/keys during module import - let individual commands handle it
         # This allows 'profile list', 'config', etc to work without full setup
@@ -253,6 +280,8 @@ class Config:
 
         return {
             "is_testnet": self.is_testnet,
+            "provider": self.provider,
+            "twin_proxy": self.twin_proxy.__dict__,
             "profile": profile_dict,
             "data": self.data.__dict__,
             "portfolio": portfolio_dict,

@@ -64,3 +64,58 @@ def test_to_dict():
     assert config_dict["is_testnet"] is True
     assert config_dict["data"]["source"] == "local"
     assert config_dict["portfolio"]["num_long"] == 5
+
+
+def test_provider_defaults_to_live():
+    config = Config()
+    assert config.provider == "live"
+    assert config.twin_proxy.url == "http://127.0.0.1:8088"
+
+
+def test_provider_twin_routes_base_url_to_proxy():
+    config_data = {
+        "provider": "twin",
+        "twin_proxy": {"url": "http://127.0.0.1:9999"},
+    }
+    with open(DEFAULT_CONFIG_PATH, "w") as f:
+        yaml.dump(config_data, f)
+
+    config = Config()
+    assert config.base_url == "http://127.0.0.1:9999"
+
+
+def test_provider_twin_wins_over_is_testnet():
+    config_data = {"provider": "twin", "is_testnet": True}
+    with open(DEFAULT_CONFIG_PATH, "w") as f:
+        yaml.dump(config_data, f)
+
+    config = Config()
+    assert config.base_url == "http://127.0.0.1:8088"
+
+
+def test_provider_twin_via_cli_override_and_refresh():
+    from cc_liquid.config import apply_cli_overrides
+
+    config = Config()
+    applied = apply_cli_overrides(
+        config, ["provider=twin", "twin_proxy.url=http://127.0.0.1:7777"]
+    )
+    config.refresh_runtime()
+    assert "provider=twin" in applied
+    assert config.base_url == "http://127.0.0.1:7777"
+
+
+def test_invalid_provider_rejected():
+    config_data = {"provider": "paper"}
+    with open(DEFAULT_CONFIG_PATH, "w") as f:
+        yaml.dump(config_data, f)
+
+    with pytest.raises(ValueError, match="Invalid provider"):
+        Config()
+
+
+def test_to_dict_includes_provider_and_twin_proxy():
+    config = Config()
+    d = config.to_dict()
+    assert d["provider"] == "live"
+    assert d["twin_proxy"]["url"] == "http://127.0.0.1:8088"

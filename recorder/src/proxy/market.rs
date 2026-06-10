@@ -4,19 +4,20 @@
 //! The provider folds the recorded event stream into a [`MarketState`] with the
 //! same deterministic semantics as the replay engine. The cursor advances as
 //! the app polls: each `all_mids()` call reveals the next recorded mids tick
-//! (folding any interleaved book/trade events along the way). Past the end of
-//! the window the final state is held, so a polling client keeps getting
-//! consistent prices instead of errors.
+//! (folding any interleaved book/trade events along the way). Behaviour past
+//! the end of the window is configurable (PRD §6): `stop` and `hold` freeze
+//! the final state (`stop` additionally tells the sim to reject new orders),
+//! `loop` rewinds and replays the window.
 
 use std::path::Path;
+use std::str::FromStr;
 
 use anyhow::Context;
 use serde_json::{json, Map, Value};
 
-use crate::events::{MarketEvent, RecordedEvent};
+use crate::events::{MarketEvent, RecordedEvent, Trade};
 use crate::manifest::Manifest;
 use crate::replay::state::MarketState;
-use crate::replay::stream::{EventStream, VecEventStream};
 
 /// Optional per-session file holding a verbatim live `meta` response captured
 /// at record time. When absent, a universe is synthesized from the manifest.
@@ -26,7 +27,34 @@ pub const META_FILE: &str = "meta.json";
 /// captured `meta.json`.
 pub const DEFAULT_SZ_DECIMALS: u32 = 4;
 
-/// Answers the playback-servable market reads (`allMids`, `meta`, `spotMeta`).
+/// What happens when the recorded window is exhausted (PRD §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EndOfWindow {
+    /// Freeze the final state; the sim rejects orders placed past the end.
+    #[default]
+    Stop,
+    /// Freeze the final book/mids and keep accepting orders against it.
+    Hold,
+    /// Rewind and replay the window on repeat (price seam documented).
+    Loop,
+}
+
+impl FromStr for EndOfWindow {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "stop" => Ok(EndOfWindow::Stop),
+            "hold" => Ok(EndOfWindow::Hold),
+            "loop" => Ok(EndOfWindow::Loop),
+            other => Err(format!(
+                "unknown end-of-window mode `{other}` (use stop|hold|loop)"
+            )),
+        }
+    }
+}
+
+/// Answers the playback-servable market reads (`allMids`, `meta`, `spotMeta`)
+/// and exposes the folded market state for the simulation engine.
 pub trait MarketDataProvider: Send {
     /// Current mids snapshot, advancing the playback cursor by one mids tick.
     /// Shape matches live: `{"BTC": "95000.0", ...}` (price strings).
@@ -36,11 +64,25 @@ pub trait MarketDataProvider: Send {
     /// Spot universe. The twin is perp-only, so this is empty-but-valid:
     /// `{"universe":[],"tokens":[]}` — enough for SDK construction.
     fn spot_meta(&mut self) -> Value;
+    /// The folded market state at the cursor (sim matching substrate).
+    /// `None` for providers without replayed state.
+    fn state(&self) -> Option<&MarketState> {
+        None
+    }
+    /// Public trades folded since the previous call (sim queue accounting).
+    fn take_trades(&mut self) -> Vec<Trade> {
+        Vec::new()
+    }
+    /// Whether the window ended under [`EndOfWindow::Stop`].
+    fn is_stopped(&self) -> bool {
+        false
+    }
 }
 
 /// Playback over a recorded (or synthetic) event sequence.
 pub struct PlaybackMarket {
-    stream: VecEventStream,
+    events: Vec<RecordedEvent>,
+    cursor: usize,
     state: MarketState,
     /// Coins the session covers (used to backfill book-derived prices).
     coins: Vec<String>,
@@ -48,6 +90,10 @@ pub struct PlaybackMarket {
     /// Whether the stream contains any `allMids` events; when it does not, the
     /// cursor advances one event per poll instead of seeking the next mids tick.
     mids_driven: bool,
+    end_of_window: EndOfWindow,
+    ended: bool,
+    /// Trades folded since the last `take_trades()`.
+    pending_trades: Vec<Trade>,
 }
 
 impl PlaybackMarket {
@@ -57,11 +103,15 @@ impl PlaybackMarket {
             .iter()
             .any(|e| matches!(e.payload, MarketEvent::AllMids(_)));
         Self {
-            stream: VecEventStream::new(events),
+            events,
+            cursor: 0,
             state: MarketState::new(),
             coins,
             meta,
             mids_driven,
+            end_of_window: EndOfWindow::default(),
+            ended: false,
+            pending_trades: Vec::new(),
         }
     }
 
@@ -94,16 +144,41 @@ impl PlaybackMarket {
         Ok(Self::from_events(events, manifest.coins, meta))
     }
 
+    /// Set the end-of-window behaviour (builder style).
+    pub fn with_end_of_window(mut self, mode: EndOfWindow) -> Self {
+        self.end_of_window = mode;
+        self
+    }
+
+    fn next_event_idx(&mut self) -> Option<usize> {
+        if self.cursor >= self.events.len() {
+            match self.end_of_window {
+                EndOfWindow::Loop if !self.events.is_empty() => self.cursor = 0,
+                EndOfWindow::Stop => {
+                    self.ended = true;
+                    return None;
+                }
+                _ => return None,
+            }
+        }
+        let idx = self.cursor;
+        self.cursor += 1;
+        Some(idx)
+    }
+
     /// Advance the cursor: fold events until the next `allMids` tick has been
-    /// applied (or a single event when the stream has no mids). Holds at the
-    /// end of the window.
+    /// applied (or a single event when the stream has no mids).
     fn advance(&mut self) {
         loop {
-            let Some(ev) = self.stream.next_event() else {
-                return; // end of window: hold final state
+            let Some(idx) = self.next_event_idx() else {
+                return; // end of window (stop/hold): final state persists
             };
+            let ev = &self.events[idx];
+            if let MarketEvent::Trades(trades) = &ev.payload {
+                self.pending_trades.extend(trades.iter().cloned());
+            }
             let was_mids = matches!(ev.payload, MarketEvent::AllMids(_));
-            self.state.apply(&ev);
+            self.state.apply(ev);
             if was_mids || !self.mids_driven {
                 return;
             }
@@ -135,6 +210,18 @@ impl MarketDataProvider for PlaybackMarket {
 
     fn spot_meta(&mut self) -> Value {
         json!({"universe": [], "tokens": []})
+    }
+
+    fn state(&self) -> Option<&MarketState> {
+        Some(&self.state)
+    }
+
+    fn take_trades(&mut self) -> Vec<Trade> {
+        std::mem::take(&mut self.pending_trades)
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.ended
     }
 }
 
@@ -355,5 +442,108 @@ mod tests {
         let sink = ParquetSink::create(dir.path()).unwrap();
         crate::sink::EventSink::finalize(&mut { sink }).unwrap();
         assert!(PlaybackMarket::load(dir.path()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod end_of_window_tests {
+    use super::*;
+    use crate::events::{AllMids, Side};
+
+    fn mids_ev(seq: u64, px: f64) -> RecordedEvent {
+        RecordedEvent {
+            seq,
+            ts_event_ms: 1000 + seq as i64,
+            ts_recv_ms: 1000 + seq as i64,
+            payload: MarketEvent::AllMids(AllMids {
+                mids: vec![("BTC".into(), px)],
+            }),
+        }
+    }
+
+    fn trades_ev(seq: u64, px: f64, sz: f64) -> RecordedEvent {
+        RecordedEvent {
+            seq,
+            ts_event_ms: 1000 + seq as i64,
+            ts_recv_ms: 1000 + seq as i64,
+            payload: MarketEvent::Trades(vec![Trade {
+                coin: "BTC".into(),
+                side: Side::Sell,
+                px,
+                sz,
+                time_ms: 1000 + seq as i64,
+            }]),
+        }
+    }
+
+    fn market(mode: EndOfWindow) -> PlaybackMarket {
+        PlaybackMarket::from_events(
+            vec![mids_ev(0, 100.0), mids_ev(1, 101.0)],
+            vec!["BTC".into()],
+            json!({}),
+        )
+        .with_end_of_window(mode)
+    }
+
+    #[test]
+    fn stop_holds_final_state_and_flags_ended() {
+        let mut m = market(EndOfWindow::Stop);
+        assert_eq!(m.all_mids()["BTC"], "100.0");
+        assert_eq!(m.all_mids()["BTC"], "101.0");
+        assert!(!m.is_stopped(), "not yet past the end");
+        assert_eq!(m.all_mids()["BTC"], "101.0", "held final state");
+        assert!(m.is_stopped());
+    }
+
+    #[test]
+    fn hold_keeps_serving_without_stopping() {
+        let mut m = market(EndOfWindow::Hold);
+        m.all_mids();
+        m.all_mids();
+        assert_eq!(m.all_mids()["BTC"], "101.0");
+        assert!(!m.is_stopped(), "hold never stops accepting");
+    }
+
+    #[test]
+    fn loop_rewinds_to_the_start_of_the_window() {
+        let mut m = market(EndOfWindow::Loop);
+        assert_eq!(m.all_mids()["BTC"], "100.0");
+        assert_eq!(m.all_mids()["BTC"], "101.0");
+        assert_eq!(m.all_mids()["BTC"], "100.0", "looped back to tick 0");
+        assert!(!m.is_stopped());
+    }
+
+    #[test]
+    fn trades_folded_during_advance_are_collectable_once() {
+        let mut m = PlaybackMarket::from_events(
+            vec![
+                mids_ev(0, 100.0),
+                trades_ev(1, 99.5, 0.4),
+                mids_ev(2, 101.0),
+            ],
+            vec!["BTC".into()],
+            json!({}),
+        );
+        m.all_mids(); // tick 0: no trades yet
+        assert!(m.take_trades().is_empty());
+        m.all_mids(); // folds the trade batch + tick 2
+        let trades = m.take_trades();
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].px, 99.5);
+        assert!(m.take_trades().is_empty(), "drained");
+    }
+
+    #[test]
+    fn state_exposes_the_cursor_market() {
+        let mut m = market(EndOfWindow::Hold);
+        m.all_mids();
+        assert_eq!(m.state().unwrap().price("BTC"), Some(100.0));
+    }
+
+    #[test]
+    fn end_of_window_parses() {
+        assert_eq!("stop".parse::<EndOfWindow>().unwrap(), EndOfWindow::Stop);
+        assert_eq!("LOOP".parse::<EndOfWindow>().unwrap(), EndOfWindow::Loop);
+        assert!("rewind".parse::<EndOfWindow>().is_err());
     }
 }

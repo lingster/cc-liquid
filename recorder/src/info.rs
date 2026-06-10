@@ -15,9 +15,11 @@ use crate::universe::parse_perp_universe;
 /// malfunctioning endpoint streaming an unbounded body (M3).
 const MAX_META_BYTES: usize = 16 * 1024 * 1024;
 
-/// Fetch the set of tradeable perp coin names from `info_endpoint`
-/// (e.g. `https://api.hyperliquid.xyz/info`).
-pub async fn fetch_perp_universe(info_endpoint: &str) -> anyhow::Result<HashSet<String>> {
+/// Fetch the raw `meta` response body from `info_endpoint`
+/// (e.g. `https://api.hyperliquid.xyz/info`). The verbatim body is also what
+/// the recorder persists as the session's `meta.json` snapshot (PRD §5.2), so
+/// playback serves the exact universe/szDecimals seen at record time.
+pub async fn fetch_meta_body(info_endpoint: &str) -> anyhow::Result<String> {
     // Bounded timeouts so a stalled endpoint can never hang the recorder at
     // startup before any recording deadline exists (M2).
     let client = reqwest::Client::builder()
@@ -45,9 +47,13 @@ pub async fn fetch_perp_universe(info_endpoint: &str) -> anyhow::Result<HashSet<
         buf.extend_from_slice(&chunk);
     }
 
-    let body = std::str::from_utf8(&buf)
-        .map_err(|e| anyhow::anyhow!("info `meta` response was not valid UTF-8: {e}"))?;
-    parse_perp_universe(body)
+    String::from_utf8(buf)
+        .map_err(|e| anyhow::anyhow!("info `meta` response was not valid UTF-8: {e}"))
+}
+
+/// Fetch the set of tradeable perp coin names from `info_endpoint`.
+pub async fn fetch_perp_universe(info_endpoint: &str) -> anyhow::Result<HashSet<String>> {
+    parse_perp_universe(&fetch_meta_body(info_endpoint).await?)
 }
 
 #[cfg(test)]

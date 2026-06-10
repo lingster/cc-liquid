@@ -244,22 +244,29 @@ only `base_url` is repointed:
 uv run cc-liquid account --set base_url=http://127.0.0.1:8088
 ```
 
-Two orthogonal knobs:
+Three knobs:
 
 1. **Market source** — `/info` market reads (`allMids`, `meta`, `spotMeta`) are
    either **forwarded** to the live exchange (default) or served from a
    **playback** of a recorded session via the replay engine (deterministic,
-   fully offline). Account reads (`clearinghouseState`, `userFills`, …) always
-   forward in v1.
-2. **Capture logging (always on)** — every round-trip (forwarded, played back,
+   fully offline).
+2. **Simulator (`--sim`)** — adds the PRD §7 matching engine + virtual account
+   on top of playback: account reads (`clearinghouseState`, `userFills`,
+   `userFees`, `frontendOpenOrders`) are answered from the virtual account and
+   `/exchange` orders are **L2-matched against the replayed market** (partial
+   fills, resting Gtc/Alo orders with queue models, stop-loss triggers,
+   reduce-only, min-notional). Without `--sim`, account reads and writes
+   forward upstream.
+3. **Capture logging (always on)** — every round-trip (forwarded, played back,
    or rejected) is appended to `rpc_log.jsonl`, self-classified by Appendix A
    method tag (`all_mids`, `bulk_orders`, …). `--redact-signatures` stores a
    hash placeholder instead of raw signatures for shareable traces.
 
-> ⚠️ **Writes are testnet-only in v1.** `POST /exchange` forwards only with
-> `--network testnet --allow-trading`; otherwise the proxy answers a
-> live-shaped `{"status":"err",…}` and logs the attempt, making accidental
-> mainnet order placement structurally impossible.
+> ⚠️ **Real writes are testnet-only.** Without `--sim`, `POST /exchange`
+> forwards only with `--network testnet --allow-trading`; otherwise the proxy
+> answers a live-shaped `{"status":"err",…}` and logs the attempt. With
+> `--sim`, orders go to the matching engine and *nothing* can reach a real
+> exchange.
 
 ```bash
 # Capture real testnet traffic (incl. orders) while forwarding live:
@@ -269,26 +276,51 @@ hl-proxy --listen 127.0.0.1:8088 --network testnet --allow-trading \
 # Serve a recorded session as the market feed, log everything:
 hl-proxy --listen 127.0.0.1:8088 --market-source playback \
     --session sessions/demo --out sessions/proxy-replay
+
+# Full offline simulator: trade against the recording (PRD §7 + §B.6):
+hl-proxy --listen 127.0.0.1:8088 --market-source playback --session sessions/demo \
+    --sim --start-balance 10000 --fill-model biased_offset:0.01 \
+    --queue conservative --end-of-window hold --out sessions/sim-run
 ```
 
+Sim options (PRD §7.1.1–§7.1.2, §6 — all deterministic/seedable):
+
+| Flag | Values | Meaning |
+|------|--------|---------|
+| `--fill-model` | `book` (default), `biased_offset:<frac>`, `fixed_spread:<frac>`, `random_spread:<max_frac>`, `worst_case` | Fill-price overlay over the L2 match |
+| `--seed` | u64 | Seed for `random_spread` (same seed ⇒ same fills) |
+| `--queue` | `conservative` (default), `optimistic`, `disabled` | Resting-order queue model |
+| `--end-of-window` | `stop` (default), `hold`, `loop` | Behaviour past the recorded window |
+| `--start-balance` | USD | Virtual account opening balance |
+
 Generate a synthetic session and prove the full loop end-to-end (builds the
-proxy, mocks the upstream exchange, runs the real `cc-liquid account` and
-`rebalance` through it, then checks the capture log):
+proxy, runs the real `cc-liquid account` and `rebalance` through it in both
+modes, checks the capture log and fill determinism):
 
 ```bash
 cargo run --example make_demo_session -- sessions/demo 300
 uv run python recorder/scripts/e2e_cc_liquid.py   # from the repo root
 ```
 
+cc-liquid can also switch by config instead of `--set base_url=...`:
+
+```yaml
+provider: twin            # live (default) | twin
+twin_proxy:
+  url: http://127.0.0.1:8088
+```
+
 Module layout mirrors the crate's style — pure, individually-tested pieces:
 `proxy::request` (classification), `proxy::log` (`RpcSink`: JSONL/memory),
 `proxy::upstream` (`Upstream`: reqwest/scripted), `proxy::market`
-(`MarketDataProvider`: playback over the replay engine), `proxy::handler`
-(routing + write guard), `proxy::server` (minimal loopback HTTP).
+(`MarketDataProvider`: playback, end-of-window policy), `proxy::handler`
+(routing + write guard + sim), `proxy::server` (minimal loopback HTTP), and
+`sim::{order,overlay,matching,account,engine}` (PRD §7 simulation core).
 
-If a session directory contains a `meta.json` (a verbatim live `meta`
-response), playback serves it; otherwise a universe is synthesized from the
-session manifest's coin list.
+`hl-recorder` saves a verbatim `meta.json` snapshot into every session
+(PRD §5.2), so playback serves the exact universe/`szDecimals` seen at record
+time; sessions without one get a universe synthesized from the manifest's
+coin list.
 
 ## Digital-twin loop (playback → recorder)
 

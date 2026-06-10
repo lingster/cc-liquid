@@ -14,6 +14,12 @@
 //! # Serve a fixed recorded session as the market feed, log everything:
 //! hl-proxy --listen 127.0.0.1:8088 --market-source playback \
 //!     --session sessions/demo --out sessions/proxy-replay
+//!
+//! # Full offline simulator: playback market + matching engine + virtual
+//! # account — cc-liquid trades against the recording, no exchange at all:
+//! hl-proxy --listen 127.0.0.1:8088 --market-source playback \
+//!     --session sessions/demo --sim --start-balance 10000 \
+//!     --fill-model biased_offset:0.01 --out sessions/sim-run
 //! ```
 
 use std::path::PathBuf;
@@ -26,9 +32,11 @@ use tracing::{info, warn};
 use hl_recorder::config::Network;
 use hl_recorder::proxy::handler::{MarketSource, ProxyConfig, ProxyHandler};
 use hl_recorder::proxy::log::JsonlSink;
-use hl_recorder::proxy::market::{MarketDataProvider, PlaybackMarket};
+use hl_recorder::proxy::market::{EndOfWindow, MarketDataProvider, PlaybackMarket};
 use hl_recorder::proxy::server::bind_and_serve;
 use hl_recorder::proxy::upstream::HttpUpstream;
+use hl_recorder::sim::order::Universe;
+use hl_recorder::sim::{FillOverlay, QueueModel, SimConfig, SimEngine};
 
 /// Hyperliquid wire-protocol proxy: capture, forward and playback.
 #[derive(Parser, Debug)]
@@ -68,6 +76,34 @@ struct Cli {
     /// Upstream base URL override (defaults to the network's API endpoint).
     #[arg(long)]
     upstream: Option<String>,
+
+    /// Enable the engine-backed simulator (PRD §7): account reads and
+    /// `/exchange` orders are served by a matching engine + virtual account
+    /// over the playback session. Requires `--market-source playback`.
+    #[arg(long, default_value_t = false)]
+    sim: bool,
+
+    /// Virtual account starting balance in USD (with `--sim`).
+    #[arg(long, default_value_t = 10_000.0)]
+    start_balance: f64,
+
+    /// Fill-price overlay (PRD §7.1.1): `book`, `biased_offset:<frac>`,
+    /// `fixed_spread:<frac>`, `random_spread:<max_frac>`, `worst_case`.
+    #[arg(long, default_value = "book")]
+    fill_model: FillOverlay,
+
+    /// Seed for the `random_spread` overlay (deterministic runs).
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+
+    /// Resting-order queue model (PRD §7.1.2).
+    #[arg(long, default_value = "conservative")]
+    queue: QueueModel,
+
+    /// Behaviour past the end of the recorded window (PRD §6):
+    /// stop | hold | loop.
+    #[arg(long, default_value = "stop")]
+    end_of_window: EndOfWindow,
 }
 
 #[tokio::main]
@@ -87,6 +123,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    let mut sim_engine = None;
     let market: Option<Box<dyn MarketDataProvider>> = match cli.market_source {
         MarketSource::Playback => {
             let session = cli
@@ -94,9 +131,34 @@ async fn main() -> anyhow::Result<()> {
                 .as_ref()
                 .context("--market-source playback requires --session <dir>")?;
             info!("loading playback session from {}", session.display());
-            Some(Box::new(PlaybackMarket::load(session)?))
+            let mut market = PlaybackMarket::load(session)?.with_end_of_window(cli.end_of_window);
+            if cli.sim {
+                let universe = Universe::from_meta(&market.meta())?;
+                let overlay = match cli.fill_model {
+                    FillOverlay::RandomSpread { max_frac, .. } => FillOverlay::RandomSpread {
+                        max_frac,
+                        seed: cli.seed,
+                    },
+                    other => other,
+                };
+                let sim_cfg = SimConfig {
+                    start_balance: cli.start_balance,
+                    overlay,
+                    queue: cli.queue,
+                    ..SimConfig::default()
+                };
+                info!(
+                    "sim enabled: balance=${}, fill_model={:?}, queue={:?}, end_of_window={:?}",
+                    cli.start_balance, sim_cfg.overlay, cli.queue, cli.end_of_window
+                );
+                sim_engine = Some(SimEngine::new(sim_cfg, universe));
+            }
+            Some(Box::new(market))
         }
-        MarketSource::Forward => None,
+        MarketSource::Forward => {
+            anyhow::ensure!(!cli.sim, "--sim requires --market-source playback");
+            None
+        }
     };
 
     let upstream_url = cli
@@ -108,12 +170,15 @@ async fn main() -> anyhow::Result<()> {
         allow_trading: cli.allow_trading,
         redact_signatures: cli.redact_signatures,
     };
-    let handler = ProxyHandler::new(
+    let mut handler = ProxyHandler::new(
         cfg,
         Box::new(HttpUpstream::new(upstream_url.clone())),
         market,
         Box::new(JsonlSink::create(&cli.out)?),
     )?;
+    if let Some(sim) = sim_engine {
+        handler = handler.with_sim(sim)?;
+    }
 
     let (addr, task) = bind_and_serve(&cli.listen, Arc::new(handler)).await?;
     info!(
