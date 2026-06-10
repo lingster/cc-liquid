@@ -478,23 +478,37 @@ Two capabilities the in-process shim cannot give us cheaply:
 
 ### B.2 Modes
 
-| Mode | Upstream call? | Response source | Side effect |
-|------|----------------|-----------------|-------------|
-| **`capture`** (pass-through) | **Yes** — forwards to real Hyperliquid | Real upstream response (returned verbatim) | Logs full request + response to session |
-| **`replay`** (serve) | No | Served from captured session **or** the twin engine (§7) | Fully offline; deterministic |
-| **`hybrid`** (optional) | Reads pass through; writes served by twin | Mixed | Live prices, simulated fills |
+The proxy has **two orthogonal knobs**, which keeps v1 simple and matches the
+existing split of responsibilities (market data is already recorded by
+`hl-recorder` and served by the replay/playback engine):
 
-`capture` mode is **transparent**: cc-liquid behaves exactly as if it were
-talking to live Hyperliquid (same data, same latency, real order placement), but
-every request/response pair is durably logged. `replay` mode then reconstructs a
-session offline. The default safe posture is read-through, write-blocked unless
-explicitly enabled.
+**1. Market-data source (the toggle).** Where `/info` *market* reads
+(`allMids`, `meta`) are answered from:
 
-> ⚠️ **Capture mode places real orders.** When pointed at mainnet `/exchange`,
-> `capture` forwards signed orders to the live exchange. Capture must default to
-> **read-only** (`/info` + `/ws` forwarded, `/exchange` rejected) and require an
-> explicit `--allow-trading` flag to forward writes. Testnet is the recommended
-> target for any write capture.
+| `market_source` | Upstream call? | Response source |
+|-----------------|----------------|-----------------|
+| **`forward`** (default) | **Yes** — to real Hyperliquid | Live mids/meta, returned verbatim |
+| **`playback`** | No | A **fixed recorded session** folded by the replay engine (`MarketState`) — fully offline, deterministic |
+
+This is exactly "toggle between a fixed playback or just forward to/from
+Hyperliquid directly." Only pure market-data reads are toggleable; account- and
+order-specific reads (`clearinghouseState`, `userFills`, `userFees`,
+`frontendOpenOrders`) and the write path always forward to the exchange in v1,
+because no virtual account/matching engine exists yet (that is the §7 follow-up,
+which would later let `playback` serve those too).
+
+**2. Capture logging (always on).** Every request/response crossing — forwarded
+*or* served from playback — is appended to the capture log (§B.5). In `forward`
+the log holds the real upstream responses (including the write path that
+`hl-recorder` cannot see); in `playback` it holds the synthesized market
+responses.
+
+> ⚠️ **Write capture is testnet-only in v1.** `POST /exchange` (orders/cancels)
+> is forwarded **only** when `network = testnet` *and* `--allow-trading` is set.
+> On mainnet — or without `--allow-trading` — the proxy **rejects** `/exchange`
+> with an error response and logs the attempt. This makes accidental live order
+> placement structurally impossible in v1. Read endpoints (`/info`) may still
+> forward to mainnet (read-only) when capturing real market data.
 
 ### B.3 Surface to intercept
 
@@ -541,12 +555,11 @@ additionally feed the existing Parquet session for replay-engine consumption):
   "transport": "http",               // http | ws
   "endpoint": "/exchange",           // /info | /exchange | /ws
   "method_tag": "bulk_orders",       // resolved Appendix A method
-  "direction": "request_response",   // or ws_in / ws_out for streamed frames
   "request": { /* verbatim JSON body */ },
   "response": { /* verbatim JSON body */ },
   "status_code": 200,
-  "mode": "capture",
-  "network": "mainnet"
+  "source": "forward",               // forward | playback | rejected
+  "network": "testnet"
 }
 ```
 
@@ -560,57 +573,90 @@ additionally feed the existing Parquet session for replay-engine consumption):
 - **Determinism:** captured timestamps and `oid`s are stored verbatim so `replay`
   reproduces the exact responses the app originally saw.
 
-### B.6 Replay semantics
+### B.6 Playback market source (v1) and future replay
 
-In `replay` mode the proxy answers each incoming request without an upstream call:
+**v1 — playback market source.** With `market_source: playback`, the proxy loads
+a fixed recorded session and folds it into a `MarketState` via the existing
+replay engine. `/info allMids` returns the current mids snapshot; `/info meta`
+returns the universe. The playback cursor advances as the app polls (or on a
+wall-clock pace), so the served prices evolve exactly as recorded — a
+deterministic, offline market feed for cc-liquid with **no application change**
+beyond the `base_url` override. Note cc-liquid constructs `Info(skip_ws=True)`,
+so it consumes market data over `/info` (not `/ws`); serving `allMids`/`meta`
+from playback fully covers its market-data needs.
 
-1. **Log-backed replay (lockstep):** serve the recorded response for the matching
-   request (by `method_tag` + key fields, or strictly by `seq` for deterministic
-   re-runs). Best for regression tests — "given the same requests, return exactly
-   what Hyperliquid returned last time."
-2. **Engine-backed replay (interactive):** route `/info` reads to the twin's
-   `MarketState` / `VirtualAccount` (§7.2) and `/exchange` writes to the
-   `MatchingEngine` (§7.1), folding a recorded or synthetic market-data stream
-   underneath. This lets cc-liquid place *new* orders the original capture never
-   contained and still get L2-matched fills — the full simulator, driven over the
-   wire.
+**Future (§7 follow-up) — engine-backed replay.** Once the `VirtualAccount` and
+`MatchingEngine` land, `playback` can additionally answer account reads
+(`clearinghouseState`, `userFills`, …) and route `/exchange` writes to the
+matcher, folding a recorded/synthetic stream underneath. That turns the proxy
+into the full offline simulator over the wire — cc-liquid places *new* orders and
+gets L2-matched fills. A separate **log-backed lockstep replay** (serve each
+captured request's exact recorded response by `seq`) is also possible later for
+regression tests. Neither is in v1 scope.
 
-`/ws` subscriptions in replay are fed by the replay engine's event stream
-(Appendix A.4), reusing `wire::to_hl_message` so frames are byte-compatible with
-live pushes.
+When/if `/ws` playback is needed, it reuses `wire::to_hl_message` so replayed
+frames are byte-compatible with live pushes (Appendix A.4).
 
 ### B.7 Configuration
 
 ```yaml
 twin_proxy:
-  mode: capture            # capture | replay | hybrid
   listen: 127.0.0.1:8088
-  upstream: https://api.hyperliquid.xyz   # capture/hybrid only
-  network: mainnet
-  allow_trading: false     # capture: forward POST /exchange to live (default off)
-  session_dir: sessions/proxy-demo
+  market_source: forward   # forward | playback  (the toggle, §B.2)
+  session_dir: sessions/proxy-demo   # capture log out; replay session in (playback)
+  network: testnet         # mainnet | testnet
+  upstream: https://api.hyperliquid-testnet.xyz   # derived from network if unset
+  allow_trading: false     # forward POST /exchange — requires network=testnet (v1)
   redact_signatures: false
-  replay_source: log       # replay: log | engine
+```
+
+Equivalent CLI (a new `hl-proxy` binary in the `recorder/` crate):
+
+```bash
+# Capture real testnet traffic (incl. orders) while forwarding live:
+hl-proxy --listen 127.0.0.1:8088 --network testnet --allow-trading \
+    --out sessions/proxy-demo
+
+# Serve a fixed recorded session as the market feed, log everything:
+hl-proxy --listen 127.0.0.1:8088 --market-source playback \
+    --session sessions/demo --out sessions/proxy-replay
 ```
 
 cc-liquid then points at the proxy with a one-line override, e.g.
-`--set base_url=http://127.0.0.1:8088` (the WS URL derives from the same host).
-No other application change is required.
+`--set base_url=http://127.0.0.1:8088`. No other application change is required.
 
-### B.8 Implementation notes & open questions
+### B.8 Implementation notes (decisions resolved)
 
-- **Recommended placement:** a new binary in the existing `recorder/` Rust crate
-  (e.g. `hl-proxy`), reusing `parser`, `wire`, `sequencer`, the storage modules,
-  and the replay engine. This shares 100% of the codec/replay code already built.
-  A lightweight Python/`aiohttp` implementation is a viable alternative if tighter
-  coupling to `Config` is wanted — **decision pending.**
+- **Language & placement (resolved): Rust, in the existing `recorder/` crate.**
+  A new `hl-proxy` binary reuses the framework already built — `config::Network`
+  (endpoints), `parser` / `wire` (codec), `events`, the `replay` engine
+  (`load_session` → `MarketState`) for the playback market source, and the
+  storage/session conventions. No Python proxy.
+- **Suggested module layout** (all pure/testable, mirroring the crate's
+  red-green TDD style): `proxy::request` (classify `/info` + `/exchange` bodies
+  into the Appendix A/B.3 tags), `proxy::log` (`RpcLogEntry` + `RpcSink` trait
+  with JSONL + in-memory impls, signature redaction), `proxy::upstream`
+  (`Upstream` trait → reqwest impl + scripted test impl), `proxy::market`
+  (`MarketDataProvider` → playback over the replay engine), `proxy::handler`
+  (routing: toggle, testnet write guard, logging), and a thin `proxy::server`
+  (loopback HTTP) wired by the `hl-proxy` binary.
+- **Write capture (resolved): testnet-only in v1.** `/exchange` forwards only
+  when `network = testnet` and `--allow-trading`; otherwise rejected + logged
+  (§B.2). Mainnet writes are out of scope until the simulator matures.
+- **Market source (resolved): playback ↔ forward toggle.** Market data is already
+  recorded by `hl-recorder` and served by the replay engine; the proxy simply
+  toggles `/info` market reads between a fixed playback session and live forward
+  (§B.2, §B.6). The full virtual-account/matching path is the §7 follow-up.
 - **Relationship to §8:** the proxy *complements*, not replaces, the in-process
   `TwinInfo`/`TwinExchange` shim. The shim is the fastest path for unit-style,
   fully-in-process simulation; the proxy is the highest-fidelity path for
-  end-to-end capture of real sessions and for SDK-agnostic replay.
-- **Scope for v1:** `capture` (read-only) + log-backed `replay` deliver the core
-  "record the real request/response, replay offline" loop. Engine-backed replay
-  and `hybrid` mode reuse §7 and can follow.
-- **Open questions:** (1) Rust `hl-proxy` vs Python proxy; (2) whether write
-  capture targets testnet only in v1; (3) JSONL-only RPC log vs also exploding
-  market data into the Parquet session during proxying.
+  end-to-end capture of real sessions and SDK-agnostic playback.
+
+### B.9 Decisions (Appendix B)
+
+| # | Decision | Choice |
+|---|---|---|
+| B1 | Implementation language / placement | **Rust**, new `hl-proxy` binary in the `recorder/` crate, reusing existing codec + replay framework |
+| B2 | Write (`/exchange`) capture in v1 | **Testnet-only**, gated behind `--allow-trading`; rejected + logged otherwise |
+| B3 | Market-data behaviour | **Toggle** `market_source: forward | playback` — forward to/from live, or serve a fixed recorded session via the replay engine |
+| B4 | Capture logging | **Always on** — JSONL `rpc_log.jsonl`, self-classifying by Appendix A method tag, optional signature redaction |
