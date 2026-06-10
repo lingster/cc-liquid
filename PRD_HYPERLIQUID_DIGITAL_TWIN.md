@@ -450,3 +450,167 @@ For the twin to be a transparent drop-in for `trader.py`:
    from the same `Config` object and applies the same routing.
 4. **`skip_ws=True`** on `Info` construction is respected (no live WS needed for
    the read path in the twin).
+
+---
+
+## Appendix B — Digital Twin Proxy (Network-Level Capture & Replay)
+
+### B.1 Motivation
+
+The §8 integration swaps `Info` / `Exchange` for Python shims *inside* the
+process. The **Digital Twin Proxy** is a complementary mechanism that operates
+one layer lower — at the **network boundary**. It is a standalone process that
+speaks the exact Hyperliquid HTTP + WebSocket wire protocol (Appendix A), so
+cc-liquid can talk to it **with zero code changes** — only its `base_url` (and WS
+URL) are repointed via config.
+
+Two capabilities the in-process shim cannot give us cheaply:
+
+1. **Full request/response capture of the *write* path.** The market-data
+   recorder (`hl-recorder`) only captures WS market data. The proxy additionally
+   captures real `POST /exchange` order/cancel requests *and their real
+   responses* — the actual signed actions cc-liquid emitted and the fills/oids
+   Hyperliquid returned. This is a complete, faithful trace of a live trading
+   session.
+2. **Language- and SDK-agnostic.** Because it intercepts at the wire level, it
+   works for the current SDK path, the future `cc_flow` path, or any other client
+   — nothing in the app needs to know the twin exists.
+
+### B.2 Modes
+
+| Mode | Upstream call? | Response source | Side effect |
+|------|----------------|-----------------|-------------|
+| **`capture`** (pass-through) | **Yes** — forwards to real Hyperliquid | Real upstream response (returned verbatim) | Logs full request + response to session |
+| **`replay`** (serve) | No | Served from captured session **or** the twin engine (§7) | Fully offline; deterministic |
+| **`hybrid`** (optional) | Reads pass through; writes served by twin | Mixed | Live prices, simulated fills |
+
+`capture` mode is **transparent**: cc-liquid behaves exactly as if it were
+talking to live Hyperliquid (same data, same latency, real order placement), but
+every request/response pair is durably logged. `replay` mode then reconstructs a
+session offline. The default safe posture is read-through, write-blocked unless
+explicitly enabled.
+
+> ⚠️ **Capture mode places real orders.** When pointed at mainnet `/exchange`,
+> `capture` forwards signed orders to the live exchange. Capture must default to
+> **read-only** (`/info` + `/ws` forwarded, `/exchange` rejected) and require an
+> explicit `--allow-trading` flag to forward writes. Testnet is the recommended
+> target for any write capture.
+
+### B.3 Surface to intercept
+
+Hyperliquid's REST surface is small — the Appendix A logical methods map onto
+just two POST endpoints plus the WS stream. The proxy mirrors exactly these:
+
+| Wire endpoint | Body discriminator | Appendix A method(s) |
+|---------------|--------------------|----------------------|
+| `POST /info` | `{"type":"allMids"}` | `info.all_mids()` |
+| `POST /info` | `{"type":"clearinghouseState","user":…}` | `info.user_state(owner)` |
+| `POST /info` | `{"type":"meta"}` | `info.meta()` |
+| `POST /info` | `{"type":"frontendOpenOrders","user":…}` | `info.frontend_open_orders(owner)` |
+| `POST /info` | `{"type":"userFills","user":…}` | `info.user_fills(owner)` |
+| `POST /info` | `{"type":"userFillsByTime","user":…,"startTime":…,"endTime":…}` | `info.user_fills_by_time(...)` |
+| `POST /info` | `{"type":"userFees","user":…}` | `info.user_fees(owner)` |
+| `POST /exchange` | `{"action":{"type":"order",…},"nonce","signature","vaultAddress"}` | `exchange.bulk_orders(...)` |
+| `POST /exchange` | `{"action":{"type":"cancel",…},…}` | `exchange.bulk_cancel(...)` |
+| `GET /ws` (upgrade) | `allMids` / `l2Book` / `trades` subscriptions | recorder market-data feeds |
+
+Because the proxy keys on the `type` discriminator, the request log is
+self-classifying: each captured entry is tagged with the logical Appendix A
+method it corresponds to.
+
+### B.4 TLS strategy
+
+cc-liquid's `base_url` is configurable, so **no MITM certificate is required**.
+The proxy listens on plain HTTP/WS at `http://127.0.0.1:<port>` (loopback);
+cc-liquid is configured with `base_url: http://127.0.0.1:<port>`. In `capture`
+mode the proxy makes the real **HTTPS** call upstream to `api.hyperliquid.xyz`.
+This keeps the client trust chain untouched and avoids cert injection.
+
+### B.5 Capture log format
+
+Each intercepted exchange round-trip is appended to a structured, append-only log
+(JSONL recommended for the variable-schema RPC log; market-data WS frames may
+additionally feed the existing Parquet session for replay-engine consumption):
+
+```jsonc
+{
+  "seq": 1024,                       // monotonic, gap-free
+  "ts_recv_ms": 1733836800123,       // when proxy received the client request
+  "ts_resp_ms": 1733836800187,       // when proxy returned the response
+  "latency_ms": 64,                  // upstream round-trip (capture mode)
+  "transport": "http",               // http | ws
+  "endpoint": "/exchange",           // /info | /exchange | /ws
+  "method_tag": "bulk_orders",       // resolved Appendix A method
+  "direction": "request_response",   // or ws_in / ws_out for streamed frames
+  "request": { /* verbatim JSON body */ },
+  "response": { /* verbatim JSON body */ },
+  "status_code": 200,
+  "mode": "capture",
+  "network": "mainnet"
+}
+```
+
+- **Correlation:** `seq` plus an optional `nonce` echo lets replay match a
+  request to its response.
+- **Secret handling:** `/exchange` bodies contain **signatures and nonces** (not
+  private keys — those never leave the client). Even so, signatures are sensitive;
+  the log lives alongside session data and must be `.gitignore`d. A
+  `--redact-signatures` option stores a hash placeholder instead of the raw
+  signature for shareable traces.
+- **Determinism:** captured timestamps and `oid`s are stored verbatim so `replay`
+  reproduces the exact responses the app originally saw.
+
+### B.6 Replay semantics
+
+In `replay` mode the proxy answers each incoming request without an upstream call:
+
+1. **Log-backed replay (lockstep):** serve the recorded response for the matching
+   request (by `method_tag` + key fields, or strictly by `seq` for deterministic
+   re-runs). Best for regression tests — "given the same requests, return exactly
+   what Hyperliquid returned last time."
+2. **Engine-backed replay (interactive):** route `/info` reads to the twin's
+   `MarketState` / `VirtualAccount` (§7.2) and `/exchange` writes to the
+   `MatchingEngine` (§7.1), folding a recorded or synthetic market-data stream
+   underneath. This lets cc-liquid place *new* orders the original capture never
+   contained and still get L2-matched fills — the full simulator, driven over the
+   wire.
+
+`/ws` subscriptions in replay are fed by the replay engine's event stream
+(Appendix A.4), reusing `wire::to_hl_message` so frames are byte-compatible with
+live pushes.
+
+### B.7 Configuration
+
+```yaml
+twin_proxy:
+  mode: capture            # capture | replay | hybrid
+  listen: 127.0.0.1:8088
+  upstream: https://api.hyperliquid.xyz   # capture/hybrid only
+  network: mainnet
+  allow_trading: false     # capture: forward POST /exchange to live (default off)
+  session_dir: sessions/proxy-demo
+  redact_signatures: false
+  replay_source: log       # replay: log | engine
+```
+
+cc-liquid then points at the proxy with a one-line override, e.g.
+`--set base_url=http://127.0.0.1:8088` (the WS URL derives from the same host).
+No other application change is required.
+
+### B.8 Implementation notes & open questions
+
+- **Recommended placement:** a new binary in the existing `recorder/` Rust crate
+  (e.g. `hl-proxy`), reusing `parser`, `wire`, `sequencer`, the storage modules,
+  and the replay engine. This shares 100% of the codec/replay code already built.
+  A lightweight Python/`aiohttp` implementation is a viable alternative if tighter
+  coupling to `Config` is wanted — **decision pending.**
+- **Relationship to §8:** the proxy *complements*, not replaces, the in-process
+  `TwinInfo`/`TwinExchange` shim. The shim is the fastest path for unit-style,
+  fully-in-process simulation; the proxy is the highest-fidelity path for
+  end-to-end capture of real sessions and for SDK-agnostic replay.
+- **Scope for v1:** `capture` (read-only) + log-backed `replay` deliver the core
+  "record the real request/response, replay offline" loop. Engine-backed replay
+  and `hybrid` mode reuse §7 and can follow.
+- **Open questions:** (1) Rust `hl-proxy` vs Python proxy; (2) whether write
+  capture targets testnet only in v1; (3) JSONL-only RPC log vs also exploding
+  market data into the Parquet session during proxying.
