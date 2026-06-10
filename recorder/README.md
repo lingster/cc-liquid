@@ -2,6 +2,8 @@
 
 Tick-by-tick market data **recorder** for the Hyperliquid Digital Twin
 (see [`../PRD_HYPERLIQUID_DIGITAL_TWIN.md`](../PRD_HYPERLIQUID_DIGITAL_TWIN.md)).
+New to the subsystem? Start with the onboarding guide:
+[`../docs/digital-twin.md`](../docs/digital-twin.md).
 
 It connects to the live Hyperliquid WebSocket API, captures the **L2 order book**,
 **all-mids**, and **trades** streams, and persists them as an append-only,
