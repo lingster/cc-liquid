@@ -35,6 +35,7 @@ pub struct Harness<'a, P: Predictor> {
 
 impl<'a, P: Predictor> Harness<'a, P> {
     pub fn new(meta: &Sidecar, horizons: Vec<u32>, model: &'a mut P) -> anyhow::Result<Self> {
+        meta.validate()?;
         Ok(Self {
             book: RollingBook::with_norm(
                 meta.grid.depth,
@@ -42,7 +43,8 @@ impl<'a, P: Predictor> Harness<'a, P> {
                 meta.grid.norm_lookback,
                 meta.tick,
                 crate::live::grid::NormMode::parse(&meta.grid.norm)?,
-            ),
+            )
+            .with_quote_flow(meta.grid.quote_flow)?,
             ledger: PredictionLedger::new(horizons, meta.tick, meta.grid.threshold_ticks)?,
             model,
             coin: meta.coin.clone(),
@@ -147,7 +149,10 @@ mod tests {
                 threshold_ticks: 0.5,
                 norm_lookback: 10,
                 norm: "zscore".to_string(),
+                trade_flow: false,
+                quote_flow: false,
             },
+            temperature: 1.0,
         }
     }
 
@@ -193,6 +198,56 @@ mod tests {
         assert_eq!(stats.unresolved, 2 + 5);
         // Stub always says "up", the ramp always goes up: everything correct.
         assert!(harness.ledger.records.iter().all(|r| r.correct));
+    }
+
+    /// Records the size of every window it is asked to score.
+    struct ShapeProbe(Vec<usize>);
+    impl Predictor for ShapeProbe {
+        fn predict(&mut self, window: &[f32]) -> anyhow::Result<[f32; 3]> {
+            self.0.push(window.len());
+            Ok([0.1, 0.2, 0.7])
+        }
+    }
+
+    #[test]
+    fn quote_flow_sidecar_feeds_three_channel_windows() {
+        let mut sidecar = meta();
+        sidecar.grid.quote_flow = true;
+        let mut model = ShapeProbe(Vec::new());
+        let mut harness = Harness::new(&sidecar, vec![2], &mut model).unwrap();
+        run_replay(&mut harness, &ramp_events(8)).unwrap();
+        assert!(!model.0.is_empty());
+        assert!(model.0.iter().all(|&len| len == 3 * 4 * 3)); // (3, window, depth)
+    }
+
+    #[test]
+    fn plain_sidecar_feeds_two_channel_windows() {
+        let mut model = ShapeProbe(Vec::new());
+        let sidecar = meta();
+        let mut harness = Harness::new(&sidecar, vec![2], &mut model).unwrap();
+        run_replay(&mut harness, &ramp_events(8)).unwrap();
+        assert!(model.0.iter().all(|&len| len == 2 * 4 * 3));
+    }
+
+    #[test]
+    fn trade_flow_sidecar_rejected_with_clear_error() {
+        let mut sidecar = meta();
+        sidecar.grid.trade_flow = true;
+        let mut model = StubModel;
+        let err = Harness::new(&sidecar, vec![2], &mut model)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("trade-flow"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn quote_flow_with_rankgauss_rejected() {
+        let mut sidecar = meta();
+        sidecar.grid.quote_flow = true;
+        sidecar.grid.norm = "rankgauss".to_string();
+        let mut model = StubModel;
+        assert!(Harness::new(&sidecar, vec![2], &mut model).is_err());
     }
 
     #[test]

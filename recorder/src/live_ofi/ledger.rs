@@ -122,8 +122,7 @@ pub fn summarize(records: &[ResolvedReg]) -> Vec<RegSummary> {
                 .map(|r| (r.predicted as f64 - r.actual).powi(2))
                 .sum();
             let ss_zero: f64 = subset.iter().map(|r| r.actual * r.actual).sum();
-            let moved: Vec<&&ResolvedReg> =
-                subset.iter().filter(|r| r.actual != 0.0).collect();
+            let moved: Vec<&&ResolvedReg> = subset.iter().filter(|r| r.actual != 0.0).collect();
             let n_moved = moved.len();
             let hits = moved
                 .iter()
@@ -139,7 +138,11 @@ pub fn summarize(records: &[ResolvedReg]) -> Vec<RegSummary> {
                 horizon,
                 n,
                 mse: sse / n.max(1) as f64,
-                r2_os: if ss_zero > 0.0 { 1.0 - sse / ss_zero } else { 0.0 },
+                r2_os: if ss_zero > 0.0 {
+                    1.0 - sse / ss_zero
+                } else {
+                    0.0
+                },
                 sign_accuracy: if n_moved > 0 {
                     hits as f64 / n_moved as f64
                 } else {

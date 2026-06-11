@@ -41,14 +41,14 @@ struct BookLevels {
 /// demand), `false` for asks. NaN prices on either side of the transition
 /// compare false everywhere -> zero flow, matching the Python rules.
 fn side_flow(now: &SideLevels, prev: &SideLevels, aggressive_when_up: bool, out: &mut [f64]) {
-    for m in 0..out.len() {
+    for (m, cell) in out.iter_mut().enumerate() {
         let (p_now, p_prev) = (now.px[m], prev.px[m]);
         let (improved, worsened) = if aggressive_when_up {
             (p_now > p_prev, p_now < p_prev)
         } else {
             (p_now < p_prev, p_now > p_prev)
         };
-        out[m] = if improved {
+        *cell = if improved {
             now.sz[m]
         } else if p_now == p_prev {
             now.sz[m] - prev.sz[m]
@@ -176,9 +176,7 @@ impl OfiState {
             ask: SideLevels::from_levels(&book.asks, self.levels),
             mid: (bb.px + ba.px) / 2.0,
         };
-        let Some(prev) = self.prev.replace(current.clone()) else {
-            return None;
-        };
+        let prev = self.prev.replace(current.clone())?;
 
         let mut row = Vec::with_capacity(self.n_features);
         match self.kind {
@@ -196,9 +194,10 @@ impl OfiState {
                 // 1..=levels per side ([bid | ask] columns), f64 then f32.
                 let mut grid = vec![0.0f64; 2 * self.levels];
                 let eps = self.tick * 1e-6;
-                for (offset, side, sign) in
-                    [(0usize, &current.bid, 1.0f64), (self.levels, &current.ask, -1.0)]
-                {
+                for (offset, side, sign) in [
+                    (0usize, &current.bid, 1.0f64),
+                    (self.levels, &current.ask, -1.0),
+                ] {
                     for m in 0..self.levels {
                         let px = side.px[m];
                         if px.is_nan() {

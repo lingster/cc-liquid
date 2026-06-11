@@ -186,12 +186,18 @@ pub async fn run_live<H: Steps>(
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            info!("duration reached after {} snapshots", harness.snapshots_seen());
+            info!(
+                "duration reached after {} snapshots",
+                harness.snapshots_seen()
+            );
             return Ok(());
         }
         let msg = match tokio::time::timeout(remaining, source.next_message()).await {
             Err(_) => {
-                info!("duration reached after {} snapshots", harness.snapshots_seen());
+                info!(
+                    "duration reached after {} snapshots",
+                    harness.snapshots_seen()
+                );
                 return Ok(());
             }
             Ok(None) => {

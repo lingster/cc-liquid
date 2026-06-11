@@ -6,6 +6,43 @@
 
 use crate::events::L2Book;
 
+/// Book-delta OFI ("quote flow") between two consecutive snapshots — port of
+/// the per-pair math of Python `representation.build_quote_flow`.
+///
+/// Resting volume is compared at EQUAL ABSOLUTE PRICES: every level of the
+/// current book enters with weight +1 and every level of the previous book
+/// with weight -1 (bid volume positive, ask volume negative), each binned by
+/// its tick offset from the CURRENT snapshot's mid with the shared ceil/eps
+/// convention. A level unchanged across the pair therefore cancels exactly
+/// even when the mid moved between the snapshots; only genuine placements and
+/// cancellations survive. Prices binned <= 0 (crossed the mid) or beyond
+/// `depth` drop, exactly as in the volume grid.
+///
+/// Accumulation mirrors the Python `np.add.at` order over rows sorted by
+/// (seq, side, level_idx) — current asks, current bids, then the previous
+/// book negated — with each contribution cast to f32 before the add, so the
+/// result is bit-identical to the training pipeline.
+pub fn quote_flow_row(prev: &L2Book, cur: &L2Book, mid: f64, depth: usize, tick: f64) -> Vec<f32> {
+    let mut flow = vec![0f32; depth];
+    let eps = tick * 1e-6;
+    for (book, snap_sign) in [(cur, 1.0f64), (prev, -1.0)] {
+        for (levels, side_sign) in [(&book.asks, -1.0f64), (&book.bids, 1.0)] {
+            for level in levels {
+                let dist = if side_sign < 0.0 {
+                    level.px - mid
+                } else {
+                    mid - level.px
+                };
+                let bin = (dist / tick - eps).ceil() as i64;
+                if (1..=depth as i64).contains(&bin) {
+                    flow[(bin - 1) as usize] += (snap_sign * side_sign * level.sz) as f32;
+                }
+            }
+        }
+    }
+    flow
+}
+
 /// One snapshot -> (flattened `[bid(depth) | ask(depth)]` grid, mid).
 /// `None` when either side of the book is empty.
 pub fn snapshot_grid(book: &L2Book, depth: usize, tick: f64) -> Option<(Vec<f32>, f64)> {
@@ -70,6 +107,17 @@ pub struct RollingBook {
     // so the rolling z-score stats are O(1) per window.
     cum_mean: Vec<f64>,
     cum_sq: Vec<f64>,
+    /// Quote-flow channel (book-delta OFI), z-score mode only. The flow plane
+    /// keeps its OWN causal stats: flows are signed and ~zero-mean, so pooling
+    /// them with the volume cells would crush them (mirrors `LobDataset`).
+    quote_flow: bool,
+    flows: Vec<Vec<f32>>,
+    /// Last folded snapshot, the "previous book" of the next pair. Skipped
+    /// (one-sided) snapshots never land here, so pairs bridge them exactly as
+    /// the Python pipeline's do.
+    prev_book: Option<L2Book>,
+    cum_flow_mean: Vec<f64>,
+    cum_flow_sq: Vec<f64>,
 }
 
 impl RollingBook {
@@ -97,6 +145,32 @@ impl RollingBook {
             ts_event_ms: Vec::new(),
             cum_mean: vec![0.0],
             cum_sq: vec![0.0],
+            quote_flow: false,
+            flows: Vec::new(),
+            prev_book: None,
+            cum_flow_mean: vec![0.0],
+            cum_flow_sq: vec![0.0],
+        }
+    }
+
+    /// Enable the quote-flow input channel (z-score normalization only; the
+    /// rank-gauss flow variant is not ported). Must be set before any `push`.
+    pub fn with_quote_flow(mut self, enabled: bool) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !(enabled && self.norm == NormMode::RankGauss),
+            "quote-flow with rankgauss normalization is not ported to hl-live"
+        );
+        self.quote_flow = enabled;
+        Ok(self)
+    }
+
+    /// Input channels served by `latest_window`: bid + ask volumes, plus the
+    /// quote-flow plane when enabled.
+    pub fn channels(&self) -> usize {
+        if self.quote_flow {
+            3
+        } else {
+            2
         }
     }
 
@@ -147,6 +221,22 @@ impl RollingBook {
                 self.raw.push(grid);
             }
         }
+        if self.quote_flow {
+            // First accepted snapshot has no predecessor: zeros (Python row 0).
+            let flow = match &self.prev_book {
+                Some(prev) => quote_flow_row(prev, book, mid, self.depth, self.tick),
+                None => vec![0f32; self.depth],
+            };
+            let cells = self.depth as f64;
+            let mean: f64 = flow.iter().map(|v| *v as f64).sum::<f64>() / cells;
+            let sq_mean: f64 = flow.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / cells;
+            self.cum_flow_mean
+                .push(self.cum_flow_mean.last().unwrap() + mean);
+            self.cum_flow_sq
+                .push(self.cum_flow_sq.last().unwrap() + sq_mean);
+            self.flows.push(flow);
+            self.prev_book = Some(book.clone());
+        }
         self.mids.push(mid);
         self.ts_event_ms.push(book.time_ms);
         Some(mid)
@@ -160,19 +250,19 @@ impl RollingBook {
     /// Causal (mu, sigma) over the `lookback` snapshots before `t` — never `t`
     /// itself. Index 0 has no history and gets identity stats.
     fn stats_at(&self, t: usize) -> (f64, f64) {
-        if t == 0 {
-            return (0.0, 1.0);
-        }
-        let start = t.saturating_sub(self.lookback);
-        let count = (t - start) as f64;
-        let mu = (self.cum_mean[t] - self.cum_mean[start]) / count;
-        let var = ((self.cum_sq[t] - self.cum_sq[start]) / count - mu * mu).max(0.0);
-        let sigma = var.sqrt();
-        (mu, if sigma > 1e-9 { sigma } else { 1.0 })
+        causal_stats(&self.cum_mean, &self.cum_sq, self.lookback, t)
     }
 
-    /// The newest model input, layout `(2, window, depth)` channel-major —
-    /// the exact tensor the Python pipeline feeds the network.
+    /// Same causal stats, over the quote-flow plane alone (own accumulator).
+    fn flow_stats_at(&self, t: usize) -> (f64, f64) {
+        causal_stats(&self.cum_flow_mean, &self.cum_flow_sq, self.lookback, t)
+    }
+
+    /// The newest model input, layout `(channels, window, depth)`
+    /// channel-major — the exact tensor the Python pipeline feeds the
+    /// network. Channels 0/1 are the normalized bid/ask volumes; with
+    /// quote-flow enabled, channel 2 is the flow plane normalized with its
+    /// own causal stats.
     pub fn latest_window(&self) -> anyhow::Result<Vec<f32>> {
         anyhow::ensure!(
             self.ready(),
@@ -186,7 +276,7 @@ impl RollingBook {
             NormMode::RankGauss => (0.0, 1.0), // grids are already normalized
         };
         let start = t + 1 - self.window;
-        let mut out = vec![0f32; 2 * self.window * self.depth];
+        let mut out = vec![0f32; self.channels() * self.window * self.depth];
         for channel in 0..2 {
             for (w, grid) in self.grids[start..=t].iter().enumerate() {
                 for d in 0..self.depth {
@@ -196,8 +286,33 @@ impl RollingBook {
                 }
             }
         }
+        if self.quote_flow {
+            let (mu_f, sigma_f) = self.flow_stats_at(t);
+            for (w, flow) in self.flows[start..=t].iter().enumerate() {
+                for d in 0..self.depth {
+                    out[2 * self.window * self.depth + w * self.depth + d] =
+                        ((flow[d] as f64 - mu_f) / sigma_f) as f32;
+                }
+            }
+        }
         Ok(out)
     }
+}
+
+/// Causal (mu, sigma) from prefix sums of per-snapshot cell mean / squared
+/// mean: stats at endpoint `t` cover snapshots `[t - lookback, t)`, never `t`
+/// itself; index 0 has no history and gets identity stats. Same semantics as
+/// Python `dataset.causal_norm_stats`.
+fn causal_stats(cum_mean: &[f64], cum_sq: &[f64], lookback: usize, t: usize) -> (f64, f64) {
+    if t == 0 {
+        return (0.0, 1.0);
+    }
+    let start = t.saturating_sub(lookback);
+    let count = (t - start) as f64;
+    let mu = (cum_mean[t] - cum_mean[start]) / count;
+    let var = ((cum_sq[t] - cum_sq[start]) / count - mu * mu).max(0.0);
+    let sigma = var.sqrt();
+    (mu, if sigma > 1e-9 { sigma } else { 1.0 })
 }
 
 /// Gauss-rank one value against a sorted reference (midrank for ties), then
@@ -321,6 +436,100 @@ mod tests {
         assert!((sigma - (16.0f64 / 3.0).sqrt()).abs() < 1e-12);
         // Index 0 is identity.
         assert_eq!(rb.stats_at(0), (0.0, 1.0));
+    }
+
+    #[test]
+    fn quote_flow_grow_shrink_and_sign_per_side() {
+        // Mirrors Python test_grow_shrink_and_sign_per_side: flat mid 99.5,
+        // tick 1, depth 4.
+        let prev = book(&[(99.0, 2.0), (97.0, 1.0)], &[(100.0, 3.0)]);
+        let cur = book(&[(99.0, 5.0), (97.0, 1.0)], &[(100.0, 1.0), (102.0, 6.0)]);
+        let flow = quote_flow_row(&prev, &cur, 99.5, 4, 1.0);
+        // bin 1: bid 99 grew 2->5 (+3); ask 100 shrank 3->1 (-2 ask delta -> +2).
+        // bin 3: bid 97 unchanged (0); ask 102 appeared (+6 ask delta -> -6).
+        assert_eq!(flow, vec![5.0, 0.0, -6.0, 0.0]);
+    }
+
+    #[test]
+    fn quote_flow_appearing_and_disappearing_levels() {
+        let prev = book(&[(99.0, 2.0), (98.0, 4.0)], &[(100.0, 3.0)]);
+        let cur = book(&[(99.0, 2.0)], &[(100.0, 3.0), (102.0, 1.5)]);
+        let flow = quote_flow_row(&prev, &cur, 99.5, 4, 1.0);
+        // bid 98 (bin 2) vanished: -4; ask 102 (bin 3) appeared: -1.5.
+        assert_eq!(flow, vec![0.0, -4.0, -1.5, 0.0]);
+    }
+
+    #[test]
+    fn quote_flow_mid_move_re_anchors_at_equal_absolute_prices() {
+        // Mirrors Python test_mid_move_re_anchors_at_equal_absolute_prices:
+        // mid 99.5 -> 100.5; everything binned against the CURRENT mid.
+        let prev = book(&[(99.0, 2.0), (98.0, 5.0)], &[(100.0, 3.0)]);
+        let cur = book(&[(100.0, 1.0), (98.0, 5.0)], &[(101.0, 4.0)]);
+        let flow = quote_flow_row(&prev, &cur, 100.5, 4, 1.0);
+        // bin 1: bid 100 appeared (+1), ask 101 appeared (-4) -> -3.
+        // bin 2: bid 99 cancelled at its NEW offset -> -2.
+        // bin 3: bid 98 unchanged cancels exactly across the mid move -> 0.
+        // ask 100 crossed below the new mid: off the ask grid, dropped.
+        assert_eq!(flow, vec![-3.0, -2.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn quote_flow_beyond_depth_dropped() {
+        let prev = book(&[(99.0, 2.0)], &[(100.0, 3.0)]);
+        let cur = book(&[(99.0, 2.0), (93.0, 7.0)], &[(100.0, 3.0)]);
+        // Bid appearing 6 ticks out (bin 6 > depth 4) must not wrap or clamp.
+        assert_eq!(quote_flow_row(&prev, &cur, 99.5, 4, 1.0), vec![0.0; 4]);
+    }
+
+    #[test]
+    fn quote_flow_first_row_zeros_and_pairs_bridge_skipped_snapshots() {
+        let mut rb = RollingBook::new(4, 2, 10, 1.0)
+            .with_quote_flow(true)
+            .unwrap();
+        rb.push(&book(&[(99.0, 2.0)], &[(100.0, 3.0)]));
+        // One-sided book: rejected, must not become the previous pair book.
+        assert!(rb.push(&book(&[(99.0, 9.0)], &[])).is_none());
+        rb.push(&book(&[(99.0, 4.0)], &[(100.0, 3.0)]));
+        assert_eq!(rb.flows[0], vec![0.0; 4]); // no predecessor
+        assert_eq!(rb.flows[1], vec![2.0, 0.0, 0.0, 0.0]); // bid 99: 2 -> 4 across the bridge
+    }
+
+    #[test]
+    fn quote_flow_window_appends_flow_plane_with_own_stats() {
+        let mut with_flow = RollingBook::new(2, 2, 10, 1.0)
+            .with_quote_flow(true)
+            .unwrap();
+        let mut without = RollingBook::new(2, 2, 10, 1.0);
+        for (bid_sz, ask_sz) in [(1.0, 2.0), (3.0, 4.0), (2.5, 4.5)] {
+            let b = book(&[(99.0, bid_sz)], &[(101.0, ask_sz)]);
+            with_flow.push(&b);
+            without.push(&b);
+        }
+        assert_eq!(with_flow.channels(), 3);
+        let w3 = with_flow.latest_window().unwrap();
+        let w2 = without.latest_window().unwrap();
+        assert_eq!(w3.len(), 3 * 2 * 2);
+        // Volume channels are byte-identical to the 2-channel path.
+        assert_eq!(&w3[..2 * 2 * 2], &w2[..]);
+        // Flow rows (mid 100; bid 99 and ask 101 both land in bin 1):
+        // t0 has no predecessor -> zeros; t1: bid delta +2, ask delta +2
+        // (sign-flipped) -> net 0; t2: bid -0.5, ask +0.5 -> -1 at bin 1.
+        assert_eq!(with_flow.flows[1], vec![0.0, 0.0]);
+        assert_eq!(with_flow.flows[2], vec![-1.0, 0.0]);
+        // Flow stats at t=2 pool flow rows 0..2 (cells {0,0,0,0}): mu=0,
+        // sigma -> 1.0 fallback; the plane passes through unscaled.
+        assert_eq!(&w3[2 * 2 * 2..], &[0.0, 0.0, -1.0, 0.0]);
+    }
+
+    #[test]
+    fn quote_flow_rejects_rankgauss() {
+        assert!(RollingBook::with_norm(2, 2, 10, 1.0, NormMode::RankGauss)
+            .with_quote_flow(true)
+            .is_err());
+        // Disabled flag is fine under rankgauss.
+        assert!(RollingBook::with_norm(2, 2, 10, 1.0, NormMode::RankGauss)
+            .with_quote_flow(false)
+            .is_ok());
     }
 
     #[test]

@@ -75,12 +75,14 @@ async fn main() -> anyhow::Result<()> {
     let meta = Sidecar::load_for_model(&args.model)?;
     let horizons = parse_horizons(args.horizons.as_deref(), meta.grid.horizon)?;
     info!(
-        "model {} | coin {} tick {} window {} depth {} | horizons {:?}",
+        "model {} | coin {} tick {} window {} depth {} channels {} temperature {} | horizons {:?}",
         args.model.display(),
         meta.coin,
         meta.tick,
         meta.grid.window,
         meta.grid.depth,
+        meta.grid.channels(),
+        meta.temperature,
         horizons
     );
 
