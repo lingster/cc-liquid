@@ -33,8 +33,22 @@ impl ParquetSink {
         Self::with_flush_threshold(dir, DEFAULT_FLUSH_THRESHOLD)
     }
 
+    /// Create a sink whose table files carry a name prefix (e.g. `20260610_`),
+    /// used by the daily-rotating sink to keep each UTC day in its own files.
+    pub fn create_prefixed(dir: impl AsRef<Path>, prefix: &str) -> anyhow::Result<Self> {
+        Self::new_inner(dir, prefix, DEFAULT_FLUSH_THRESHOLD)
+    }
+
     pub fn with_flush_threshold(
         dir: impl AsRef<Path>,
+        flush_threshold: usize,
+    ) -> anyhow::Result<Self> {
+        Self::new_inner(dir, "", flush_threshold)
+    }
+
+    fn new_inner(
+        dir: impl AsRef<Path>,
+        prefix: &str,
         flush_threshold: usize,
     ) -> anyhow::Result<Self> {
         let dir = dir.as_ref();
@@ -44,9 +58,18 @@ impl ParquetSink {
             mids_buf: MidsBuffer::default(),
             book_buf: BookBuffer::default(),
             trades_buf: TradesBuffer::default(),
-            mids_file: TableFile::new(dir.join(ALL_MIDS_FILE), MidsBuffer::schema()),
-            book_file: TableFile::new(dir.join(L2_BOOK_FILE), BookBuffer::schema()),
-            trades_file: TableFile::new(dir.join(TRADES_FILE), TradesBuffer::schema()),
+            mids_file: TableFile::new(
+                dir.join(format!("{prefix}{ALL_MIDS_FILE}")),
+                MidsBuffer::schema(),
+            ),
+            book_file: TableFile::new(
+                dir.join(format!("{prefix}{L2_BOOK_FILE}")),
+                BookBuffer::schema(),
+            ),
+            trades_file: TableFile::new(
+                dir.join(format!("{prefix}{TRADES_FILE}")),
+                TradesBuffer::schema(),
+            ),
         })
     }
 

@@ -12,12 +12,12 @@ use hl_recorder::client::{connect_sharded, WsSource};
 use hl_recorder::config::{Network, RecordConfig};
 use hl_recorder::crowdcent;
 use hl_recorder::info::fetch_meta_body;
-use hl_recorder::manifest::{Counts, Manifest, SCHEMA_VERSION};
+use hl_recorder::manifest::{AssetInfo, Counts, Manifest, SCHEMA_VERSION};
 use hl_recorder::reconnect::{ReconnectPolicy, ReconnectSource};
 use hl_recorder::recorder::Recorder;
 use hl_recorder::sink::EventSink;
 use hl_recorder::source::EventSource;
-use hl_recorder::storage::{ParquetSink, ShardedParquetSink};
+use hl_recorder::storage::{self, ParquetSink, RotatingSink, ShardedParquetSink};
 use hl_recorder::subscription::{build_subscriptions, StreamSelection};
 use hl_recorder::universe::validate_coins;
 
@@ -90,6 +90,12 @@ struct Cli {
     /// and on shutdown). The Parquet footer is only written on shutdown.
     #[arg(long, default_value_t = 300)]
     flush_interval: u64,
+
+    /// Rotate output files at midnight UTC: each day's tables get a
+    /// `YYYYMMDD_` prefix and are finalized (footer written) in the background
+    /// while the new day records. Recommended for multi-day recordings.
+    #[arg(long, default_value_t = false)]
+    daily: bool,
 }
 
 impl Cli {
@@ -133,9 +139,16 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("no coins to record: pass --assets BTC,ETH,... or --cc");
     }
 
-    let (shard_size, l2_shards) = (cli.shard_size, cli.l2_shards);
+    let (shard_size, l2_shards, daily) = (cli.shard_size, cli.l2_shards, cli.daily);
     let flush_interval = (cli.flush_interval > 0).then(|| Duration::from_secs(cli.flush_interval));
-    run(cli.into_config(), shard_size, l2_shards, flush_interval).await
+    run(
+        cli.into_config(),
+        shard_size,
+        l2_shards,
+        flush_interval,
+        daily,
+    )
+    .await
 }
 
 /// Resolve when a recording session should stop: the duration deadline (when
@@ -219,11 +232,14 @@ async fn run(
     shard_size: usize,
     l2_shards: usize,
     flush_interval: Option<Duration>,
+    daily: bool,
 ) -> anyhow::Result<()> {
     let endpoint = cfg.network.ws_endpoint();
 
     // Validate requested coins against the live universe so one bad coin (e.g. a
     // symbol not listed on Hyperliquid) can never poison the whole connection.
+    // The same fetch carries per-asset `szDecimals`, recorded in the manifest so
+    // consumers can derive exact tick sizes instead of inferring them.
     let meta_body = fetch_meta_body(cfg.network.info_endpoint())
         .await
         .with_context(|| {
@@ -232,11 +248,12 @@ async fn run(
                 cfg.network.info_endpoint()
             )
         })?;
-    let universe = hl_recorder::universe::parse_perp_universe(&meta_body)?;
+    let asset_metas = hl_recorder::universe::parse_perp_assets(&meta_body)?;
     // Persist the verbatim `meta` snapshot (PRD §5.2 meta_snapshot) so twin
     // playback serves the exact universe/szDecimals seen at record time.
     std::fs::create_dir_all(&cfg.out_dir)?;
     std::fs::write(cfg.out_dir.join("meta.json"), &meta_body)?;
+    let universe: std::collections::HashSet<String> = asset_metas.keys().cloned().collect();
     let validation = validate_coins(&cfg.coins, &universe);
     if !validation.dropped.is_empty() {
         warn!(
@@ -299,8 +316,23 @@ async fn run(
         .with_context(|| format!("connecting to {endpoint}"))?;
     let mut source = ReconnectSource::new(initial, connect, ReconnectPolicy::default());
 
-    // Choose storage: single-file, or partitioned/parallel L2.
-    let mut sink: Box<dyn EventSink> = if l2_shards > 1 {
+    // Choose storage: single-file or partitioned/parallel L2, optionally
+    // wrapped in midnight-UTC daily rotation (`YYYYMMDD_` prefixed files,
+    // previous day finalized on a background thread).
+    let mut sink: Box<dyn EventSink> = if daily {
+        let out_dir = cfg.out_dir.clone();
+        Box::new(RotatingSink::new(
+            move |prefix: &str| -> anyhow::Result<storage::rotating::BoxedSendSink> {
+                Ok(if l2_shards > 1 {
+                    Box::new(ShardedParquetSink::create_prefixed(
+                        &out_dir, prefix, l2_shards,
+                    )?)
+                } else {
+                    Box::new(ParquetSink::create_prefixed(&out_dir, prefix)?)
+                })
+            },
+        ))
+    } else if l2_shards > 1 {
         Box::new(ShardedParquetSink::create(&cfg.out_dir, l2_shards)?)
     } else {
         Box::new(ParquetSink::create(&cfg.out_dir)?)
@@ -333,6 +365,11 @@ async fn run(
         duration_secs: actual_duration_secs,
         counts: Counts::from(&stats),
         recorder_version: env!("CARGO_PKG_VERSION").to_string(),
+        daily,
+        assets: coins
+            .iter()
+            .filter_map(|c| asset_metas.get(c).map(|m| (c.clone(), AssetInfo::from(*m))))
+            .collect(),
     };
     std::fs::write(cfg.out_dir.join(MANIFEST_FILE), manifest.to_json()?)?;
 

@@ -17,6 +17,14 @@ path = "src/bin/hl-viewer.rs"
 name = "hl-proxy"
 path = "src/bin/hl-proxy.rs"
 
+[[bin]]
+name = "hl-live"
+path = "src/bin/hl-live.rs"
+
+[[bin]]
+name = "hl-live-ofi"
+path = "src/bin/hl-live-ofi.rs"
+
 [lib]
 name = "hl_recorder"
 path = "src/lib.rs"
@@ -40,6 +48,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
 # Desktop viewer UI (used only by the `hl-viewer` binary). Re-exports `egui`.
 eframe = "0.29"
+# ONNX Runtime bindings for the `hl-live` inference harness.
+ort = { version = "2.0.0-rc.10", features = ["download-binaries"] }
 
 [build-dependencies]
 # Used by build.rs to stamp a human-readable UTC build datetime into the binary.

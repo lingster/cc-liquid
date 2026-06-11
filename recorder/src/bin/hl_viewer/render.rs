@@ -70,8 +70,7 @@ pub fn render_depth_chart(ui: &mut egui::Ui, book: &L2Book, max_size: f64) {
     let ask_color = egui::Color32::from_rgb(220, 90, 90);
 
     let width = ui.available_width();
-    let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(width, HEIGHT), egui::Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, HEIGHT), egui::Sense::hover());
     let painter = ui.painter_at(rect);
 
     let n_bids = book.bids.len();
@@ -96,10 +95,8 @@ pub fn render_depth_chart(ui: &mut egui::Ui, book: &L2Book, max_size: f64) {
     let mut hits: Vec<Hit> = Vec::with_capacity(total);
 
     let mut draw_bar = |x: f32, px: f64, sz: f64, color: egui::Color32, is_bid: bool| {
-        let col = egui::Rect::from_min_max(
-            egui::pos2(x, rect.top()),
-            egui::pos2(x + bar_w, baseline),
-        );
+        let col =
+            egui::Rect::from_min_max(egui::pos2(x, rect.top()), egui::pos2(x + bar_w, baseline));
         if sz.is_finite() {
             let h = bar_height(sz);
             let bar = egui::Rect::from_min_max(
@@ -108,7 +105,12 @@ pub fn render_depth_chart(ui: &mut egui::Ui, book: &L2Book, max_size: f64) {
             );
             painter.rect_filled(bar, 0.0, color);
         }
-        hits.push(Hit { col, px, sz, is_bid });
+        hits.push(Hit {
+            col,
+            px,
+            sz,
+            is_bid,
+        });
     };
 
     // Left half: bids worst→best (best ends up adjacent to the centre). Book
@@ -128,7 +130,10 @@ pub fn render_depth_chart(ui: &mut egui::Ui, book: &L2Book, max_size: f64) {
     // Centre divider between the bid and ask halves.
     let center_x = rect.left() + bar_w * n_bids as f32;
     painter.line_segment(
-        [egui::pos2(center_x, rect.top()), egui::pos2(center_x, baseline)],
+        [
+            egui::pos2(center_x, rect.top()),
+            egui::pos2(center_x, baseline),
+        ],
         egui::Stroke::new(1.0, egui::Color32::GRAY),
     );
 

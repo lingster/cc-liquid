@@ -1,9 +1,12 @@
 //! Session manifest: self-describing metadata written alongside the Parquet
 //! tables so a recording can be validated and replayed without guesswork.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::recorder::RecordingStats;
+use crate::universe::AssetMeta;
 
 /// Schema version for forward/backward compatibility checks on replay.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -27,6 +30,37 @@ pub struct Manifest {
     pub counts: Counts,
     /// SDK/recorder version that produced the session.
     pub recorder_version: String,
+    /// True when the session was recorded with `--daily` rotation: tables are
+    /// split per UTC day with `YYYYMMDD_` file prefixes.
+    #[serde(default)]
+    pub daily: bool,
+    /// Per-coin price/size grid metadata from the exchange `meta` endpoint,
+    /// so consumers can derive exact tick sizes instead of inferring them
+    /// from observed prices. Empty for sessions recorded before this field
+    /// existed (`serde(default)` keeps old manifests readable).
+    #[serde(default)]
+    pub assets: BTreeMap<String, AssetInfo>,
+}
+
+/// Price/size grid metadata for one coin.
+///
+/// The exact tick at price `p` is `max(10^-px_decimals, 10^(floor(log10 p) - 4))`
+/// (Hyperliquid allows at most `px_decimals` decimals and 5 significant figures).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetInfo {
+    /// `szDecimals` from the exchange universe entry.
+    pub sz_decimals: u32,
+    /// Maximum decimal places a price may carry (`6 - sz_decimals` for perps).
+    pub px_decimals: u32,
+}
+
+impl From<AssetMeta> for AssetInfo {
+    fn from(meta: AssetMeta) -> Self {
+        Self {
+            sz_decimals: meta.sz_decimals,
+            px_decimals: meta.px_decimals(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +121,23 @@ mod tests {
                 trades: 2,
             },
             recorder_version: "0.1.0".into(),
+            daily: false,
+            assets: BTreeMap::from([
+                (
+                    "BTC".to_string(),
+                    AssetInfo {
+                        sz_decimals: 5,
+                        px_decimals: 1,
+                    },
+                ),
+                (
+                    "ETH".to_string(),
+                    AssetInfo {
+                        sz_decimals: 4,
+                        px_decimals: 2,
+                    },
+                ),
+            ]),
         }
     }
 
@@ -96,6 +147,21 @@ mod tests {
         let json = m.to_json().unwrap();
         let back = Manifest::from_json(&json).unwrap();
         assert_eq!(m, back);
+    }
+
+    #[test]
+    fn old_manifests_without_assets_still_parse() {
+        let mut json = serde_json::to_value(sample()).unwrap();
+        json.as_object_mut().unwrap().remove("assets");
+        let back = Manifest::from_json(&json.to_string()).unwrap();
+        assert!(back.assets.is_empty());
+    }
+
+    #[test]
+    fn asset_info_derives_px_decimals_from_meta() {
+        let info = AssetInfo::from(AssetMeta { sz_decimals: 5 });
+        assert_eq!(info.sz_decimals, 5);
+        assert_eq!(info.px_decimals, 1);
     }
 
     #[test]

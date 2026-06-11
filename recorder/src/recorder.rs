@@ -310,7 +310,10 @@ mod tests {
 
         assert_eq!(stats.recorded, 1);
         assert_eq!(sink.flushes, 3, "one periodic flush per elapsed interval");
-        assert!(sink.finalized, "finalize still runs after the periodic flushes");
+        assert!(
+            sink.finalized,
+            "finalize still runs after the periodic flushes"
+        );
     }
 
     #[tokio::test(start_paused = true)]

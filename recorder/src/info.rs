@@ -1,14 +1,14 @@
 //! Thin HTTP client for the Hyperliquid `info` endpoint.
 //!
 //! Deliberately minimal: it performs the one-shot `meta` POST and hands the raw
-//! body to the pure [`crate::universe::parse_perp_universe`] parser. Network I/O
+//! body to the pure [`crate::universe::parse_perp_assets`] parser. Network I/O
 //! here, parsing/validation rules over in [`crate::universe`]. Exercised by a
 //! network-gated test.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use crate::universe::parse_perp_universe;
+use crate::universe::{parse_perp_assets, AssetMeta};
 
 /// Upper bound on the buffered `meta` response body. The real payload is tens
 /// of KiB; 16 MiB is far larger yet still bounds memory against a hostile or
@@ -53,7 +53,16 @@ pub async fn fetch_meta_body(info_endpoint: &str) -> anyhow::Result<String> {
 
 /// Fetch the set of tradeable perp coin names from `info_endpoint`.
 pub async fn fetch_perp_universe(info_endpoint: &str) -> anyhow::Result<HashSet<String>> {
-    parse_perp_universe(&fetch_meta_body(info_endpoint).await?)
+    Ok(fetch_perp_assets(info_endpoint)
+        .await?
+        .into_keys()
+        .collect())
+}
+
+/// Fetch the tradeable perp universe with per-asset metadata (`szDecimals`)
+/// from `info_endpoint` (e.g. `https://api.hyperliquid.xyz/info`).
+pub async fn fetch_perp_assets(info_endpoint: &str) -> anyhow::Result<HashMap<String, AssetMeta>> {
+    parse_perp_assets(&fetch_meta_body(info_endpoint).await?)
 }
 
 #[cfg(test)]

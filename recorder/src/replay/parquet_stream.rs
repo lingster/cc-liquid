@@ -20,33 +20,74 @@ use crate::storage::tables::{ALL_MIDS_FILE, L2_BOOK_DIR, L2_BOOK_FILE, TRADES_FI
 
 /// Load a session directory into events ordered by `seq`.
 ///
-/// Supports both L2 layouts: a single `l2_book.parquet` (single-file sink) or a
-/// partitioned `l2_book/part-*.parquet` directory (sharded sink).
+/// Supports every sink layout: single-file tables, a partitioned
+/// `l2_book/part-*.parquet` directory (sharded sink), and daily-rotated
+/// sessions where each table carries a `YYYYMMDD_` prefix (`--daily`). All
+/// matching files are merged; `seq` is globally monotonic across days, so the
+/// merge reproduces the original event order.
 pub fn load_session(dir: impl AsRef<Path>) -> anyhow::Result<Vec<RecordedEvent>> {
     let dir = dir.as_ref();
+    let tables = SessionTables::scan(dir)?;
     let mut by_seq: BTreeMap<u64, RecordedEvent> = BTreeMap::new();
 
-    load_all_mids(&dir.join(ALL_MIDS_FILE), &mut by_seq)?;
-    for part in l2_book_parts(dir)? {
-        load_l2_book(&part, &mut by_seq)?;
+    for path in &tables.all_mids {
+        load_all_mids(path, &mut by_seq)?;
     }
-    load_trades(&dir.join(TRADES_FILE), &mut by_seq)?;
+    for path in &tables.l2_book {
+        load_l2_book(path, &mut by_seq)?;
+    }
+    for path in &tables.trades {
+        load_trades(path, &mut by_seq)?;
+    }
 
     Ok(by_seq.into_values().collect())
 }
 
-/// Resolve the L2 part-file(s) for a session, supporting both layouts.
-fn l2_book_parts(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
-    let part_dir = dir.join(L2_BOOK_DIR);
-    if part_dir.is_dir() {
-        let mut parts: Vec<PathBuf> = std::fs::read_dir(&part_dir)?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "parquet"))
-            .collect();
-        parts.sort();
-        return Ok(parts);
+/// The resolved table files of a session, across all supported layouts.
+struct SessionTables {
+    all_mids: Vec<PathBuf>,
+    l2_book: Vec<PathBuf>,
+    trades: Vec<PathBuf>,
+}
+
+impl SessionTables {
+    fn scan(dir: &Path) -> anyhow::Result<Self> {
+        let mut tables = Self {
+            all_mids: Vec::new(),
+            l2_book: Vec::new(),
+            trades: Vec::new(),
+        };
+        for entry in std::fs::read_dir(dir)
+            .with_context(|| format!("reading session dir {}", dir.display()))?
+        {
+            let path = entry?.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if path.is_dir() && name.ends_with(L2_BOOK_DIR) {
+                // `l2_book/` or `YYYYMMDD_l2_book/`: collect its part-files.
+                let mut parts: Vec<PathBuf> = std::fs::read_dir(&path)?
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.extension().is_some_and(|x| x == "parquet"))
+                    .collect();
+                parts.sort();
+                tables.l2_book.extend(parts);
+            } else if name.ends_with(ALL_MIDS_FILE) {
+                tables.all_mids.push(path);
+            } else if name.ends_with(L2_BOOK_FILE) {
+                tables.l2_book.push(path);
+            } else if name.ends_with(TRADES_FILE) {
+                tables.trades.push(path);
+            }
+        }
+        if tables.all_mids.is_empty() && tables.l2_book.is_empty() && tables.trades.is_empty() {
+            anyhow::bail!("no session tables found in {}", dir.display());
+        }
+        tables.all_mids.sort();
+        tables.l2_book.sort();
+        tables.trades.sort();
+        Ok(tables)
     }
-    Ok(vec![dir.join(L2_BOOK_FILE)])
 }
 
 /// Convenience: load a session straight into an [`EventStream`].
@@ -331,5 +372,69 @@ mod tests {
         write_session(dir.path(), &[]);
         let loaded = load_session(dir.path()).unwrap();
         assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn missing_session_dir_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_session(dir.path().join("nope")).is_err());
+        // An existing-but-empty dir has no tables -> error, not silence.
+        assert!(load_session(dir.path()).is_err());
+    }
+
+    #[test]
+    fn daily_rotated_session_loads_across_day_files() {
+        use crate::storage::rotating::{BoxedSendSink, RotatingSink};
+        use crate::storage::ShardedParquetSink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().to_path_buf();
+        let mut sink = RotatingSink::new(move |prefix: &str| -> anyhow::Result<BoxedSendSink> {
+            Ok(Box::new(ShardedParquetSink::create_prefixed(
+                &out, prefix, 2,
+            )?))
+        });
+
+        // Two events on 2026-06-10, one after midnight UTC on 2026-06-11.
+        const DAY1: i64 = 1781135999000;
+        const DAY2: i64 = 1781136000500;
+        let mk = |seq: u64, ts: i64, coin: &str| RecordedEvent {
+            seq,
+            ts_event_ms: ts,
+            ts_recv_ms: ts,
+            payload: MarketEvent::L2Book(L2Book {
+                coin: coin.into(),
+                time_ms: ts,
+                bids: vec![Level {
+                    px: 99.0,
+                    sz: 1.0,
+                    n: 1,
+                }],
+                asks: vec![Level {
+                    px: 101.0,
+                    sz: 1.0,
+                    n: 1,
+                }],
+            }),
+        };
+        sink.write(&mk(0, DAY1, "BTC")).unwrap();
+        sink.write(&mk(1, DAY1 + 1, "ETH")).unwrap();
+        sink.write(&mk(2, DAY2, "BTC")).unwrap();
+        sink.finalize().unwrap();
+
+        // Each day produced its own prefixed tables...
+        assert!(dir.path().join("20260610_l2_book").is_dir());
+        assert!(dir.path().join("20260611_l2_book").is_dir());
+        assert!(dir.path().join("20260610_all_mids.parquet").is_file());
+        assert!(dir.path().join("20260611_trades.parquet").is_file());
+
+        // ...and the loader merges them back into one ordered event stream.
+        let loaded = load_session(dir.path()).unwrap();
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(
+            loaded.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(loaded[2].ts_recv_ms, DAY2);
     }
 }

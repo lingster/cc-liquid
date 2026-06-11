@@ -59,6 +59,8 @@ fn main() -> anyhow::Result<()> {
             trades: 0,
         },
         recorder_version: env!("CARGO_PKG_VERSION").into(),
+        daily: false,
+        assets: Default::default(),
     };
     std::fs::write(
         std::path::Path::new(&out).join("manifest.json"),

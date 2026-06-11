@@ -9,6 +9,8 @@ pub mod config;
 pub mod crowdcent;
 pub mod events;
 pub mod info;
+pub mod live;
+pub mod live_ofi;
 pub mod manifest;
 pub mod merge_source;
 pub mod parser;

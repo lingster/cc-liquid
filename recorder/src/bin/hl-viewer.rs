@@ -314,7 +314,12 @@ impl ViewerApp {
             .max_height(600.0)
             .show(ui, |ui| {
                 ui.horizontal_top(|ui| {
-                    render_side(ui, "BIDS", &book.bids, egui::Color32::from_rgb(80, 200, 120));
+                    render_side(
+                        ui,
+                        "BIDS",
+                        &book.bids,
+                        egui::Color32::from_rgb(80, 200, 120),
+                    );
                     ui.separator();
                     render_side(ui, "ASKS", &book.asks, egui::Color32::from_rgb(220, 90, 90));
                 });

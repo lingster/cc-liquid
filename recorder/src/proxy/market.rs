@@ -394,6 +394,8 @@ mod tests {
                 trades: 0,
             },
             recorder_version: "0.1.0".into(),
+            daily: false,
+            assets: Default::default(),
         };
         std::fs::write(
             dir.path().join("manifest.json"),

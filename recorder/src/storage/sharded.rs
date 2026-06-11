@@ -122,14 +122,34 @@ impl ShardedParquetSink {
         Self::with_flush_threshold(dir, num_shards, DEFAULT_FLUSH_THRESHOLD)
     }
 
+    /// Create a sink whose tables carry a name prefix (e.g. `20260610_`); the
+    /// L2 part-files land in `<prefix>l2_book/`. Used by the daily-rotating
+    /// sink to keep each UTC day in its own files.
+    pub fn create_prefixed(
+        dir: impl AsRef<Path>,
+        prefix: &str,
+        num_shards: usize,
+    ) -> anyhow::Result<Self> {
+        Self::new_inner(dir, prefix, num_shards, DEFAULT_FLUSH_THRESHOLD)
+    }
+
     pub fn with_flush_threshold(
         dir: impl AsRef<Path>,
         num_shards: usize,
         flush_threshold: usize,
     ) -> anyhow::Result<Self> {
+        Self::new_inner(dir, "", num_shards, flush_threshold)
+    }
+
+    fn new_inner(
+        dir: impl AsRef<Path>,
+        prefix: &str,
+        num_shards: usize,
+        flush_threshold: usize,
+    ) -> anyhow::Result<Self> {
         let num_shards = num_shards.max(1);
         let dir = dir.as_ref();
-        let book_dir = dir.join(L2_BOOK_DIR);
+        let book_dir = dir.join(format!("{prefix}{L2_BOOK_DIR}"));
         std::fs::create_dir_all(&book_dir)?;
 
         let mut book_bufs = Vec::with_capacity(num_shards);
@@ -145,8 +165,14 @@ impl ShardedParquetSink {
             workers,
             mids_buf: MidsBuffer::default(),
             trades_buf: TradesBuffer::default(),
-            mids_file: TableFile::new(dir.join(ALL_MIDS_FILE), MidsBuffer::schema()),
-            trades_file: TableFile::new(dir.join(TRADES_FILE), TradesBuffer::schema()),
+            mids_file: TableFile::new(
+                dir.join(format!("{prefix}{ALL_MIDS_FILE}")),
+                MidsBuffer::schema(),
+            ),
+            trades_file: TableFile::new(
+                dir.join(format!("{prefix}{TRADES_FILE}")),
+                TradesBuffer::schema(),
+            ),
         })
     }
 

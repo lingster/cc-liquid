@@ -45,6 +45,7 @@ hl-recorder --cc --duration 300 --out sessions/crowdcent
 | `--shard-size` | `0` | Coins per WebSocket connection (`0` = single); see *Scaling* |
 | `--l2-shards` | `1` | Parallel L2 Parquet part-files; see *Scaling* |
 | `--flush-interval` | `300` | Flush buffered rows to disk at least every N seconds (`0` disables); see *Durability* |
+| `--daily` | off | Rotate output files at midnight UTC with `YYYYMMDD_` prefixes; see *Daily rotation* |
 
 Set `RUST_LOG=debug` for verbose subscription/transport logging.
 
@@ -112,6 +113,50 @@ INFO  done: recorded=23 (mids=7, l2=0, trades=16), ignored=3, errors=0
 > be intercepted by any process, so a hard-kill mid-recording can still leave an
 > unfinalized file — use a graceful signal to stop a session.
 
+## Daily rotation (`--daily`)
+
+For multi-day recordings, a single unfinalized Parquet held open for days is a
+large blast radius: a hard crash loses everything since the last footer.
+`--daily` rotates the output at **midnight UTC** instead, so each completed day
+is a fully finalized, immediately readable file set with a `YYYYMMDD_` prefix:
+
+```
+sessions/long-run/
+├── 20260609_all_mids.parquet     # finalized at 2026-06-10T00:00Z
+├── 20260609_l2_book/part-*.parquet
+├── 20260609_trades.parquet
+├── 20260610_all_mids.parquet     # currently being written
+├── 20260610_l2_book/part-*.parquet
+├── 20260610_trades.parquet
+└── manifest.json                 # daily: true
+```
+
+```bash
+hl-recorder --cc --daily --l2-shards 4 --out sessions/long-run   # run for weeks
+```
+
+**How the boundary is handled (no data loss):** rotation is keyed on each
+event's `ts_recv_ms`. The first event of a new UTC day (1) opens the new day's
+files *first* — ingestion continues into their in-memory buffers immediately —
+then (2) hands the previous day's sink, including any rows still buffered, to a
+**background thread** that drains it and writes the footer. The hot recording
+path never waits on the midnight close. If opening the new day's files fails
+(e.g. disk full), the previous sink stays installed and the error surfaces
+instead of events being dropped.
+
+**Parallelism:** three mechanisms compose — (1) the per-day background
+finalizer thread at each rotation, (2) the `--l2-shards N` worker threads that
+parallelize ZSTD/IO for the heavy L2 stream *within* each day, and (3)
+`--shard-size` connection sharding on the network side. A multi-day,
+full-universe capture typically runs `--daily --l2-shards 4 --shard-size 20`.
+
+Rotation is forward-only (an event with a clock-skewed earlier timestamp stays
+in the currently open day), and background finalize errors are surfaced at the
+next flush/finalize rather than silently dropped. The replay loader,
+`hl-viewer` and `hl-live --replay` read daily sessions transparently — `seq`
+is globally monotonic across days, so the per-day files merge back into one
+ordered event stream.
+
 ## Output session layout
 
 ```
@@ -119,12 +164,54 @@ sessions/demo/
 ├── all_mids.parquet   # one row per (event, coin): seq, ts_event_ms, ts_recv_ms, coin, mid
 ├── l2_book.parquet    # one row per level: …, side (bid|ask), level_idx, px, sz, n
 ├── trades.parquet     # one row per trade: …, side, px, sz, trade_time_ms
-└── manifest.json      # network, endpoint, coins, streams, window, counts, schema_version
+└── manifest.json      # network, endpoint, coins, streams, window, counts, schema_version, assets
 ```
 
 Every event carries a monotonic, gap-free `seq` plus the exchange event time
 (`ts_event_ms`) and local receive time (`ts_recv_ms`), so a replay engine can
 deterministically fold the events back into market state.
+
+**Tick-size metadata (`assets`)** — the manifest records, per recorded coin,
+the exchange's price/size grid parameters taken from the same `info`/`meta`
+fetch used for coin validation:
+
+```json
+"assets": { "BTC": { "sz_decimals": 5, "px_decimals": 1 } }
+```
+
+`px_decimals = 6 - szDecimals` is the maximum decimal places a perp price may
+carry; combined with Hyperliquid's 5-significant-figure rule, the exact tick at
+price `p` is `max(10^-px_decimals, 10^(floor(log10 p) - 4))`. Consumers (e.g.
+the `orderbooker` model pipeline) use this instead of inferring tick sizes from
+observed quotes. Sessions recorded before this field existed simply omit it.
+
+## Live model harness (`hl-live`)
+
+`hl-live` runs an exported [orderbooker](../orderbooker/) ONNX model against
+live (or replayed) L2 data and scores its predictions once the target
+snapshots arrive — the Rust port of `orderbooker live`, sharing this crate's
+WebSocket client, parser and Parquet writers, with ONNX Runtime (`ort`) for
+inference.
+
+```bash
+# Export a trained model from Python first
+(cd ../orderbooker && uv run orderbooker export models/btc.pt --out models/btc.onnx)
+
+# Live: 5 minutes on mainnet at the model's trained horizon
+cargo run --release --bin hl-live -- ../orderbooker/models/btc.onnx --duration 300
+
+# Explicit horizons + custom output
+cargo run --release --bin hl-live -- model.onnx --horizons 50,100,200 --out results.parquet
+
+# Deterministic replay of a recorded session (used for Python/Rust parity tests)
+cargo run --release --bin hl-live -- model.onnx --replay sessions/demo5min
+```
+
+The grid binning, causal normalization and labelling are bit-compatible with
+the Python training pipeline (verified: max probability divergence vs PyTorch
+< 1e-7 across a full session replay). Results land in a Parquet file with the
+same columns as the Python harness. Full guide (flags, output format, parity
+procedure): [`../orderbooker/docs/rust-harness.md`](../orderbooker/docs/rust-harness.md).
 
 ## Inspecting a session (`hl-viewer`)
 

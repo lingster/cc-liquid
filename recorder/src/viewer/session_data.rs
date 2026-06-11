@@ -94,10 +94,8 @@ impl SessionData {
                     // Track the volume (size) range; skip non-finite so corrupt
                     // parquet can never poison the chart's axis scaling.
                     if level.sz.is_finite() {
-                        idx.size_min =
-                            Some(idx.size_min.map_or(level.sz, |m| m.min(level.sz)));
-                        idx.size_max =
-                            Some(idx.size_max.map_or(level.sz, |m| m.max(level.sz)));
+                        idx.size_min = Some(idx.size_min.map_or(level.sz, |m| m.min(level.sz)));
+                        idx.size_max = Some(idx.size_max.map_or(level.sz, |m| m.max(level.sz)));
                     }
                 }
                 idx.snapshots.push(Snapshot {
@@ -159,10 +157,12 @@ impl SessionData {
     /// Inclusive `(min, max)` of level volume (`sz`) across every level of
     /// every snapshot for `coin`. `None` when the coin has no finite sizes.
     pub fn size_range(&self, coin: &str) -> Option<(f64, f64)> {
-        self.coins.get(coin).and_then(|c| match (c.size_min, c.size_max) {
-            (Some(lo), Some(hi)) => Some((lo, hi)),
-            _ => None,
-        })
+        self.coins
+            .get(coin)
+            .and_then(|c| match (c.size_min, c.size_max) {
+                (Some(lo), Some(hi)) => Some((lo, hi)),
+                _ => None,
+            })
     }
 
     /// Inclusive `(min, max)` of `ts_event_ms` across `coin`'s snapshots.
