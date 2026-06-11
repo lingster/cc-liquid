@@ -19,6 +19,15 @@ pub fn direction_label(mv: f64, tick: f64, threshold_ticks: f64) -> u32 {
     }
 }
 
+/// One prediction head: probabilities resolved at `issue_idx + horizon` and
+/// labelled with `threshold_ticks`. Single-head models scored at several
+/// user horizons are just several heads sharing one probability vector.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Head {
+    pub horizon: u32,
+    pub threshold_ticks: f64,
+}
+
 /// One scored prediction (a row in the results parquet).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Resolved {
@@ -34,10 +43,13 @@ pub struct Resolved {
     pub move_ticks: f64,
     pub actual: u32,
     pub correct: bool,
+    /// Labelling threshold (ticks) this row was scored with.
+    pub threshold_ticks: f64,
 }
 
 struct Pending {
     horizon: u32,
+    threshold_ticks: f64,
     issue_idx: u64,
     ts_issue_ms: i64,
     mid_issue: f64,
@@ -45,44 +57,89 @@ struct Pending {
 }
 
 pub struct PredictionLedger {
-    horizons: Vec<u32>,
+    heads: Vec<Head>,
     tick: f64,
-    threshold_ticks: f64,
     pending: HashMap<u64, Vec<Pending>>,
     pub records: Vec<Resolved>,
 }
 
 impl PredictionLedger {
+    /// All horizons share one labelling threshold (the single-head layout).
     pub fn new(horizons: Vec<u32>, tick: f64, threshold_ticks: f64) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            !horizons.is_empty() && horizons.iter().all(|h| *h >= 1),
-            "horizons must be non-empty and positive, got {horizons:?}"
-        );
-        let mut horizons = horizons;
-        horizons.sort_unstable();
-        Ok(Self {
-            horizons,
+        Self::with_heads(
+            horizons
+                .into_iter()
+                .map(|horizon| Head {
+                    horizon,
+                    threshold_ticks,
+                })
+                .collect(),
             tick,
-            threshold_ticks,
+        )
+    }
+
+    /// Per-head (horizon, threshold) pairs — the multi-head layout.
+    pub fn with_heads(heads: Vec<Head>, tick: f64) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !heads.is_empty() && heads.iter().all(|h| h.horizon >= 1),
+            "head horizons must be non-empty and positive, got {:?}",
+            heads.iter().map(|h| h.horizon).collect::<Vec<_>>()
+        );
+        anyhow::ensure!(
+            heads
+                .iter()
+                .all(|h| h.threshold_ticks.is_finite() && h.threshold_ticks >= 0.0),
+            "head thresholds must be finite and non-negative, got {:?}",
+            heads.iter().map(|h| h.threshold_ticks).collect::<Vec<_>>()
+        );
+        let mut heads = heads;
+        heads.sort_by_key(|h| h.horizon);
+        Ok(Self {
+            heads,
+            tick,
             pending: HashMap::new(),
             records: Vec::new(),
         })
     }
 
-    /// Register one model output against every configured horizon.
+    /// Register one model output against every configured head (the
+    /// single-output path: every head scores the same probabilities).
     pub fn issue(&mut self, idx: u64, ts_event_ms: i64, mid: f64, probs: [f32; 3]) {
-        for &horizon in &self.horizons {
+        self.issue_per_head(idx, ts_event_ms, mid, &[probs])
+            .expect("a single probability vector broadcasts to any head count");
+    }
+
+    /// Register per-head model outputs: `probs[i]` is scored by head `i`
+    /// (ledger heads are sorted by horizon, matching the sidecar's sorted
+    /// `horizons`). A single vector broadcasts to every head.
+    pub fn issue_per_head(
+        &mut self,
+        idx: u64,
+        ts_event_ms: i64,
+        mid: f64,
+        probs: &[[f32; 3]],
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            probs.len() == 1 || probs.len() == self.heads.len(),
+            "model emitted {} probability vectors for {} ledger heads",
+            probs.len(),
+            self.heads.len()
+        );
+        for (i, head) in self.heads.iter().enumerate() {
+            let head_probs = if probs.len() == 1 { probs[0] } else { probs[i] };
             self.pending
-                .entry(idx + horizon as u64)
+                .entry(idx + head.horizon as u64)
                 .or_default()
                 .push(Pending {
-                    horizon,
+                    horizon: head.horizon,
+                    threshold_ticks: head.threshold_ticks,
                     issue_idx: idx,
                     ts_issue_ms: ts_event_ms,
                     mid_issue: mid,
-                    probs,
+                    probs: head_probs,
                 });
         }
+        Ok(())
     }
 
     /// Score every prediction whose target snapshot is `idx`; returns how many.
@@ -93,7 +150,7 @@ impl PredictionLedger {
         let count = pending.len();
         for p in pending {
             let mv = mid - p.mid_issue;
-            let actual = direction_label(mv, self.tick, self.threshold_ticks);
+            let actual = direction_label(mv, self.tick, p.threshold_ticks);
             let predicted = argmax3(&p.probs);
             self.records.push(Resolved {
                 horizon: p.horizon,
@@ -108,6 +165,7 @@ impl PredictionLedger {
                 move_ticks: mv / self.tick,
                 actual,
                 correct: predicted == actual,
+                threshold_ticks: p.threshold_ticks,
             });
         }
         count
@@ -232,5 +290,86 @@ mod tests {
     fn empty_horizons_rejected() {
         assert!(PredictionLedger::new(vec![], 1.0, 0.5).is_err());
         assert!(PredictionLedger::new(vec![0], 1.0, 0.5).is_err());
+    }
+
+    #[test]
+    fn single_threshold_constructor_stamps_every_record() {
+        let mut ledger = PredictionLedger::new(vec![1], 1.0, 0.75).unwrap();
+        ledger.issue(0, 0, 100.0, [0.1, 0.2, 0.7]);
+        ledger.resolve(1, 10, 101.0);
+        assert_eq!(ledger.records[0].threshold_ticks, 0.75);
+    }
+
+    #[test]
+    fn heads_resolve_at_own_targets_with_own_thresholds() {
+        let heads = vec![
+            Head {
+                horizon: 2,
+                threshold_ticks: 0.5,
+            },
+            Head {
+                horizon: 4,
+                threshold_ticks: 2.5,
+            },
+        ];
+        let mut ledger = PredictionLedger::with_heads(heads, 1.0).unwrap();
+        ledger
+            .issue_per_head(10, 1000, 100.0, &[[0.1, 0.2, 0.7], [0.7, 0.2, 0.1]])
+            .unwrap();
+        assert_eq!(ledger.pending_count(), 2);
+        assert_eq!(ledger.resolve(12, 1200, 102.0), 1); // head 0 only
+        assert_eq!(ledger.resolve(14, 1400, 102.0), 1); // head 1 only
+        let r0 = &ledger.records[0];
+        // +2 ticks > 0.5 -> up; head 0 carried its own "up" probabilities.
+        assert_eq!(r0.horizon, 2);
+        assert_eq!(r0.threshold_ticks, 0.5);
+        assert_eq!(r0.probs, [0.1, 0.2, 0.7]);
+        assert_eq!(r0.actual, LABEL_UP);
+        assert!(r0.correct);
+        let r1 = &ledger.records[1];
+        // Same +2 tick move is STATIONARY under head 1's 2.5-tick threshold.
+        assert_eq!(r1.horizon, 4);
+        assert_eq!(r1.threshold_ticks, 2.5);
+        assert_eq!(r1.probs, [0.7, 0.2, 0.1]);
+        assert_eq!(r1.actual, LABEL_STATIONARY);
+        assert!(!r1.correct); // it predicted down
+    }
+
+    #[test]
+    fn issue_per_head_broadcasts_one_vector_and_rejects_mismatch() {
+        let heads = vec![
+            Head {
+                horizon: 1,
+                threshold_ticks: 0.5,
+            },
+            Head {
+                horizon: 2,
+                threshold_ticks: 0.5,
+            },
+        ];
+        let mut ledger = PredictionLedger::with_heads(heads, 1.0).unwrap();
+        ledger
+            .issue_per_head(0, 0, 100.0, &[[0.1, 0.2, 0.7]])
+            .unwrap();
+        ledger.resolve(1, 10, 102.0);
+        ledger.resolve(2, 20, 102.0);
+        assert!(ledger.records.iter().all(|r| r.probs == [0.1, 0.2, 0.7]));
+        assert!(ledger
+            .issue_per_head(3, 30, 100.0, &[[0.1, 0.2, 0.7]; 3])
+            .is_err());
+    }
+
+    #[test]
+    fn with_heads_validates_horizons_and_thresholds() {
+        let head = |horizon, threshold_ticks| Head {
+            horizon,
+            threshold_ticks,
+        };
+        assert!(PredictionLedger::with_heads(vec![], 1.0).is_err());
+        assert!(PredictionLedger::with_heads(vec![head(0, 0.5)], 1.0).is_err());
+        assert!(PredictionLedger::with_heads(vec![head(1, f64::NAN)], 1.0).is_err());
+        assert!(PredictionLedger::with_heads(vec![head(1, -0.5)], 1.0).is_err());
+        // Zero threshold is legal (calibrated BTC head 0 uses it).
+        assert!(PredictionLedger::with_heads(vec![head(1, 0.0)], 1.0).is_ok());
     }
 }

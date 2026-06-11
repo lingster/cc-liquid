@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
-use tracing::info;
+use tracing::{info, warn};
 
 use hl_recorder::client::WsSource;
 use hl_recorder::config::Network;
@@ -73,7 +73,19 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let meta = Sidecar::load_for_model(&args.model)?;
-    let horizons = parse_horizons(args.horizons.as_deref(), meta.grid.horizon)?;
+    let horizons = if meta.is_multi_head() {
+        if args.horizons.is_some() {
+            warn!(
+                "--horizons ignored: multi-head model defines its own horizons {:?} \
+                 (with per-head thresholds {:?})",
+                meta.head_horizons(),
+                meta.head_thresholds()
+            );
+        }
+        meta.head_horizons()
+    } else {
+        parse_horizons(args.horizons.as_deref(), meta.grid.horizon)?
+    };
     info!(
         "model {} | coin {} tick {} window {} depth {} channels {} temperature {} | horizons {:?}",
         args.model.display(),
@@ -85,6 +97,19 @@ async fn main() -> anyhow::Result<()> {
         meta.temperature,
         horizons
     );
+    if meta.is_multi_head() {
+        info!(
+            "multi-head: horizons {:?} | thresholds {:?}{} | temperatures {:?}",
+            meta.head_horizons(),
+            meta.head_thresholds(),
+            if meta.coin_thresholds.contains_key(&meta.coin) {
+                format!(" (calibrated for {})", meta.coin)
+            } else {
+                String::new()
+            },
+            meta.head_temperatures()
+        );
+    }
 
     let mut model = OnnxModel::load(&args.model, &meta)?;
     let mut harness = Harness::new(&meta, horizons, &mut model)?;

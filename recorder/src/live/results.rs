@@ -31,6 +31,9 @@ fn schema() -> Arc<Schema> {
         Field::new("move_ticks", DataType::Float64, false),
         Field::new("actual", DataType::UInt32, false),
         Field::new("correct", DataType::Boolean, false),
+        // Additive (2026-06): labelling threshold (ticks) the row was scored
+        // with — distinguishes per-head/per-coin calibrated labels.
+        Field::new("threshold_ticks", DataType::Float64, false),
     ]))
 }
 
@@ -81,6 +84,9 @@ pub fn write_results(records: &[Resolved], out: &Path) -> anyhow::Result<()> {
         Arc::new(BooleanArray::from_iter(
             records.iter().map(|r| Some(r.correct)),
         )),
+        Arc::new(Float64Array::from_iter_values(
+            records.iter().map(|r| r.threshold_ticks),
+        )),
     ];
     let batch = RecordBatch::try_new(schema(), cols)?;
     let mut writer = ArrowWriter::try_new(File::create(out)?, schema(), Some(writer_props()))?;
@@ -108,6 +114,7 @@ mod tests {
             move_ticks: 1.0,
             actual: 2,
             correct: true,
+            threshold_ticks: 0.5,
         }];
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("results.parquet");

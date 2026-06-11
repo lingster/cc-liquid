@@ -11,7 +11,7 @@ use tracing::info;
 
 use crate::events::{L2Book, MarketEvent, RecordedEvent};
 use crate::live::grid::RollingBook;
-use crate::live::ledger::PredictionLedger;
+use crate::live::ledger::{Head, PredictionLedger};
 use crate::live::model::{Predictor, Sidecar};
 use crate::parser::parse_message;
 use crate::source::EventSource;
@@ -34,8 +34,31 @@ pub struct Harness<'a, P: Predictor> {
 }
 
 impl<'a, P: Predictor> Harness<'a, P> {
+    /// `horizons` scores a single-head model at the user's snapshot offsets
+    /// (each labelled with the model's own threshold). Multi-head models
+    /// define their horizons AND thresholds per head in the sidecar, so the
+    /// argument is ignored there (the CLI warns before calling).
     pub fn new(meta: &Sidecar, horizons: Vec<u32>, model: &'a mut P) -> anyhow::Result<Self> {
         meta.validate()?;
+        let thresholds = meta.head_thresholds();
+        let heads: Vec<Head> = if meta.is_multi_head() {
+            meta.head_horizons()
+                .into_iter()
+                .zip(thresholds)
+                .map(|(horizon, threshold_ticks)| Head {
+                    horizon,
+                    threshold_ticks,
+                })
+                .collect()
+        } else {
+            horizons
+                .into_iter()
+                .map(|horizon| Head {
+                    horizon,
+                    threshold_ticks: thresholds[0],
+                })
+                .collect()
+        };
         Ok(Self {
             book: RollingBook::with_norm(
                 meta.grid.depth,
@@ -45,7 +68,7 @@ impl<'a, P: Predictor> Harness<'a, P> {
                 crate::live::grid::NormMode::parse(&meta.grid.norm)?,
             )
             .with_quote_flow(meta.grid.quote_flow)?,
-            ledger: PredictionLedger::new(horizons, meta.tick, meta.grid.threshold_ticks)?,
+            ledger: PredictionLedger::with_heads(heads, meta.tick)?,
             model,
             coin: meta.coin.clone(),
             idx: 0,
@@ -64,7 +87,8 @@ impl<'a, P: Predictor> Harness<'a, P> {
         self.ledger.resolve(self.idx, book.time_ms, mid);
         if self.book.ready() {
             let probs = self.model.predict(&self.book.latest_window()?)?;
-            self.ledger.issue(self.idx, book.time_ms, mid, probs);
+            self.ledger
+                .issue_per_head(self.idx, book.time_ms, mid, &probs)?;
             self.issued += 1;
         }
         self.idx += 1;
@@ -133,8 +157,8 @@ mod tests {
     /// Always predicts "up" with fixed probabilities.
     struct StubModel;
     impl Predictor for StubModel {
-        fn predict(&mut self, _window: &[f32]) -> anyhow::Result<[f32; 3]> {
-            Ok([0.1, 0.2, 0.7])
+        fn predict(&mut self, _window: &[f32]) -> anyhow::Result<Vec<[f32; 3]>> {
+            Ok(vec![[0.1, 0.2, 0.7]])
         }
     }
 
@@ -147,13 +171,26 @@ mod tests {
                 window: 4,
                 horizon: 2,
                 threshold_ticks: 0.5,
+                horizons: vec![],
+                horizon_thresholds: vec![],
                 norm_lookback: 10,
                 norm: "zscore".to_string(),
                 trade_flow: false,
                 quote_flow: false,
             },
+            coin_thresholds: Default::default(),
+            temperatures: vec![],
             temperature: 1.0,
         }
+    }
+
+    /// Three-head sidecar: horizons 1/2/4 with distinct global thresholds.
+    fn multi_head_meta() -> Sidecar {
+        let mut sidecar = meta();
+        sidecar.grid.horizons = vec![1, 2, 4];
+        sidecar.grid.horizon_thresholds = vec![0.5, 1.5, 2.5];
+        sidecar.grid.horizon = 4;
+        sidecar
     }
 
     fn ramp_events(n: u64) -> Vec<RecordedEvent> {
@@ -203,9 +240,9 @@ mod tests {
     /// Records the size of every window it is asked to score.
     struct ShapeProbe(Vec<usize>);
     impl Predictor for ShapeProbe {
-        fn predict(&mut self, window: &[f32]) -> anyhow::Result<[f32; 3]> {
+        fn predict(&mut self, window: &[f32]) -> anyhow::Result<Vec<[f32; 3]>> {
             self.0.push(window.len());
-            Ok([0.1, 0.2, 0.7])
+            Ok(vec![[0.1, 0.2, 0.7]])
         }
     }
 
@@ -248,6 +285,76 @@ mod tests {
         sidecar.grid.norm = "rankgauss".to_string();
         let mut model = StubModel;
         assert!(Harness::new(&sidecar, vec![2], &mut model).is_err());
+    }
+
+    /// Emits a fixed list of per-head probability vectors.
+    struct MultiHeadStub(Vec<[f32; 3]>);
+    impl Predictor for MultiHeadStub {
+        fn predict(&mut self, _window: &[f32]) -> anyhow::Result<Vec<[f32; 3]>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn multi_head_resolves_each_head_at_its_own_target_with_its_probs() {
+        // Distinct calls per head: down / stationary / up.
+        let head_probs = vec![[0.8, 0.1, 0.1], [0.1, 0.8, 0.1], [0.1, 0.1, 0.8]];
+        let mut model = MultiHeadStub(head_probs.clone());
+        // User horizons must be ignored: the heads define 1/2/4.
+        let mut harness = Harness::new(&multi_head_meta(), vec![7], &mut model).unwrap();
+        run_replay(&mut harness, &ramp_events(12)).unwrap();
+        let records = &harness.ledger.records;
+        assert!(records.iter().all(|r| r.horizon != 7));
+        for (i, (&horizon, &threshold)) in [1u32, 2, 4].iter().zip(&[0.5, 1.5, 2.5]).enumerate() {
+            let head: Vec<_> = records.iter().filter(|r| r.horizon == horizon).collect();
+            assert!(!head.is_empty(), "no records for head {horizon}");
+            // Each head carries its OWN probabilities, threshold, and target.
+            assert!(head.iter().all(|r| r.probs == head_probs[i]));
+            assert!(head.iter().all(|r| r.threshold_ticks == threshold));
+            assert!(head
+                .iter()
+                .all(|r| r.target_idx == r.issue_idx + horizon as u64));
+            // Ramp rises 1 tick/snapshot: move = horizon ticks > threshold -> up.
+            assert!(head
+                .iter()
+                .all(|r| r.actual == crate::live::ledger::LABEL_UP));
+            assert!(head.iter().all(|r| r.move_ticks == horizon as f64));
+        }
+    }
+
+    #[test]
+    fn multi_head_per_coin_thresholds_override_global() {
+        let mut sidecar = multi_head_meta();
+        // BTC calibration: h=2 threshold jumps to 2.5 so the 2-tick ramp move
+        // becomes stationary instead of up; h=1 drops to 0 (1 tick -> up).
+        sidecar
+            .coin_thresholds
+            .insert("BTC".into(), vec![0.0, 2.5, 2.5]);
+        let mut model = MultiHeadStub(vec![[0.1, 0.8, 0.1]; 3]);
+        let mut harness = Harness::new(&sidecar, vec![], &mut model).unwrap();
+        run_replay(&mut harness, &ramp_events(12)).unwrap();
+        let label_for = |horizon: u32| {
+            let head: Vec<_> = harness
+                .ledger
+                .records
+                .iter()
+                .filter(|r| r.horizon == horizon)
+                .collect();
+            assert!(!head.is_empty());
+            (head[0].actual, head[0].threshold_ticks)
+        };
+        assert_eq!(label_for(1), (crate::live::ledger::LABEL_UP, 0.0));
+        assert_eq!(label_for(2), (crate::live::ledger::LABEL_STATIONARY, 2.5));
+        assert_eq!(label_for(4), (crate::live::ledger::LABEL_UP, 2.5));
+    }
+
+    #[test]
+    fn head_count_mismatch_fails_the_run() {
+        // Two probability vectors for a three-head ledger: hard error.
+        let mut model = MultiHeadStub(vec![[0.1, 0.8, 0.1]; 2]);
+        let mut harness = Harness::new(&multi_head_meta(), vec![], &mut model).unwrap();
+        let err = run_replay(&mut harness, &ramp_events(12)).unwrap_err();
+        assert!(err.to_string().contains("ledger heads"), "{err}");
     }
 
     #[test]
