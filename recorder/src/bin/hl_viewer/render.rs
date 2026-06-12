@@ -160,6 +160,127 @@ pub fn render_depth_chart(ui: &mut egui::Ui, book: &L2Book, max_size: f64) {
     }
 }
 
+/// Colours for [`render_price_chart`]; sourced from the user's YAML config.
+pub struct PriceChartColors {
+    /// The full price history line (spanning the whole time range).
+    pub full: egui::Color32,
+    /// The overlay up to the current playback position.
+    pub elapsed: egui::Color32,
+}
+
+/// Draw the coin's mid-price over time. The X axis always spans the full series
+/// (`series` is `(ts_ms, price)` in ascending time), so the chart shows the
+/// entire loaded range regardless of playback position. The whole series is
+/// drawn in `colors.full`; the portion up to `current_ts` is overdrawn in
+/// `colors.elapsed` with a playhead marker, so users can see where in time the
+/// replay has reached. Hovering shows the time + price of the nearest point.
+pub fn render_price_chart(
+    ui: &mut egui::Ui,
+    series: &[(i64, f64)],
+    current_ts: i64,
+    colors: &PriceChartColors,
+) -> Option<i64> {
+    let height = ui.available_height().max(80.0);
+    let width = ui.available_width();
+    // Click sense (which also reports hover) so the chart can both show a
+    // tooltip and seek playback when clicked.
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    let painter = ui.painter_at(rect);
+
+    if series.len() < 2 {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "no price series for this coin",
+            egui::FontId::monospace(12.0),
+            egui::Color32::GRAY,
+        );
+        return None;
+    }
+
+    let plot = rect.shrink(6.0);
+    let t0 = series.first().unwrap().0;
+    let t1 = series.last().unwrap().0;
+    let t_span = (t1 - t0).max(1) as f64;
+    let (mut p_min, mut p_max) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &(_, p) in series {
+        p_min = p_min.min(p);
+        p_max = p_max.max(p);
+    }
+
+    let x_of = |t: i64| plot.left() + ((t - t0) as f64 / t_span) as f32 * plot.width();
+    let y_of = |p: f64| {
+        if p_max <= p_min {
+            plot.center().y // flat price: draw down the middle
+        } else {
+            plot.bottom() - ((p - p_min) / (p_max - p_min)) as f32 * plot.height()
+        }
+    };
+
+    // Full price history in the "full" colour.
+    let full_pts: Vec<egui::Pos2> = series.iter().map(|&(t, p)| egui::pos2(x_of(t), y_of(p))).collect();
+    painter.add(egui::Shape::line(
+        full_pts,
+        egui::Stroke::new(1.0, colors.full),
+    ));
+
+    // Elapsed overlay up to the playback position, plus a playhead.
+    let elapsed_pts: Vec<egui::Pos2> = series
+        .iter()
+        .filter(|&&(t, _)| t <= current_ts)
+        .map(|&(t, p)| egui::pos2(x_of(t), y_of(p)))
+        .collect();
+    if elapsed_pts.len() >= 2 {
+        painter.add(egui::Shape::line(
+            elapsed_pts.clone(),
+            egui::Stroke::new(1.5, colors.elapsed),
+        ));
+    }
+    if let Some(&head) = elapsed_pts.last() {
+        painter.line_segment(
+            [egui::pos2(head.x, plot.top()), egui::pos2(head.x, plot.bottom())],
+            egui::Stroke::new(0.5, colors.elapsed.gamma_multiply(0.6)),
+        );
+        painter.circle_filled(head, 3.0, colors.elapsed);
+    }
+
+    // Hover: snap to the nearest point by X and show its time + price.
+    if let Some(pos) = resp.hover_pos() {
+        let mut best = 0usize;
+        let mut best_dx = f32::MAX;
+        for (i, &(t, _)) in series.iter().enumerate() {
+            let dx = (x_of(t) - pos.x).abs();
+            if dx < best_dx {
+                best_dx = dx;
+                best = i;
+            }
+        }
+        let (t, p) = series[best];
+        let pt = egui::pos2(x_of(t), y_of(p));
+        painter.circle_stroke(pt, 4.0, egui::Stroke::new(1.0, egui::Color32::WHITE));
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        egui::show_tooltip_at_pointer(
+            ui.ctx(),
+            ui.layer_id(),
+            egui::Id::new("price_chart_tooltip"),
+            |ui| {
+                ui.monospace(format_utc_ms(t));
+                ui.monospace(format!("price {p:.4}"));
+            },
+        );
+    }
+
+    // Click: map the pointer X back to a timestamp across the full range so the
+    // caller can seek there (the navigator snaps to the nearest snapshot).
+    if resp.clicked() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let frac = ((pos.x - plot.left()) / plot.width()).clamp(0.0, 1.0) as f64;
+            return Some(t0 + (frac * t_span).round() as i64);
+        }
+    }
+    None
+}
+
 /// Render one side of the book (bids or asks) as a px/sz/n grid in delivered
 /// (best-first) order.
 pub fn render_side(ui: &mut egui::Ui, title: &str, levels: &[Level], color: egui::Color32) {

@@ -11,17 +11,26 @@
 use std::time::Instant;
 
 use eframe::egui;
-use hl_recorder::viewer::{Navigator, PlaybackClock, SessionData};
+use hl_recorder::viewer::{Navigator, PlaybackClock, SessionData, ViewerConfig};
 
 #[path = "hl_viewer/render.rs"]
 mod render;
-use render::{render_depth_chart, render_side, render_top_of_book, timeline_for};
+use render::{
+    format_utc_ms, render_depth_chart, render_price_chart, render_side, render_top_of_book,
+    timeline_for, PriceChartColors,
+};
+
+/// Default config filename, looked up in the working directory. Override with a
+/// second CLI argument: `hl-viewer <session_dir> [config.yaml]`.
+const DEFAULT_CONFIG: &str = "hl-viewer-config.yaml";
 
 fn main() -> eframe::Result<()> {
     let dir = std::env::args().nth(1).unwrap_or_else(|| {
-        eprintln!("usage: hl-viewer <session_dir>");
+        eprintln!("usage: hl-viewer <session_dir> [config.yaml]");
         std::process::exit(2);
     });
+    let cfg_path = std::env::args().nth(2).unwrap_or_else(|| DEFAULT_CONFIG.to_string());
+    let config = ViewerConfig::load_or_default(&cfg_path);
 
     let data = match SessionData::from_dir(&dir) {
         Ok(d) => d,
@@ -38,7 +47,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "hl-viewer",
         options,
-        Box::new(move |_cc| Ok(Box::new(ViewerApp::new(dir, data)))),
+        Box::new(move |_cc| Ok(Box::new(ViewerApp::new(dir, data, config)))),
     )
 }
 
@@ -52,10 +61,14 @@ struct ViewerApp {
     play_started: Option<Instant>,
     /// Case-insensitive substring filter applied to the coin list.
     coin_filter: String,
+    /// User colour preferences loaded from YAML.
+    config: ViewerConfig,
+    /// Last session-open error, shown in the menu bar until the next success.
+    load_error: Option<String>,
 }
 
 impl ViewerApp {
-    fn new(dir: String, data: SessionData) -> Self {
+    fn new(dir: String, data: SessionData, config: ViewerConfig) -> Self {
         let first_coin = data.coins().first().cloned().unwrap_or_default();
         let nav = Navigator::new(first_coin.clone());
         let playback = PlaybackClock::new(timeline_for(&data, &first_coin));
@@ -66,6 +79,8 @@ impl ViewerApp {
             playback,
             play_started: None,
             coin_filter: String::new(),
+            config,
+            load_error: None,
         }
     }
 
@@ -74,6 +89,25 @@ impl ViewerApp {
         self.nav.set_coin(coin);
         self.playback = PlaybackClock::new(timeline_for(&self.data, coin));
         self.play_started = None;
+    }
+
+    /// Load a different session directory in place, resetting navigation and
+    /// playback. On failure the old session stays loaded and the error is shown
+    /// in the menu bar.
+    fn open_session(&mut self, dir: String) {
+        match SessionData::from_dir(&dir) {
+            Ok(data) => {
+                let first = data.coins().first().cloned().unwrap_or_default();
+                self.data = data;
+                self.nav = Navigator::new(first.clone());
+                self.playback = PlaybackClock::new(timeline_for(&self.data, &first));
+                self.play_started = None;
+                self.coin_filter.clear();
+                self.dir = dir;
+                self.load_error = None;
+            }
+            Err(e) => self.load_error = Some(format!("open failed: {e:#}")),
+        }
     }
 
     /// Apply paced playback: advance the navigator to the tick the wall clock
@@ -119,6 +153,14 @@ impl eframe::App for ViewerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drive_playback(ctx);
 
+        // Menu bar spans the full width at the very top.
+        let to_open = egui::TopBottomPanel::top("menu_bar")
+            .show(ctx, |ui| self.menu_bar(ui))
+            .inner;
+        if let Some(dir) = to_open {
+            self.open_session(dir);
+        }
+
         egui::SidePanel::left("coins_ladder")
             .resizable(true)
             .default_width(220.0)
@@ -129,6 +171,21 @@ impl eframe::App for ViewerApp {
             .show(ctx, |ui| self.left_panel(ui));
 
         egui::TopBottomPanel::top("controls").show(ctx, |ui| self.controls(ui));
+
+        // Price-movement chart sits above the order book, resizable so users
+        // can give it as much vertical room as they like. A click on the chart
+        // seeks playback to that point in time.
+        let seek_ts = egui::TopBottomPanel::top("price_chart")
+            .resizable(true)
+            .default_height(200.0)
+            .min_height(100.0)
+            .show(ctx, |ui| self.price_chart_panel(ui))
+            .inner;
+        if let Some(ts) = seek_ts {
+            self.playback.pause();
+            self.play_started = None;
+            self.nav.seek_to_time(&self.data, ts);
+        }
 
         egui::TopBottomPanel::bottom("footer").show(ctx, |ui| self.footer(ui));
 
@@ -269,6 +326,35 @@ impl ViewerApp {
         }
     }
 
+    /// Top menu bar. Returns a folder path when the user picks one via
+    /// `File ▸ Open`, so the caller can (re)load it outside this borrow.
+    fn menu_bar(&self, ui: &mut egui::Ui) -> Option<String> {
+        let mut to_open = None;
+        egui::menu::bar(ui, |ui| {
+            ui.menu_button("File", |ui| {
+                if ui.button("Open session folder…").clicked() {
+                    ui.close_menu();
+                    let mut dialog = rfd::FileDialog::new().set_title("Open session folder");
+                    if !self.dir.is_empty() {
+                        dialog = dialog.set_directory(&self.dir);
+                    }
+                    if let Some(path) = dialog.pick_folder() {
+                        to_open = Some(path.display().to_string());
+                    }
+                }
+                ui.separator();
+                if ui.button("Quit").clicked() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+            if let Some(err) = &self.load_error {
+                ui.separator();
+                ui.colored_label(egui::Color32::from_rgb(220, 90, 90), err);
+            }
+        });
+        to_open
+    }
+
     /// Persistent footer showing the version and exact build so it is always
     /// obvious which binary is running (e.g. when a stale release lingers).
     fn footer(&self, ui: &mut egui::Ui) {
@@ -284,6 +370,37 @@ impl ViewerApp {
                 .weak(),
             );
         });
+    }
+
+    /// Price panel: the selected coin's mid-price over the full loaded time
+    /// range, with a light-blue overlay tracking the current playback position.
+    /// Returns a timestamp when the user clicks the chart, so the caller can
+    /// seek playback there.
+    fn price_chart_panel(&self, ui: &mut egui::Ui) -> Option<i64> {
+        let coin = self.nav.coin();
+        ui.horizontal(|ui| {
+            ui.heading(format!("{coin} — price"));
+            if let Some((lo, hi)) = self.data.time_range(coin) {
+                ui.separator();
+                ui.monospace(format!("{} … {}", format_utc_ms(lo), format_utc_ms(hi)));
+            }
+            ui.separator();
+            ui.weak("click to seek");
+        });
+
+        let series = self.data.price_series(coin);
+        let current_ts = self
+            .nav
+            .current_snapshot(&self.data)
+            .map(|s| s.ts_event_ms)
+            .unwrap_or(i64::MIN);
+        let [fr, fg, fb] = self.config.price_chart.full_color;
+        let [er, eg, eb] = self.config.price_chart.elapsed_color;
+        let colors = PriceChartColors {
+            full: egui::Color32::from_rgb(fr, fg, fb),
+            elapsed: egui::Color32::from_rgb(er, eg, eb),
+        };
+        render_price_chart(ui, &series, current_ts, &colors)
     }
 
     fn book_view(&mut self, ui: &mut egui::Ui) {

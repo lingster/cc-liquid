@@ -173,6 +173,27 @@ impl SessionData {
             _ => None,
         }
     }
+
+    /// Mid-price series for `coin`: `(ts_event_ms, mid)` per snapshot in seq
+    /// order. Mid is `(best_bid + best_ask) / 2` when both sides exist, falling
+    /// back to whichever single side is present. Snapshots whose top-of-book has
+    /// no finite price are skipped, so the series only carries plottable points.
+    pub fn price_series(&self, coin: &str) -> Vec<(i64, f64)> {
+        self.snapshots(coin)
+            .iter()
+            .filter_map(|s| {
+                let bid = s.book.bids.first().map(|l| l.px).filter(|p| p.is_finite());
+                let ask = s.book.asks.first().map(|l| l.px).filter(|p| p.is_finite());
+                let mid = match (bid, ask) {
+                    (Some(b), Some(a)) => Some((b + a) / 2.0),
+                    (Some(b), None) => Some(b),
+                    (None, Some(a)) => Some(a),
+                    (None, None) => None,
+                };
+                mid.map(|m| (s.ts_event_ms, m))
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -291,6 +312,47 @@ mod tests {
         );
         // Unknown coin yields an empty ladder, not a panic.
         assert!(s.price_ladder_counts("ETH").is_empty());
+    }
+
+    #[test]
+    fn price_series_is_mid_per_snapshot_in_seq_order() {
+        let events = vec![
+            book_event(0, 100, "BTC", &[100.0], &[102.0]), // mid 101.0
+            book_event(1, 200, "BTC", &[104.0], &[106.0]), // mid 105.0
+            book_event(2, 150, "ETH", &[10.0], &[12.0]),   // unrelated coin
+        ];
+        let s = SessionData::from_events(&events);
+        assert_eq!(s.price_series("BTC"), vec![(100, 101.0), (200, 105.0)]);
+        // Unknown coin -> empty, no panic.
+        assert!(s.price_series("DOGE").is_empty());
+    }
+
+    #[test]
+    fn price_series_falls_back_to_single_side_and_skips_empty() {
+        // Construct books with one-sided / empty tops directly.
+        let lvl = |px: f64| Level { px, sz: 1.0, n: 1 };
+        let mk = |ts: i64, bids: Vec<Level>, asks: Vec<Level>| RecordedEvent {
+            seq: ts as u64,
+            ts_event_ms: ts,
+            ts_recv_ms: ts,
+            payload: MarketEvent::L2Book(L2Book {
+                coin: "BTC".into(),
+                time_ms: ts,
+                bids,
+                asks,
+            }),
+        };
+        let events = vec![
+            mk(10, vec![lvl(100.0)], vec![]),  // bid only -> 100.0
+            mk(20, vec![], vec![lvl(200.0)]),  // ask only -> 200.0
+            mk(30, vec![], vec![]),            // no book -> skipped
+            mk(40, vec![lvl(50.0)], vec![lvl(52.0)]), // mid 51.0
+        ];
+        let s = SessionData::from_events(&events);
+        assert_eq!(
+            s.price_series("BTC"),
+            vec![(10, 100.0), (20, 200.0), (40, 51.0)]
+        );
     }
 
     #[test]

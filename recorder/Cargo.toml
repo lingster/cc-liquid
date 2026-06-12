@@ -36,6 +36,7 @@ reqwest = { version = "0.12", default-features = false, features = ["native-tls"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 arrow = "53"
 parquet = "53"
 bytes = "1"
@@ -48,6 +49,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
 # Desktop viewer UI (used only by the `hl-viewer` binary). Re-exports `egui`.
 eframe = "0.29"
+# Native file/folder picker for the hl-viewer "File ▸ Open" menu. xdg-portal
+# avoids a build-time GTK dependency on Linux.
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
 # ONNX Runtime bindings for the `hl-live` inference harness.
 ort = { version = "2.0.0-rc.10", features = ["download-binaries"] }
 

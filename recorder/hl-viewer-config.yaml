@@ -1,0 +1,14 @@
+# hl-viewer GUI configuration.
+#
+# Loaded from the working directory by default; override with a second CLI arg:
+#   hl-viewer <session_dir> path/to/config.yaml
+# Any missing key falls back to the built-in default shown below.
+
+price_chart:
+  # Colour of the full price-history line (the whole loaded time range).
+  # RGB, 0-255. Default: light grey.
+  full_color: [180, 180, 180]
+
+  # Colour of the overlay drawn up to the current playback position, so you can
+  # see where in time the replay has reached. Default: light blue.
+  elapsed_color: [120, 190, 255]
