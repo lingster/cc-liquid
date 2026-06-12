@@ -11,7 +11,7 @@
 use std::time::Instant;
 
 use eframe::egui;
-use hl_recorder::viewer::{Navigator, PlaybackClock, SessionData, ViewerConfig};
+use hl_recorder::viewer::{layout, Navigator, PlaybackClock, Section, SessionData, ViewerConfig};
 
 #[path = "hl_viewer/render.rs"]
 mod render;
@@ -65,6 +65,8 @@ struct ViewerApp {
     config: ViewerConfig,
     /// Last session-open error, shown in the menu bar until the next success.
     load_error: Option<String>,
+    /// Top-to-bottom order of the draggable content sections.
+    section_order: Vec<Section>,
 }
 
 impl ViewerApp {
@@ -81,6 +83,7 @@ impl ViewerApp {
             coin_filter: String::new(),
             config,
             load_error: None,
+            section_order: layout::default_order(),
         }
     }
 
@@ -172,24 +175,11 @@ impl eframe::App for ViewerApp {
 
         egui::TopBottomPanel::top("controls").show(ctx, |ui| self.controls(ui));
 
-        // Price-movement chart sits above the order book, resizable so users
-        // can give it as much vertical room as they like. A click on the chart
-        // seeks playback to that point in time.
-        let seek_ts = egui::TopBottomPanel::top("price_chart")
-            .resizable(true)
-            .default_height(200.0)
-            .min_height(100.0)
-            .show(ctx, |ui| self.price_chart_panel(ui))
-            .inner;
-        if let Some(ts) = seek_ts {
-            self.playback.pause();
-            self.play_started = None;
-            self.nav.seek_to_time(&self.data, ts);
-        }
-
         egui::TopBottomPanel::bottom("footer").show(ctx, |ui| self.footer(ui));
 
-        egui::CentralPanel::default().show(ctx, |ui| self.book_view(ui));
+        // The price chart and order book are draggable sections: grab a
+        // section's ⠿ handle and drop it above/below the other to reorder them.
+        egui::CentralPanel::default().show(ctx, |ui| self.sections(ui));
     }
 }
 
@@ -370,6 +360,79 @@ impl ViewerApp {
                 .weak(),
             );
         });
+    }
+
+    /// Render the draggable content sections (price chart, order book) in the
+    /// user's current order. Each section has a ⠿ drag handle; dropping it on
+    /// the other section's top/bottom half reorders them (50%-midpoint snap).
+    fn sections(&mut self, ui: &mut egui::Ui) {
+        let order = self.section_order.clone();
+        // Captured out of the drag/closure scope, applied after the loop.
+        let mut dropped: Option<(Section, Section, bool)> = None;
+        let mut seek_ts: Option<i64> = None;
+
+        egui::ScrollArea::vertical()
+            .id_salt("sections")
+            .show(ui, |ui| {
+                for &section in &order {
+                    let frame = egui::Frame::group(ui.style()).inner_margin(6.0);
+                    let (inner, payload) =
+                        ui.dnd_drop_zone::<Section, ()>(frame, |ui| {
+                            ui.horizontal(|ui| {
+                                // Only the handle is the drag source, so the
+                                // chart/book bodies stay fully interactive.
+                                ui.dnd_drag_source(
+                                    egui::Id::new(("section_handle", section)),
+                                    section,
+                                    |ui| {
+                                        ui.label(
+                                            egui::RichText::new("⠿").strong().monospace(),
+                                        )
+                                        .on_hover_text("drag to reorder");
+                                    },
+                                );
+                                ui.label(egui::RichText::new(section.title()).strong());
+                            });
+                            ui.separator();
+                            match section {
+                                Section::PriceChart => {
+                                    // Bound the chart's height; it reads
+                                    // available_height, which is unbounded in a
+                                    // scroll area.
+                                    ui.allocate_ui(
+                                        egui::vec2(ui.available_width(), 220.0),
+                                        |ui| {
+                                            if let Some(ts) = self.price_chart_panel(ui) {
+                                                seek_ts = Some(ts);
+                                            }
+                                        },
+                                    );
+                                }
+                                Section::OrderBook => self.book_view(ui),
+                            }
+                        });
+
+                    if let Some(dragged) = payload {
+                        // Snap: pointer past the section's vertical midpoint ⇒
+                        // drop below it, otherwise above.
+                        let after = ui
+                            .input(|i| i.pointer.interact_pos())
+                            .map(|p| p.y > inner.response.rect.center().y)
+                            .unwrap_or(false);
+                        dropped = Some((*dragged, section, after));
+                    }
+                }
+            });
+
+        if let Some((dragged, reference, after)) = dropped {
+            self.section_order =
+                layout::reordered(&self.section_order, dragged, reference, after);
+        }
+        if let Some(ts) = seek_ts {
+            self.playback.pause();
+            self.play_started = None;
+            self.nav.seek_to_time(&self.data, ts);
+        }
     }
 
     /// Price panel: the selected coin's mid-price over the full loaded time

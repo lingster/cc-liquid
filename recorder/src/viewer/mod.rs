@@ -7,11 +7,13 @@
 //! binary (`src/bin/hl-viewer.rs`) is a thin shell over these types.
 
 pub mod config;
+pub mod layout;
 pub mod navigator;
 pub mod playback;
 pub mod session_data;
 
 pub use config::{PriceChartConfig, ViewerConfig};
+pub use layout::Section;
 pub use navigator::Navigator;
 pub use playback::{PlaybackClock, PlaybackState};
 pub use session_data::SessionData;
