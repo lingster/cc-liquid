@@ -10,9 +10,16 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context};
-use arrow::array::{Float64Array, Int64Array, StringArray, UInt32Array, UInt64Array};
+use arrow::array::{
+    Array, BooleanArray, Float64Array, Int64Array, StringArray, UInt32Array, UInt64Array,
+};
+use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{
+    ArrowPredicateFn, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder, RowFilter,
+};
+use parquet::arrow::ProjectionMask;
+use parquet::file::statistics::Statistics;
 
 use crate::events::{AllMids, L2Book, Level, MarketEvent, RecordedEvent, Side, Trade};
 use crate::replay::stream::VecEventStream;
@@ -63,6 +70,178 @@ pub fn load_session(dir: impl AsRef<Path>) -> anyhow::Result<Vec<RecordedEvent>>
         events = events.len(),
         elapsed_ms = started.elapsed().as_millis() as u64,
         "session decode complete"
+    );
+    Ok(events)
+}
+
+/// List the coins available in a session, cheaply.
+///
+/// Prefers the `coins` array in `manifest.json` (no file scan); falls back to
+/// streaming the `l2_book` table and collecting the distinct `coin` column when
+/// the manifest is absent or carries no coins. Result is sorted and de-duped.
+/// This lets the viewer populate its coin list without materialising any books
+/// (see lazy per-coin loading).
+pub fn list_session_coins(dir: impl AsRef<Path>) -> anyhow::Result<Vec<String>> {
+    let dir = dir.as_ref();
+
+    // Fast path: manifest.json's coins array.
+    #[derive(serde::Deserialize)]
+    struct CoinsOnly {
+        #[serde(default)]
+        coins: Vec<String>,
+    }
+    if let Ok(text) = std::fs::read_to_string(dir.join("manifest.json")) {
+        if let Ok(m) = serde_json::from_str::<CoinsOnly>(&text) {
+            if !m.coins.is_empty() {
+                let mut coins = m.coins;
+                coins.sort();
+                coins.dedup();
+                tracing::info!(coins = coins.len(), "coin list from manifest");
+                return Ok(coins);
+            }
+        }
+    }
+
+    // Fallback: scan the l2_book table for distinct coins (names only, no books).
+    let tables = SessionTables::scan(dir)?;
+    let mut set = std::collections::BTreeSet::new();
+    for path in &tables.l2_book {
+        // Stream batch-by-batch so the full table is never resident at once.
+        for batch in open_reader(path)? {
+            let batch = batch?;
+            let coin = col::<StringArray>(&batch, "coin")?;
+            for i in 0..batch.num_rows() {
+                if !set.contains(coin.value(i)) {
+                    set.insert(coin.value(i).to_string());
+                }
+            }
+        }
+    }
+    tracing::info!(coins = set.len(), "coin list from l2_book scan");
+    Ok(set.into_iter().collect())
+}
+
+/// The session's wall-clock span as inclusive `(start_ms, end_ms)` unix millis,
+/// read from `manifest.json`'s RFC3339 `started_at`/`ended_at`. Returns `None`
+/// when the manifest is absent or the timestamps can't be parsed (the caller
+/// then falls back to the loaded coin's own time range). Used to scale the UI's
+/// window range slider without scanning the data.
+pub fn session_time_span(dir: impl AsRef<Path>) -> Option<(i64, i64)> {
+    #[derive(serde::Deserialize)]
+    struct Span {
+        started_at: String,
+        ended_at: String,
+    }
+    let text = std::fs::read_to_string(dir.as_ref().join("manifest.json")).ok()?;
+    let span: Span = serde_json::from_str(&text).ok()?;
+    let parse = |s: &str| {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|dt| dt.timestamp_millis())
+    };
+    match (parse(&span.started_at), parse(&span.ended_at)) {
+        (Some(a), Some(b)) if a <= b => Some((a, b)),
+        _ => None,
+    }
+}
+
+/// Load just one coin's L2 book events from a session, ordered by `seq`.
+///
+/// Streams the `l2_book` table and keeps only rows for `coin`, so peak memory
+/// is bounded by that single coin's books rather than the whole session. This
+/// is the per-coin half of the viewer's lazy loading: the order book, depth
+/// chart and price series for the selected coin are derived from these events.
+///
+/// `window` (inclusive `[start_ms, end_ms]` on `ts_event_ms`) restricts the
+/// load to a time slice — e.g. a single 24h period. Because the table is
+/// written in time order, row groups whose `ts_event_ms` range falls outside
+/// the window are skipped via parquet statistics, so a window load is both
+/// smaller *and* faster than a full coin load. `None` loads the whole coin.
+pub fn load_coin_session(
+    dir: impl AsRef<Path>,
+    coin: &str,
+    window: Option<(i64, i64)>,
+) -> anyhow::Result<Vec<RecordedEvent>> {
+    let dir = dir.as_ref();
+    let started = std::time::Instant::now();
+    let tables = SessionTables::scan(dir)?;
+    // Only this coin's seqs are retained, so the map stays small.
+    let mut acc: HashMap<u64, BookAccum> = HashMap::new();
+    for path in &tables.l2_book {
+        // Predicate pushdown filters to this coin during decode; row-group
+        // pruning skips chunks outside the window; batches are streamed and
+        // dropped, so peak memory is bounded by one coin's windowed books.
+        for batch in open_coin_reader(path, coin, window)? {
+            let batch = batch?;
+            let seq = col::<UInt64Array>(&batch, "seq")?;
+            let te = col::<Int64Array>(&batch, "ts_event_ms")?;
+            let tr = col::<Int64Array>(&batch, "ts_recv_ms")?;
+            let coin_col = col::<StringArray>(&batch, "coin")?;
+            let side = col::<StringArray>(&batch, "side")?;
+            let level_idx = col::<UInt32Array>(&batch, "level_idx")?;
+            let px = col::<Float64Array>(&batch, "px")?;
+            let sz = col::<Float64Array>(&batch, "sz")?;
+            let n = col::<UInt32Array>(&batch, "n")?;
+            for i in 0..batch.num_rows() {
+                if coin_col.value(i) != coin {
+                    continue;
+                }
+                // Row-group pruning is coarse; enforce the exact window here.
+                if let Some((lo, hi)) = window {
+                    let ts = te.value(i);
+                    if ts < lo || ts > hi {
+                        continue;
+                    }
+                }
+                let accum = acc.entry(seq.value(i)).or_insert_with(|| BookAccum {
+                    common: Common {
+                        ts_event_ms: te.value(i),
+                        ts_recv_ms: tr.value(i),
+                    },
+                    coin: coin.to_string(),
+                    bids: Vec::new(),
+                    asks: Vec::new(),
+                });
+                let level = Level {
+                    px: px.value(i),
+                    sz: sz.value(i),
+                    n: n.value(i),
+                };
+                match side.value(i) {
+                    "bid" => accum.bids.push((level_idx.value(i), level)),
+                    "ask" => accum.asks.push((level_idx.value(i), level)),
+                    other => return Err(anyhow!("unknown book side `{other}`")),
+                }
+            }
+        }
+    }
+
+    // Order by seq and rebuild best-first books.
+    let mut by_seq: BTreeMap<u64, RecordedEvent> = BTreeMap::new();
+    for (seq, mut accum) in acc {
+        accum.bids.sort_by_key(|(idx, _)| *idx);
+        accum.asks.sort_by_key(|(idx, _)| *idx);
+        by_seq.insert(
+            seq,
+            RecordedEvent {
+                seq,
+                ts_event_ms: accum.common.ts_event_ms,
+                ts_recv_ms: accum.common.ts_recv_ms,
+                payload: MarketEvent::L2Book(L2Book {
+                    coin: accum.coin,
+                    time_ms: accum.common.ts_event_ms,
+                    bids: accum.bids.into_iter().map(|(_, l)| l).collect(),
+                    asks: accum.asks.into_iter().map(|(_, l)| l).collect(),
+                }),
+            },
+        );
+    }
+    let events: Vec<RecordedEvent> = by_seq.into_values().collect();
+    tracing::info!(
+        coin,
+        events = events.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "loaded single coin session"
     );
     Ok(events)
 }
@@ -120,13 +299,83 @@ pub fn load_session_stream(dir: impl AsRef<Path>) -> anyhow::Result<VecEventStre
 }
 
 fn read_batches(path: &Path) -> anyhow::Result<Vec<RecordBatch>> {
-    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
     let mut batches = Vec::new();
-    for batch in reader {
+    for batch in open_reader(path)? {
         batches.push(batch?);
     }
     Ok(batches)
+}
+
+/// Open a streaming batch reader over a parquet file. Iterating decodes one
+/// batch (row group chunk) at a time, so callers that process-and-drop each
+/// batch never hold the whole file in memory — essential for the multi-GB
+/// `l2_book` table (see lazy per-coin loading).
+fn open_reader(path: &Path) -> anyhow::Result<ParquetRecordBatchReader> {
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    Ok(ParquetRecordBatchReaderBuilder::try_new(file)?.build()?)
+}
+
+/// Open a streaming reader that pushes a `coin == target` predicate down into
+/// parquet, and (when `window` is set) skips row groups whose `ts_event_ms`
+/// range lies entirely outside the window. The `coin` column is decoded first
+/// to build a row mask, and the remaining (wide) columns are only materialised
+/// for matching rows — so extracting one coin/window from a table with all
+/// coins interleaved skips the bulk of the decode work, not just allocation.
+fn open_coin_reader(
+    path: &Path,
+    coin: &str,
+    window: Option<(i64, i64)>,
+) -> anyhow::Result<ParquetRecordBatchReader> {
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+
+    // Leaf indices (flat schema ⇒ field index == leaf index).
+    let leaf_idx = |name: &str| {
+        builder
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == name)
+    };
+    let coin_idx =
+        leaf_idx("coin").ok_or_else(|| anyhow!("l2_book table is missing a `coin` column"))?;
+
+    // Row-group pruning by ts_event_ms statistics (table is time-ordered).
+    if let (Some((lo, hi)), Some(ts_idx)) = (window, leaf_idx("ts_event_ms")) {
+        let meta = builder.metadata();
+        let mut keep = Vec::new();
+        for rg in 0..meta.num_row_groups() {
+            let stats = meta.row_group(rg).column(ts_idx).statistics().cloned();
+            let overlaps = match stats {
+                Some(Statistics::Int64(s)) => match (s.min_opt(), s.max_opt()) {
+                    (Some(&min), Some(&max)) => max >= lo && min <= hi,
+                    _ => true, // missing min/max: keep to be safe
+                },
+                _ => true, // no/other stats: keep
+            };
+            if overlaps {
+                keep.push(rg);
+            }
+        }
+        builder = builder.with_row_groups(keep);
+    }
+
+    let mask = ProjectionMask::leaves(builder.parquet_schema(), [coin_idx]);
+    let target = coin.to_string();
+    let predicate = ArrowPredicateFn::new(mask, move |batch: RecordBatch| {
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| ArrowError::CastError("coin column is not Utf8".into()))?;
+        Ok(BooleanArray::from_iter(
+            (0..col.len()).map(|i| Some(col.value(i) == target)),
+        ))
+    });
+    let reader = builder
+        .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+        .build()?;
+    Ok(reader)
 }
 
 fn col<'a, T: 'static>(batch: &'a RecordBatch, name: &str) -> anyhow::Result<&'a T> {

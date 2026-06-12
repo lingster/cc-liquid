@@ -113,6 +113,21 @@ impl SessionData {
         Ok(Self::from_events(&events))
     }
 
+    /// Lazily load a session directory but index only `coin`'s books, optionally
+    /// restricted to a `window` (`[start_ms, end_ms]` on `ts_event_ms`).
+    ///
+    /// Peak memory is bounded by that single coin/window (see lazy per-coin
+    /// loading), unlike [`Self::from_dir`] which materialises every coin. The
+    /// returned index therefore reports only `coin` in [`Self::coins`].
+    pub fn from_dir_coin(
+        dir: impl AsRef<Path>,
+        coin: &str,
+        window: Option<(i64, i64)>,
+    ) -> anyhow::Result<Self> {
+        let events = crate::replay::load_coin_session(dir, coin, window)?;
+        Ok(Self::from_events(&events))
+    }
+
     /// Coins that have at least one L2 snapshot, sorted ascending.
     pub fn coins(&self) -> Vec<String> {
         self.coins.keys().cloned().collect()

@@ -12,11 +12,21 @@ use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use hl_recorder::replay::{list_session_coins, session_time_span};
 use hl_recorder::viewer::{layout, Navigator, PlaybackClock, Section, SessionData, ViewerConfig};
 
-/// Result of a background session load: the folder that was opened plus its
-/// indexed data, or a human-readable error.
-type LoadResult = Result<(String, SessionData), String>;
+/// A successfully loaded session slice: the session directory, its full coin
+/// list, and the single coin whose books were materialised (lazy per-coin
+/// loading — only one coin is held in memory at a time).
+struct LoadedSession {
+    dir: String,
+    coins: Vec<String>,
+    coin: String,
+    data: SessionData,
+}
+
+/// Result delivered from the background loader thread.
+type LoadResult = Result<LoadedSession, String>;
 
 #[path = "hl_viewer/render.rs"]
 mod render;
@@ -38,30 +48,16 @@ fn main() -> eframe::Result<()> {
     let cfg_path = std::env::args().nth(2).unwrap_or_else(|| DEFAULT_CONFIG.to_string());
     let config = ViewerConfig::load_or_default(&cfg_path);
 
-    let started = Instant::now();
-    tracing::info!(dir = %dir, "loading initial session (blocking)");
-    let data = match SessionData::from_dir(&dir) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("failed to load session `{dir}`: {e:#}");
-            std::process::exit(1);
-        }
-    };
-    tracing::info!(
-        dir = %dir,
-        coins = data.coins().len(),
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "initial session loaded"
-    );
-
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 760.0]),
         ..Default::default()
     };
+    // The session is loaded lazily on a background thread (see ViewerApp::new),
+    // so the window appears immediately even for multi-GB sessions.
     eframe::run_native(
         "hl-viewer",
         options,
-        Box::new(move |_cc| Ok(Box::new(ViewerApp::new(dir, data, config)))),
+        Box::new(move |_cc| Ok(Box::new(ViewerApp::new(dir, config)))),
     )
 }
 
@@ -96,63 +92,200 @@ struct ViewerApp {
     /// switch (it can be millions of points) so the chart doesn't rebuild it
     /// every frame; the chart downsamples this to the pixel width when drawing.
     price_series: Vec<(i64, f64)>,
+    /// Full coin universe for the session (from the manifest), independent of
+    /// which single coin's books are currently materialised in `data`.
+    all_coins: Vec<String>,
+    /// The coin whose books are loaded (or being loaded) in `data`.
+    selected_coin: String,
+    /// Bounded LRU of recently-loaded coins' books (most-recently-used last).
+    /// Switching back to a cached coin is instant — important for huge sessions
+    /// where a fresh per-coin load re-scans the whole table (~20s). Cleared when
+    /// a new session folder is opened or the load window changes.
+    coin_cache: Vec<(String, SessionData)>,
+    /// Session wall-clock span `(start_ms, end_ms)` from the manifest, used as
+    /// the extent of the window range slider. `None` when unknown.
+    session_span: Option<(i64, i64)>,
+    /// Active load window `[start_ms, end_ms]` restricting how much of each coin
+    /// is loaded. `None` loads the whole coin.
+    window: Option<(i64, i64)>,
+    /// Working values for the window range slider, applied on "Load window".
+    window_edit: (i64, i64),
+}
+
+/// Max coins kept in [`ViewerApp::coin_cache`] (excludes the current coin).
+/// Bounds memory: on a multi-GB session each coin can be hundreds of MB.
+const COIN_CACHE_CAP: usize = 3;
+
+/// One day in milliseconds — the default load window for large sessions.
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Default load window for a session of wall-clock `span`: the first 24h when
+/// the session is longer than a day, else the whole thing (`None` = no filter).
+fn default_window(span: Option<(i64, i64)>) -> Option<(i64, i64)> {
+    match span {
+        Some((a, b)) if b - a > DAY_MS => Some((a, a + DAY_MS)),
+        _ => None,
+    }
 }
 
 impl ViewerApp {
-    fn new(dir: String, data: SessionData, config: ViewerConfig) -> Self {
-        let first_coin = data.coins().first().cloned().unwrap_or_default();
-        let nav = Navigator::new(first_coin.clone());
-        let playback = PlaybackClock::new(timeline_for(&data, &first_coin));
-        let price_series = data.price_series(&first_coin);
-        Self {
-            dir,
-            data,
-            nav,
-            playback,
+    /// Build an empty app and kick off the initial lazy load of `dir`.
+    fn new(dir: String, config: ViewerConfig) -> Self {
+        let mut app = Self {
+            dir: String::new(),
+            data: SessionData::default(),
+            nav: Navigator::new(String::new()),
+            playback: PlaybackClock::new(Vec::new()),
             play_started: None,
             coin_filter: String::new(),
             config,
             load_error: None,
             section_order: layout::default_order(),
             pending_load: None,
-            price_series,
+            price_series: Vec::new(),
+            all_coins: Vec::new(),
+            selected_coin: String::new(),
+            coin_cache: Vec::new(),
+            session_span: None,
+            window: None,
+            window_edit: (0, 0),
+        };
+        app.open_folder(dir);
+        app
+    }
+
+    /// Open a *new* session folder. Resets to a clean loading state for the new
+    /// directory immediately — clearing the old coin list and data — so a coin
+    /// click during the (possibly slow) load can't target the previous session
+    /// (the stale-`dir` race). Then discovers coins and loads the first one.
+    fn open_folder(&mut self, dir: String) {
+        self.dir = dir.clone();
+        self.all_coins.clear();
+        self.selected_coin.clear();
+        self.data = SessionData::default();
+        self.nav = Navigator::new(String::new());
+        self.playback = PlaybackClock::new(Vec::new());
+        self.play_started = None;
+        self.price_series.clear();
+        // Cached coins belong to the previous session; drop them.
+        self.coin_cache.clear();
+        // Discover the session span (cheap: manifest only) and default to a 24h
+        // window so a multi-day session doesn't load in full.
+        self.session_span = session_time_span(&dir);
+        self.window = default_window(self.session_span);
+        self.window_edit = self.window.or(self.session_span).unwrap_or((0, 0));
+        let window = self.window;
+        self.start_load(dir, String::new(), None, window);
+    }
+
+    /// Select `coin`: serve it instantly from the LRU cache if present,
+    /// otherwise start a background load. Used by the coin-list clicks.
+    fn select_coin(&mut self, coin: String) {
+        if coin == self.selected_coin {
+            return;
+        }
+        if let Some(data) = self.cache_take(&coin) {
+            tracing::info!(coin = %coin, "coin served from cache (instant)");
+            // A cached hit supersedes any in-flight load.
+            self.pending_load = None;
+            self.cache_current();
+            self.set_current(coin, data);
+        } else {
+            let dir = self.dir.clone();
+            let known = self.all_coins.clone();
+            let window = self.window;
+            self.start_load(dir, coin, Some(known), window);
         }
     }
 
-    /// Rebuild playback timeline + reset navigation after a coin change.
-    fn switch_coin(&mut self, coin: &str) {
-        self.nav.set_coin(coin);
-        self.playback = PlaybackClock::new(timeline_for(&self.data, coin));
-        self.play_started = None;
-        self.price_series = self.data.price_series(coin);
+    /// Move the currently-loaded coin's books into the LRU cache.
+    fn cache_current(&mut self) {
+        if self.selected_coin.is_empty() {
+            return;
+        }
+        let data = std::mem::take(&mut self.data);
+        if data.is_empty() {
+            return;
+        }
+        let coin = std::mem::take(&mut self.selected_coin);
+        self.cache_put(coin, data);
     }
 
-    /// Begin loading a different session directory on a background thread. The
-    /// UI stays responsive and shows a "loading…" indicator; the result is
-    /// applied in [`Self::poll_pending_load`]. Large sessions (multi-GB parquet)
-    /// can take a while — watch the logs for per-file timing under `RUST_LOG`.
-    fn open_session(&mut self, dir: String) {
-        tracing::info!(dir = %dir, "opening session on background thread");
+    /// Insert/refresh a coin in the LRU cache, evicting the least-recently-used
+    /// entries beyond [`COIN_CACHE_CAP`].
+    fn cache_put(&mut self, coin: String, data: SessionData) {
+        self.coin_cache.retain(|(c, _)| c != &coin);
+        self.coin_cache.push((coin, data));
+        while self.coin_cache.len() > COIN_CACHE_CAP {
+            self.coin_cache.remove(0);
+        }
+    }
+
+    /// Remove and return a coin's cached books, if present.
+    fn cache_take(&mut self, coin: &str) -> Option<SessionData> {
+        let pos = self.coin_cache.iter().position(|(c, _)| c == coin)?;
+        Some(self.coin_cache.remove(pos).1)
+    }
+
+    /// Install `coin`/`data` as the current view, resetting navigation,
+    /// playback and the cached price series.
+    fn set_current(&mut self, coin: String, data: SessionData) {
+        self.data = data;
+        self.nav = Navigator::new(coin.clone());
+        self.playback = PlaybackClock::new(timeline_for(&self.data, &coin));
+        self.play_started = None;
+        self.price_series = self.data.price_series(&coin);
+        self.selected_coin = coin;
+        self.load_error = None;
+    }
+
+    /// Start a background load on a worker thread so the UI never blocks on a
+    /// multi-GB parquet decode. `coin` empty ⇒ load the first coin of the
+    /// (freshly discovered) session; otherwise load that specific coin.
+    /// `known_coins` skips re-listing when only switching coin within a session.
+    fn start_load(
+        &mut self,
+        dir: String,
+        coin: String,
+        known_coins: Option<Vec<String>>,
+        window: Option<(i64, i64)>,
+    ) {
+        tracing::info!(dir = %dir, coin = %coin, ?window, "starting background load");
         let (tx, rx) = channel();
         std::thread::spawn(move || {
-            let started = Instant::now();
-            let result: LoadResult = match SessionData::from_dir(&dir) {
-                Ok(data) => {
-                    tracing::info!(
-                        dir = %dir,
-                        coins = data.coins().len(),
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        "background session load complete"
-                    );
-                    Ok((dir, data))
-                }
-                Err(e) => {
-                    let msg = format!("{e:#}");
-                    tracing::error!(error = %msg, "background session load failed");
-                    Err(msg)
-                }
-            };
-            // Receiver gone (a newer open superseded this one) is fine to ignore.
+            let result: LoadResult = (|| {
+                let coins = match known_coins {
+                    Some(c) => c,
+                    None => list_session_coins(&dir).map_err(|e| format!("{e:#}"))?,
+                };
+                let coin = if coin.is_empty() {
+                    coins.first().cloned().unwrap_or_default()
+                } else {
+                    coin
+                };
+                let started = Instant::now();
+                let data = if coin.is_empty() {
+                    SessionData::default()
+                } else {
+                    SessionData::from_dir_coin(&dir, &coin, window).map_err(|e| format!("{e:#}"))?
+                };
+                tracing::info!(
+                    coin = %coin,
+                    coins = coins.len(),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "coin load complete"
+                );
+                Ok(LoadedSession {
+                    dir,
+                    coins,
+                    coin,
+                    data,
+                })
+            })();
+            if let Err(ref e) = result {
+                tracing::error!(error = %e, "background load failed");
+            }
+            // Receiver gone (a newer load superseded this one) is fine to ignore.
             let _ = tx.send(result);
         });
         self.pending_load = Some(rx);
@@ -166,9 +299,9 @@ impl ViewerApp {
             return false;
         };
         match rx.try_recv() {
-            Ok(Ok((dir, data))) => {
+            Ok(Ok(loaded)) => {
                 self.pending_load = None;
-                self.apply_session(dir, data);
+                self.apply_loaded(loaded);
                 false
             }
             Ok(Err(msg)) => {
@@ -190,17 +323,39 @@ impl ViewerApp {
         }
     }
 
-    /// Swap in a freshly loaded session, resetting navigation and playback.
-    fn apply_session(&mut self, dir: String, data: SessionData) {
-        let first = data.coins().first().cloned().unwrap_or_default();
-        self.data = data;
-        self.nav = Navigator::new(first.clone());
-        self.playback = PlaybackClock::new(timeline_for(&self.data, &first));
-        self.play_started = None;
-        self.coin_filter.clear();
+    /// Swap in a freshly loaded coin slice, caching the outgoing coin so a
+    /// switch back to it is instant.
+    fn apply_loaded(&mut self, loaded: LoadedSession) {
+        let LoadedSession {
+            dir,
+            coins,
+            coin,
+            data,
+        } = loaded;
         self.dir = dir;
-        self.load_error = None;
-        self.price_series = self.data.price_series(&first);
+        self.all_coins = coins;
+        self.cache_current();
+        self.set_current(coin, data);
+        // If we had no manifest span, fall back to the loaded coin's own range
+        // so the window slider still has a sensible extent.
+        if self.session_span.is_none() {
+            self.session_span = self.data.time_range(&self.selected_coin);
+        }
+        self.window_edit = self
+            .window
+            .or(self.session_span)
+            .unwrap_or(self.window_edit);
+    }
+
+    /// Apply the edited window: reload the current coin restricted to it. The
+    /// cache is dropped because every coin's data is window-specific.
+    fn apply_window(&mut self, window: Option<(i64, i64)>) {
+        self.window = window;
+        self.coin_cache.clear();
+        let dir = self.dir.clone();
+        let known = self.all_coins.clone();
+        let coin = self.selected_coin.clone();
+        self.start_load(dir, coin, Some(known), window);
     }
 
     /// Apply paced playback: advance the navigator to the tick the wall clock
@@ -253,7 +408,8 @@ impl eframe::App for ViewerApp {
             .show(ctx, |ui| self.menu_bar(ui))
             .inner;
         if let Some(dir) = to_open {
-            self.open_session(dir);
+            // New folder: reset state for the new dir, then load its first coin.
+            self.open_folder(dir);
         }
 
         egui::SidePanel::left("coins_ladder")
@@ -295,8 +451,11 @@ impl ViewerApp {
                 self.coin_filter.clear();
             }
         });
-        let coins = self.data.coins();
+        // Coin list comes from the manifest universe (all_coins), independent
+        // of which single coin's books are currently loaded.
+        let coins = self.all_coins.clone();
         let needle = self.coin_filter.to_lowercase();
+        let selected_coin = self.selected_coin.clone();
         let mut pending: Option<String> = None;
         let mut shown = 0usize;
         egui::ScrollArea::vertical()
@@ -308,7 +467,7 @@ impl ViewerApp {
                         continue;
                     }
                     shown += 1;
-                    let selected = coin == self.nav.coin();
+                    let selected = *coin == selected_coin;
                     if ui.selectable_label(selected, coin).clicked() && !selected {
                         pending = Some(coin.clone());
                     }
@@ -318,7 +477,8 @@ impl ViewerApp {
                 }
             });
         if let Some(c) = pending {
-            self.switch_coin(&c);
+            // Instant from cache if we've loaded it before, else background load.
+            self.select_coin(c);
         }
 
         ui.separator();
@@ -405,6 +565,70 @@ impl ViewerApp {
                 self.play_started = None;
                 self.nav.seek_to_time(&self.data, t);
             }
+        }
+
+        self.window_controls(ui);
+    }
+
+    /// Load-window range control: two handles over the session span select the
+    /// `[start, end]` slice loaded for each coin. Reloading is expensive, so the
+    /// window only applies when "Load window" is pressed (not on every drag).
+    fn window_controls(&mut self, ui: &mut egui::Ui) {
+        let Some((span_lo, span_hi)) = self.session_span else {
+            return; // unknown span (no manifest): no window slider
+        };
+        if span_hi <= span_lo {
+            return;
+        }
+
+        ui.separator();
+        let mut apply: Option<Option<(i64, i64)>> = None;
+        ui.horizontal(|ui| {
+            ui.label("window");
+            // Clamp the working values into the span and keep start <= end.
+            let (mut lo, mut hi) = self.window_edit;
+            lo = lo.clamp(span_lo, span_hi);
+            hi = hi.clamp(span_lo, span_hi);
+
+            ui.add(egui::Slider::new(&mut lo, span_lo..=span_hi).show_value(false));
+            ui.add(egui::Slider::new(&mut hi, span_lo..=span_hi).show_value(false));
+            if lo > hi {
+                std::mem::swap(&mut lo, &mut hi);
+            }
+            self.window_edit = (lo, hi);
+
+            let dirty = self.window != Some((lo, hi));
+            if ui
+                .add_enabled(dirty, egui::Button::new("Load window"))
+                .clicked()
+            {
+                apply = Some(Some((lo, hi)));
+            }
+            // Quick presets.
+            if ui.button("24h").clicked() {
+                let end = (span_lo + DAY_MS).min(span_hi);
+                self.window_edit = (span_lo, end);
+                apply = Some(Some((span_lo, end)));
+            }
+            if ui
+                .add_enabled(self.window.is_some(), egui::Button::new("Full"))
+                .clicked()
+            {
+                self.window_edit = (span_lo, span_hi);
+                apply = Some(None);
+            }
+        });
+        // Show the selected window as UTC, plus its duration in hours.
+        let (lo, hi) = self.window_edit;
+        let hours = (hi - lo) as f64 / 3_600_000.0;
+        ui.monospace(format!(
+            "{}  →  {}   ({hours:.1}h)",
+            format_utc_ms(lo),
+            format_utc_ms(hi)
+        ));
+
+        if let Some(window) = apply {
+            self.apply_window(window);
         }
     }
 
