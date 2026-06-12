@@ -50,6 +50,7 @@ nav:
           - Autopilot & Scheduling: autopilot.md
           - Headless & Custom Callbacks: headless.md
           - Backtesting & Optimization: backtesting.md
+          - Digital Twin (offline simulation): digital-twin.md
       - More:
           - Troubleshooting: troubleshooting.md
           - Security & Disclaimer: security.md

@@ -1,0 +1,65 @@
+[package]
+name = "hl-recorder"
+version = "0.1.0"
+edition = "2021"
+description = "Hyperliquid Digital Twin — tick-by-tick L2/mids/trades recorder"
+license = "MIT"
+
+[[bin]]
+name = "hl-recorder"
+path = "src/main.rs"
+
+[[bin]]
+name = "hl-viewer"
+path = "src/bin/hl-viewer.rs"
+
+[[bin]]
+name = "hl-proxy"
+path = "src/bin/hl-proxy.rs"
+
+[[bin]]
+name = "hl-live"
+path = "src/bin/hl-live.rs"
+
+[[bin]]
+name = "hl-live-ofi"
+path = "src/bin/hl-live-ofi.rs"
+
+[lib]
+name = "hl_recorder"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["native-tls"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+arrow = "53"
+parquet = "53"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "1"
+chrono = { version = "0.4", features = ["clock"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+# Desktop viewer UI (used only by the `hl-viewer` binary). Re-exports `egui`.
+eframe = "0.29"
+# Native file/folder picker for the hl-viewer "File ▸ Open" menu. xdg-portal
+# avoids a build-time GTK dependency on Linux.
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+# ONNX Runtime bindings for the `hl-live` inference harness.
+ort = { version = "2.0.0-rc.10", features = ["download-binaries"] }
+
+[build-dependencies]
+# Used by build.rs to stamp a human-readable UTC build datetime into the binary.
+chrono = { version = "0.4", features = ["clock"] }
+
+[dev-dependencies]
+tempfile = "3"
+# `test-util` enables the paused-clock helpers used by the recorder timer tests.
+tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread", "time"] }

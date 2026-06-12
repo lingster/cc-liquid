@@ -83,6 +83,10 @@ execution:
   - `signer_env`: name of env var holding the private key for signing
 - `active_profile` selects the default profile, override with `set --active_profile` at runtime
 - `is_testnet: true` switches from mainnet to testnet
+- `provider: twin` routes all traffic to the local [Digital Twin Proxy](https://github.com/lingster/cc-liquid/tree/main/recorder#digital-twin-proxy-hl-proxy)
+  (`twin_proxy.url`, default `http://127.0.0.1:8088`) for offline playback /
+  simulated trading; `provider: live` (default) talks to Hyperliquid directly.
+  Equivalent one-off override: `--set provider=twin`.
 
 See more on how to generate Hyperliquid API wallets and private keys for safety: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/nonces-and-api-wallets
 

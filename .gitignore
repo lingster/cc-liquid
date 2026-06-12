@@ -39,3 +39,6 @@ history/
 *.pem
 private_key*
 wallet_key*
+
+# LibreOffice lock files
+.~lock.*#
