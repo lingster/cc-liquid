@@ -10,6 +10,7 @@ pub mod config;
 pub mod layout;
 pub mod navigator;
 pub mod playback;
+pub mod sampling;
 pub mod session_data;
 
 pub use config::{PriceChartConfig, ViewerConfig};

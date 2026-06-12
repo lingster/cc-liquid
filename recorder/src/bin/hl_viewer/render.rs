@@ -8,7 +8,7 @@
 use chrono::{DateTime, Utc};
 use eframe::egui;
 use hl_recorder::events::{L2Book, Level};
-use hl_recorder::viewer::SessionData;
+use hl_recorder::viewer::{sampling, SessionData};
 
 /// The per-coin snapshot timeline (ts_event_ms) the playback clock runs over.
 pub fn timeline_for(data: &SessionData, coin: &str) -> Vec<i64> {
@@ -199,6 +199,13 @@ pub fn render_price_chart(
     }
 
     let plot = rect.shrink(6.0);
+    // Sample down to the pixel budget: ~2 points per horizontal pixel is plenty
+    // for a line that's only `plot.width()` px wide, and turns millions of
+    // points into a few thousand to draw. The full series stays cached upstream.
+    let budget = ((plot.width().max(1.0) as usize) * 2).clamp(16, 8192);
+    let sampled = sampling::downsample(series, budget);
+    let series = sampled.as_slice();
+
     let t0 = series.first().unwrap().0;
     let t1 = series.last().unwrap().0;
     let t_span = (t1 - t0).max(1) as f64;

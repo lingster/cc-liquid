@@ -8,10 +8,15 @@
 //! hl-viewer <session_dir>      # e.g. hl-viewer sessions/smoke
 //! ```
 
-use std::time::Instant;
+use std::sync::mpsc::{channel, Receiver};
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use hl_recorder::viewer::{layout, Navigator, PlaybackClock, Section, SessionData, ViewerConfig};
+
+/// Result of a background session load: the folder that was opened plus its
+/// indexed data, or a human-readable error.
+type LoadResult = Result<(String, SessionData), String>;
 
 #[path = "hl_viewer/render.rs"]
 mod render;
@@ -25,6 +30,7 @@ use render::{
 const DEFAULT_CONFIG: &str = "hl-viewer-config.yaml";
 
 fn main() -> eframe::Result<()> {
+    init_tracing();
     let dir = std::env::args().nth(1).unwrap_or_else(|| {
         eprintln!("usage: hl-viewer <session_dir> [config.yaml]");
         std::process::exit(2);
@@ -32,6 +38,8 @@ fn main() -> eframe::Result<()> {
     let cfg_path = std::env::args().nth(2).unwrap_or_else(|| DEFAULT_CONFIG.to_string());
     let config = ViewerConfig::load_or_default(&cfg_path);
 
+    let started = Instant::now();
+    tracing::info!(dir = %dir, "loading initial session (blocking)");
     let data = match SessionData::from_dir(&dir) {
         Ok(d) => d,
         Err(e) => {
@@ -39,6 +47,12 @@ fn main() -> eframe::Result<()> {
             std::process::exit(1);
         }
     };
+    tracing::info!(
+        dir = %dir,
+        coins = data.coins().len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "initial session loaded"
+    );
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 760.0]),
@@ -49,6 +63,14 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |_cc| Ok(Box::new(ViewerApp::new(dir, data, config)))),
     )
+}
+
+/// Initialise tracing once. Honours `RUST_LOG` (e.g. `RUST_LOG=debug` for
+/// per-file load timings); defaults to `info`.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 
 /// eframe application state: wires the pure model to egui.
@@ -67,6 +89,13 @@ struct ViewerApp {
     load_error: Option<String>,
     /// Top-to-bottom order of the draggable content sections.
     section_order: Vec<Section>,
+    /// In-flight background session load. The heavy parquet decode runs off the
+    /// UI thread so the window stays responsive; the result arrives here.
+    pending_load: Option<Receiver<LoadResult>>,
+    /// Cached full mid-price series for the selected coin. Built once per coin
+    /// switch (it can be millions of points) so the chart doesn't rebuild it
+    /// every frame; the chart downsamples this to the pixel width when drawing.
+    price_series: Vec<(i64, f64)>,
 }
 
 impl ViewerApp {
@@ -74,6 +103,7 @@ impl ViewerApp {
         let first_coin = data.coins().first().cloned().unwrap_or_default();
         let nav = Navigator::new(first_coin.clone());
         let playback = PlaybackClock::new(timeline_for(&data, &first_coin));
+        let price_series = data.price_series(&first_coin);
         Self {
             dir,
             data,
@@ -84,6 +114,8 @@ impl ViewerApp {
             config,
             load_error: None,
             section_order: layout::default_order(),
+            pending_load: None,
+            price_series,
         }
     }
 
@@ -92,25 +124,83 @@ impl ViewerApp {
         self.nav.set_coin(coin);
         self.playback = PlaybackClock::new(timeline_for(&self.data, coin));
         self.play_started = None;
+        self.price_series = self.data.price_series(coin);
     }
 
-    /// Load a different session directory in place, resetting navigation and
-    /// playback. On failure the old session stays loaded and the error is shown
-    /// in the menu bar.
+    /// Begin loading a different session directory on a background thread. The
+    /// UI stays responsive and shows a "loading…" indicator; the result is
+    /// applied in [`Self::poll_pending_load`]. Large sessions (multi-GB parquet)
+    /// can take a while — watch the logs for per-file timing under `RUST_LOG`.
     fn open_session(&mut self, dir: String) {
-        match SessionData::from_dir(&dir) {
-            Ok(data) => {
-                let first = data.coins().first().cloned().unwrap_or_default();
-                self.data = data;
-                self.nav = Navigator::new(first.clone());
-                self.playback = PlaybackClock::new(timeline_for(&self.data, &first));
-                self.play_started = None;
-                self.coin_filter.clear();
-                self.dir = dir;
-                self.load_error = None;
+        tracing::info!(dir = %dir, "opening session on background thread");
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let result: LoadResult = match SessionData::from_dir(&dir) {
+                Ok(data) => {
+                    tracing::info!(
+                        dir = %dir,
+                        coins = data.coins().len(),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "background session load complete"
+                    );
+                    Ok((dir, data))
+                }
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    tracing::error!(error = %msg, "background session load failed");
+                    Err(msg)
+                }
+            };
+            // Receiver gone (a newer open superseded this one) is fine to ignore.
+            let _ = tx.send(result);
+        });
+        self.pending_load = Some(rx);
+        self.load_error = None;
+    }
+
+    /// Poll the background loader; apply the new session or surface its error.
+    /// Returns whether a load is still in flight (so the UI keeps repainting).
+    fn poll_pending_load(&mut self, ctx: &egui::Context) -> bool {
+        let Some(rx) = &self.pending_load else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(Ok((dir, data))) => {
+                self.pending_load = None;
+                self.apply_session(dir, data);
+                false
             }
-            Err(e) => self.load_error = Some(format!("open failed: {e:#}")),
+            Ok(Err(msg)) => {
+                self.pending_load = None;
+                self.load_error = Some(format!("open failed: {msg}"));
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // Still loading: keep the event loop ticking so we poll again
+                // and the spinner animates, without busy-spinning a core.
+                ctx.request_repaint_after(Duration::from_millis(100));
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.pending_load = None;
+                self.load_error = Some("open failed: loader thread terminated".into());
+                false
+            }
         }
+    }
+
+    /// Swap in a freshly loaded session, resetting navigation and playback.
+    fn apply_session(&mut self, dir: String, data: SessionData) {
+        let first = data.coins().first().cloned().unwrap_or_default();
+        self.data = data;
+        self.nav = Navigator::new(first.clone());
+        self.playback = PlaybackClock::new(timeline_for(&self.data, &first));
+        self.play_started = None;
+        self.coin_filter.clear();
+        self.dir = dir;
+        self.load_error = None;
+        self.price_series = self.data.price_series(&first);
     }
 
     /// Apply paced playback: advance the navigator to the tick the wall clock
@@ -154,6 +244,8 @@ impl ViewerApp {
 
 impl eframe::App for ViewerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Apply any finished background load before drawing this frame.
+        self.poll_pending_load(ctx);
         self.drive_playback(ctx);
 
         // Menu bar spans the full width at the very top.
@@ -337,6 +429,11 @@ impl ViewerApp {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
+            if self.pending_load.is_some() {
+                ui.separator();
+                ui.spinner();
+                ui.label("loading session…");
+            }
             if let Some(err) = &self.load_error {
                 ui.separator();
                 ui.colored_label(egui::Color32::from_rgb(220, 90, 90), err);
@@ -451,7 +548,6 @@ impl ViewerApp {
             ui.weak("click to seek");
         });
 
-        let series = self.data.price_series(coin);
         let current_ts = self
             .nav
             .current_snapshot(&self.data)
@@ -463,7 +559,9 @@ impl ViewerApp {
             full: egui::Color32::from_rgb(fr, fg, fb),
             elapsed: egui::Color32::from_rgb(er, eg, eb),
         };
-        render_price_chart(ui, &series, current_ts, &colors)
+        // Use the cached full series; render_price_chart downsamples it to the
+        // available pixel width before drawing.
+        render_price_chart(ui, &self.price_series, current_ts, &colors)
     }
 
     fn book_view(&mut self, ui: &mut egui::Ui) {

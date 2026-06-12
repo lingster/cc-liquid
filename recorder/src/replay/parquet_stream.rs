@@ -27,20 +27,44 @@ use crate::storage::tables::{ALL_MIDS_FILE, L2_BOOK_DIR, L2_BOOK_FILE, TRADES_FI
 /// merge reproduces the original event order.
 pub fn load_session(dir: impl AsRef<Path>) -> anyhow::Result<Vec<RecordedEvent>> {
     let dir = dir.as_ref();
+    let started = std::time::Instant::now();
     let tables = SessionTables::scan(dir)?;
+    tracing::info!(
+        dir = %dir.display(),
+        all_mids = tables.all_mids.len(),
+        l2_book = tables.l2_book.len(),
+        trades = tables.trades.len(),
+        "scanning session tables; decoding into memory"
+    );
+    // NOTE: this materialises every event into RAM (see by_seq below); there is
+    // no streaming. Very large sessions (multi-GB l2_book) are correspondingly
+    // memory- and time-heavy — the per-file debug logs show where time goes.
     let mut by_seq: BTreeMap<u64, RecordedEvent> = BTreeMap::new();
 
     for path in &tables.all_mids {
         load_all_mids(path, &mut by_seq)?;
     }
     for path in &tables.l2_book {
+        let t = std::time::Instant::now();
         load_l2_book(path, &mut by_seq)?;
+        tracing::debug!(
+            file = %path.display(),
+            events_so_far = by_seq.len(),
+            elapsed_ms = t.elapsed().as_millis() as u64,
+            "decoded l2_book file"
+        );
     }
     for path in &tables.trades {
         load_trades(path, &mut by_seq)?;
     }
 
-    Ok(by_seq.into_values().collect())
+    let events: Vec<RecordedEvent> = by_seq.into_values().collect();
+    tracing::info!(
+        events = events.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "session decode complete"
+    );
+    Ok(events)
 }
 
 /// The resolved table files of a session, across all supported layouts.
