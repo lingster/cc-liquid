@@ -11,6 +11,10 @@ replayable **Parquet** session. This is the *record* half of the
 record → replay → simulate pipeline; the replay engine and matching engine
 consume these sessions.
 
+For a step-by-step walkthrough of how the recorder talks to Hyperliquid (the
+HTTP `meta` fetch, WebSocket subscriptions, sharding and auto-reconnect), see
+[`docs/data-ingestion.md`](docs/data-ingestion.md).
+
 ## Build & test
 
 ```bash
@@ -267,6 +271,10 @@ EventSource (trait)            EventSink (trait)
 | `proxy` | Digital Twin Proxy (`hl-proxy`): wire-level capture, forward & playback |
 
 Built with red-green TDD: see the `#[cfg(test)]` modules and `tests/integration.rs`.
+
+The full connect → subscribe → ingest path (endpoints, coin validation,
+subscription frames, sharding, reconnect) is documented in
+[`docs/data-ingestion.md`](docs/data-ingestion.md).
 
 ## Replay engine
 
