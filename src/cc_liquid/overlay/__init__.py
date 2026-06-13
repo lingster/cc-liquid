@@ -11,6 +11,7 @@ from .client import HttpSignalSource
 from .config import OverlayConfig
 from .executor import Clock, FillResult, OrderGateway, OverlayExecutor
 from .gate import OverlayAction, OverlayDecision, decide
+from .gateway import HyperliquidOrderGateway, MarketData, OrderRequest, OrderSubmitter
 from .signal import MockSignalSource, Signal, SignalSource
 
 __all__ = [
@@ -26,4 +27,8 @@ __all__ = [
     "OrderGateway",
     "FillResult",
     "Clock",
+    "HyperliquidOrderGateway",
+    "OrderRequest",
+    "MarketData",
+    "OrderSubmitter",
 ]

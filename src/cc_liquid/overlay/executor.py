@@ -17,7 +17,7 @@ Policy per order:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from .config import OverlayConfig
 from .gate import OverlayAction, decide
@@ -33,6 +33,7 @@ class FillResult:
     detail: str
 
 
+@runtime_checkable
 class OrderGateway(Protocol):
     """The order actions the working loop needs, abstracted from the SDK."""
 
