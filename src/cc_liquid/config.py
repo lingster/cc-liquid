@@ -7,6 +7,8 @@ from typing import Any
 import yaml
 from dotenv import load_dotenv
 
+from .overlay.config import OverlayConfig
+
 DEFAULT_CONFIG_PATH = "cc-liquid-config.yaml"
 
 
@@ -62,6 +64,7 @@ class ExecutionConfig:
     min_trade_value: float = 10.0  # Exchange minimum order notional in USD
     order_type: str = "market"  # "market" or "limit"
     time_in_force: str = "Ioc"  # "Ioc" (Immediate or Cancel), "Gtc" (Good til Canceled), "Alo" (Add Liquidity Only)
+    overlay: OverlayConfig = field(default_factory=OverlayConfig)  # deepLOB execution overlay (P3)
 
 
 @dataclass
