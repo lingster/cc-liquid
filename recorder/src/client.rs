@@ -23,6 +23,16 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// Channel depth for the sharded fan-in (bounded for back-pressure).
 const SHARD_CHANNEL_DEPTH: usize = 4096;
 
+/// Hyperliquid closes WebSockets with no inbound traffic for 60s; the docs ask
+/// clients to send `{"method":"ping"}` on a shorter period. The resulting
+/// `{"channel":"pong"}` also guarantees a healthy connection always has
+/// traffic, so the idle watchdog (see [`crate::watchdog`]) only trips on
+/// genuinely dead links.
+const APP_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Application-level keepalive frame per the Hyperliquid WebSocket docs.
+const APP_PING_FRAME: &str = r#"{"method":"ping"}"#;
+
 /// Connect a **sharded** live source: split `coins` into groups of at most
 /// `shard_size`, open one WebSocket per group, and merge them concurrently.
 ///
@@ -54,6 +64,7 @@ pub async fn connect_sharded(
 pub struct WsSource {
     write: SplitSink<WsStream, Message>,
     read: SplitStream<WsStream>,
+    ping_timer: tokio::time::Interval,
 }
 
 impl WsSource {
@@ -67,7 +78,16 @@ impl WsSource {
             debug!("sent subscription: {sub}");
         }
 
-        Ok(Self { write, read })
+        let mut ping_timer = tokio::time::interval(APP_PING_INTERVAL);
+        ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Consume the immediate first tick; the first ping is one period in.
+        ping_timer.tick().await;
+
+        Ok(Self {
+            write,
+            read,
+            ping_timer,
+        })
     }
 }
 
@@ -75,18 +95,28 @@ impl WsSource {
 impl EventSource for WsSource {
     async fn next_message(&mut self) -> Option<anyhow::Result<String>> {
         loop {
-            match self.read.next().await {
-                Some(Ok(Message::Text(text))) => return Some(Ok(text.as_str().to_string())),
-                Some(Ok(Message::Ping(payload))) => {
-                    // Keep the connection alive; surface send failures.
-                    if let Err(e) = self.write.send(Message::Pong(payload)).await {
+            tokio::select! {
+                // Prefer draining frames; the keepalive only needs its period.
+                biased;
+                frame = self.read.next() => match frame {
+                    Some(Ok(Message::Text(text))) => return Some(Ok(text.as_str().to_string())),
+                    Some(Ok(Message::Ping(payload))) => {
+                        // Keep the connection alive; surface send failures.
+                        if let Err(e) = self.write.send(Message::Pong(payload)).await {
+                            return Some(Err(e.into()));
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => return None,
+                    // Pong/Binary/raw frames carry no recordable data.
+                    Some(Ok(_)) => continue,
+                    Some(Err(e)) => return Some(Err(e.into())),
+                },
+                _ = self.ping_timer.tick() => {
+                    if let Err(e) = self.write.send(Message::text(APP_PING_FRAME)).await {
                         return Some(Err(e.into()));
                     }
+                    debug!("sent application ping");
                 }
-                Some(Ok(Message::Close(_))) | None => return None,
-                // Pong/Binary/raw frames carry no recordable data.
-                Some(Ok(_)) => continue,
-                Some(Err(e)) => return Some(Err(e.into())),
             }
         }
     }

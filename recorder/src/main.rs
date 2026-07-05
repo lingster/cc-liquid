@@ -13,6 +13,7 @@ use hl_recorder::config::{Network, RecordConfig};
 use hl_recorder::crowdcent;
 use hl_recorder::info::fetch_meta_body;
 use hl_recorder::manifest::{AssetInfo, Counts, Manifest, SCHEMA_VERSION};
+use hl_recorder::notify::DiscordNotifier;
 use hl_recorder::reconnect::{ReconnectPolicy, ReconnectSource};
 use hl_recorder::recorder::Recorder;
 use hl_recorder::sink::EventSink;
@@ -20,6 +21,7 @@ use hl_recorder::source::EventSource;
 use hl_recorder::storage::{self, ParquetSink, RotatingSink, ShardedParquetSink};
 use hl_recorder::subscription::{build_subscriptions, StreamSelection};
 use hl_recorder::universe::validate_coins;
+use hl_recorder::watchdog::IdleTimeoutSource;
 
 /// A boxed source so single-connection and sharded transports share one type.
 type BoxedSource = Box<dyn EventSource + Send>;
@@ -96,6 +98,12 @@ struct Cli {
     /// while the new day records. Recommended for multi-day recordings.
     #[arg(long, default_value_t = false)]
     daily: bool,
+
+    /// Treat a connection with no inbound traffic for this many seconds as
+    /// dead and reconnect (a half-dead TCP link never errors on its own).
+    /// `0` disables the watchdog.
+    #[arg(long, default_value_t = 90)]
+    idle_timeout: u64,
 }
 
 impl Cli {
@@ -141,14 +149,41 @@ async fn main() -> anyhow::Result<()> {
 
     let (shard_size, l2_shards, daily) = (cli.shard_size, cli.l2_shards, cli.daily);
     let flush_interval = (cli.flush_interval > 0).then(|| Duration::from_secs(cli.flush_interval));
-    run(
+    let idle_timeout = (cli.idle_timeout > 0).then(|| Duration::from_secs(cli.idle_timeout));
+
+    // Operator alerting for unrecoverable failures (opt-in via env/.env).
+    let notifier = DiscordNotifier::from_env();
+    if notifier.is_some() {
+        info!("discord notifications enabled for unrecoverable errors");
+    }
+
+    let result = run(
         cli.into_config(),
         shard_size,
         l2_shards,
         flush_interval,
         daily,
+        idle_timeout,
     )
-    .await
+    .await;
+
+    if let Err(e) = &result {
+        if let Some(n) = &notifier {
+            n.send(&format!(
+                "🔴 **hl-recorder** exited with an unrecoverable error on `{}`:\n```\n{e:#}\n```",
+                hostname()
+            ))
+            .await;
+        }
+    }
+    result
+}
+
+/// Best-effort hostname for notification context.
+fn hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "unknown-host".to_string())
 }
 
 /// Resolve when a recording session should stop: the duration deadline (when
@@ -233,6 +268,7 @@ async fn run(
     l2_shards: usize,
     flush_interval: Option<Duration>,
     daily: bool,
+    idle_timeout: Option<Duration>,
 ) -> anyhow::Result<()> {
     let endpoint = cfg.network.ws_endpoint();
 
@@ -305,6 +341,12 @@ async fn run(
                 let subs = build_subscriptions(&coins, &streams);
                 Box::new(WsSource::connect(&endpoint, &subs).await?)
             };
+            // The watchdog turns a half-dead connection (silent, never errors)
+            // into a stream error so the reconnect layer can replace it.
+            let src: BoxedSource = match idle_timeout {
+                Some(t) => Box::new(IdleTimeoutSource::new(src, t)),
+                None => src,
+            };
             Ok::<BoxedSource, anyhow::Error>(src)
         }
     };
@@ -339,16 +381,24 @@ async fn run(
     };
 
     // Stop on the duration deadline *or* a graceful shutdown signal; either way
-    // `run_until` finalizes the sink so the Parquet footer is written.
+    // `run_until` finalizes the sink so the Parquet footer is written. Track
+    // whether the stop future actually fired: if the run ends any other way,
+    // the source was exhausted (reconnection gave up), which is unrecoverable
+    // and must surface as an error, not a clean exit.
+    let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = {
+        let stopped = stopped.clone();
+        let duration_secs = cfg.duration_secs;
+        async move {
+            wait_for_stop(duration_secs).await;
+            stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    };
     let stats = Recorder::new()
         .with_flush_interval(flush_interval)
-        .run_until(
-            &mut source,
-            &mut sink,
-            now_ms,
-            wait_for_stop(cfg.duration_secs),
-        )
+        .run_until(&mut source, &mut sink, now_ms, stop)
         .await?;
+    let source_exhausted = !stopped.load(std::sync::atomic::Ordering::SeqCst);
     let ended_at = chrono::Utc::now();
     // Record the actual elapsed wall-clock, which is the only meaningful value
     // when running unlimited (`--duration 0`) and matches the target otherwise.
@@ -382,5 +432,14 @@ async fn run(
         stats.ignored,
         stats.parse_errors
     );
+    if source_exhausted {
+        // The session on disk is finalized and valid, but the run did not end
+        // by operator intent — exit nonzero so a supervisor restarts us.
+        anyhow::bail!(
+            "event source exhausted (reconnection gave up after repeated failures); \
+             session finalized at {}",
+            cfg.out_dir.display()
+        );
+    }
     Ok(())
 }

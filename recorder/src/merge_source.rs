@@ -29,19 +29,31 @@ pub struct MergeSource {
 impl MergeSource {
     /// Spawn one reader task per source. The channel closes (yielding `None`)
     /// once every source is exhausted.
+    ///
+    /// A shard that ends while its siblings are still live is a *partial*
+    /// failure: without intervention the merged stream would keep flowing,
+    /// silently missing that shard's coins. Each reader therefore emits an
+    /// error frame when its source ends, so the reconnect layer tears down and
+    /// re-establishes the whole sharded connection set.
     pub fn spawn<S>(sources: Vec<S>, buffer: usize) -> Self
     where
         S: EventSource + Send + 'static,
     {
         let (tx, rx) = mpsc::channel(buffer.max(1));
-        for mut source in sources {
+        for (i, mut source) in sources.into_iter().enumerate() {
             let tx = tx.clone();
             tokio::spawn(async move {
                 while let Some(msg) = source.next_message().await {
                     if tx.send(msg).await.is_err() {
-                        break; // receiver dropped
+                        return; // receiver dropped
                     }
                 }
+                // Signal the partial failure; ignore send failure (shutdown).
+                let _ = tx
+                    .send(Err(anyhow::anyhow!(
+                        "shard {i} ended while merged stream is live"
+                    )))
+                    .await;
             });
         }
         // Drop the original handle so the channel ends when all tasks finish.
@@ -82,8 +94,14 @@ mod tests {
         let mut merged = MergeSource::spawn(vec![s1, s2], 16);
 
         let mut seen = HashSet::new();
+        let mut shard_end_errors = 0;
         while let Some(msg) = merged.next_message().await {
-            seen.insert(msg.unwrap());
+            match msg {
+                Ok(text) => {
+                    seen.insert(text);
+                }
+                Err(_) => shard_end_errors += 1,
+            }
         }
         // All five messages arrive (interleaving order is not guaranteed).
         assert_eq!(
@@ -93,12 +111,16 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect()
         );
+        // Each shard's end is surfaced so a live consumer can reconnect.
+        assert_eq!(shard_end_errors, 2);
     }
 
     #[tokio::test]
-    async fn ends_when_all_sources_drained() {
+    async fn a_dead_shard_surfaces_as_an_error() {
         let merged = MergeSource::spawn(vec![ScriptedSource::new(vec![])], 4);
         let mut merged = merged;
+        let err = merged.next_message().await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("shard 0 ended"), "{err}");
         assert!(merged.next_message().await.is_none());
     }
 }
