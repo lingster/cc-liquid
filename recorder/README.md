@@ -168,6 +168,40 @@ next flush/finalize rather than silently dropped. The replay loader,
 is globally monotonic across days, so the per-day files merge back into one
 ordered event stream.
 
+## Production: supervised long-run capture
+
+The production instance is not launched as a bare `hl-recorder`; it runs under
+`scripts/run-recorder.sh`, which:
+
+- starts `target/release/hl-recorder`, passing through any arguments (with no
+  arguments, `./config.yaml` supplies everything — the committed one records
+  the CrowdCent universe daily-rotated to `/data/hyperliquid/sessions/long-run`);
+- appends all recorder output to `<out>/recorder.log` (override with
+  `HL_RECORDER_LOG`), resolving `<out>` the same way the binary does;
+- **restarts on abnormal exit** (crash, reconnect exhaustion) with 5s→300s
+  exponential backoff, reset after a stable >10-minute run;
+- **stops** when the recorder exits cleanly (Ctrl-C / SIGTERM / `--duration`
+  reached), so an operator stop is honored;
+- posts to Discord on every crash-restart and on supervisor exit when
+  `DISCORD_WEBHOOK_URL` is set (environment or `.env`; the recorder itself
+  also notifies on unrecoverable errors).
+
+Launch it in a tmux window so it survives the terminal:
+
+```bash
+tmux new-window -t hl -n recorder -c "$(pwd)" 'exec ./scripts/run-recorder.sh'
+```
+
+Check on it with `tmux attach -t hl` (window `recorder`) or
+`tail -f /data/hyperliquid/sessions/long-run/recorder.log`. Stop it with a
+single Ctrl-C in that window (graceful: the Parquet footers are written and
+the supervisor does not restart).
+
+> **Same-day restart caveat:** the Parquet sinks truncate existing files on
+> open, so restarting into a session directory that already has files for the
+> current UTC day overwrites that day's earlier capture. Move the current
+> day's `YYYYMMDD_*` files aside first if they must be kept.
+
 ## Output session layout
 
 ```
