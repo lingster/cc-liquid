@@ -516,3 +516,10 @@ What scales now: mids/FX for the entire universe (one global subscription),
 multi-coin record/replay, and parallel L2 writes. The remaining bottleneck for
 the *full* universe with L2 is central JSON parsing (single consumer); parsing in
 the shard tasks would be the next step.
+
+# Disk space/usage
+as of 2026-07-19 we are storing to /data/hyperliquid/sessions/long-run which
+is the md0 / root disk. this has approx 3 years of recording space based on
+~550mb/day. We should aim to move this to /mnt/archive/hyperliquid so we
+can test performance of using sda/b drives
+
