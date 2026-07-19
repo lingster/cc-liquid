@@ -265,6 +265,60 @@ mod tests {
     }
 
     #[test]
+    fn same_day_restart_appends_to_all_tables() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // First run: records seqs 0..=2, stops cleanly (footer written).
+        let mut sink = ParquetSink::create(dir.path()).unwrap();
+        sink.write(&rec(
+            0,
+            MarketEvent::AllMids(AllMids {
+                mids: vec![("BTC".into(), 95000.0)],
+            }),
+        ))
+        .unwrap();
+        sink.write(&rec(
+            1,
+            MarketEvent::Trades(vec![Trade {
+                coin: "BTC".into(),
+                side: Side::Buy,
+                px: 95000.0,
+                sz: 0.1,
+                time_ms: 1,
+            }]),
+        ))
+        .unwrap();
+        sink.finalize().unwrap();
+
+        // Restart into the same directory: previous rows must survive.
+        let mut sink = ParquetSink::create(dir.path()).unwrap();
+        sink.write(&rec(
+            2,
+            MarketEvent::AllMids(AllMids {
+                mids: vec![("ETH".into(), 3200.0)],
+            }),
+        ))
+        .unwrap();
+        sink.write(&rec(
+            3,
+            MarketEvent::Trades(vec![Trade {
+                coin: "ETH".into(),
+                side: Side::Sell,
+                px: 3200.0,
+                sz: 1.0,
+                time_ms: 3,
+            }]),
+        ))
+        .unwrap();
+        sink.finalize().unwrap();
+
+        assert_eq!(read_row_count(&dir.path().join(ALL_MIDS_FILE)), 2);
+        assert_eq!(read_row_count(&dir.path().join(TRADES_FILE)), 2);
+        // The L2 table saw no rows in either run but stays a valid empty file.
+        assert_eq!(read_row_count(&dir.path().join(L2_BOOK_FILE)), 0);
+    }
+
+    #[test]
     fn periodic_flush_preserves_all_rows() {
         let dir = tempfile::tempdir().unwrap();
         let mut sink = ParquetSink::with_flush_threshold(dir.path(), 2).unwrap();

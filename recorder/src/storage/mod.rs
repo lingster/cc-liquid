@@ -8,4 +8,4 @@ pub mod tables;
 pub use parquet_sink::ParquetSink;
 pub use rotating::RotatingSink;
 pub use sharded::ShardedParquetSink;
-pub use tables::{ALL_MIDS_FILE, L2_BOOK_DIR, L2_BOOK_FILE, TRADES_FILE};
+pub use tables::{max_existing_seq, ALL_MIDS_FILE, L2_BOOK_DIR, L2_BOOK_FILE, TRADES_FILE};

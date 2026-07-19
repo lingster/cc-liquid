@@ -6,15 +6,17 @@
 //! compatible (DRY).
 
 use std::fs::File;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray, UInt32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
+use tracing::{info, warn};
 
 use crate::events::{L2Book, Trade};
 
@@ -33,6 +35,15 @@ pub fn writer_props() -> WriterProperties {
 
 /// Manages a single Parquet file: lazily opens on first write, and guarantees
 /// the file exists (with schema) even when no rows were produced.
+///
+/// **Same-day restart append:** Parquet cannot be appended in place (one
+/// footer, at the end), so opening a path that already holds data would
+/// otherwise truncate it — which is how a restart used to clobber the current
+/// day's earlier capture. Instead, the existing file is renamed aside and its
+/// rows are copied into the fresh writer before new rows flow, so a restart
+/// *appends*. An existing file that cannot be read back (e.g. footerless after
+/// a hard crash) is preserved next to the new file as `*.unrecovered-*` rather
+/// than deleted.
 pub struct TableFile {
     path: PathBuf,
     schema: Arc<Schema>,
@@ -50,12 +61,16 @@ impl TableFile {
 
     pub fn write_batch(&mut self, batch: &RecordBatch) -> anyhow::Result<()> {
         if self.writer.is_none() {
+            let carried_over = existing_nonempty(&self.path)
+                .map(|prev| set_aside(&self.path, &prev))
+                .transpose()?;
             let file = File::create(&self.path)?;
-            self.writer = Some(ArrowWriter::try_new(
-                file,
-                self.schema.clone(),
-                Some(writer_props()),
-            )?);
+            let mut writer =
+                ArrowWriter::try_new(file, self.schema.clone(), Some(writer_props()))?;
+            if let Some(prev) = carried_over {
+                copy_rows_forward(&prev, &mut writer, &self.path)?;
+            }
+            self.writer = Some(writer);
         }
         self.writer.as_mut().unwrap().write(batch)?;
         Ok(())
@@ -82,6 +97,110 @@ impl TableFile {
         }
         Ok(())
     }
+}
+
+/// `Some(path)` when a previous file with actual content sits at `path`.
+fn existing_nonempty(path: &Path) -> Option<PathBuf> {
+    match std::fs::metadata(path) {
+        Ok(m) if m.len() > 0 => Some(path.to_path_buf()),
+        _ => None,
+    }
+}
+
+/// Rename `prev` aside under a unique name so a crash between the rename and
+/// the copy can never destroy already-captured data (a later restart must not
+/// re-use the same aside name and clobber it).
+fn set_aside(path: &Path, prev: &Path) -> anyhow::Result<PathBuf> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("table.parquet");
+    let aside = path.with_file_name(format!("{name}.prev-{nanos}"));
+    std::fs::rename(prev, &aside)?;
+    Ok(aside)
+}
+
+/// Stream every row of `prev` into `writer` (append-on-restart), then delete
+/// it. An unreadable `prev` (footerless crash leftover, foreign schema) is
+/// preserved as `*.unrecovered-*` and recording continues with new rows only —
+/// losing the new capture over an old file's corruption would be worse.
+fn copy_rows_forward(
+    prev: &Path,
+    writer: &mut ArrowWriter<File>,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let mut copy = || -> anyhow::Result<usize> {
+        let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(prev)?)?.build()?;
+        let mut rows = 0usize;
+        for batch in reader {
+            let batch = batch?;
+            rows += batch.num_rows();
+            writer.write(&batch)?;
+        }
+        Ok(rows)
+    };
+    match copy() {
+        Ok(rows) => {
+            std::fs::remove_file(prev)?;
+            info!(
+                "appended {rows} existing row(s) from a previous run into {}",
+                path.display()
+            );
+        }
+        Err(e) => {
+            let name = prev.to_string_lossy().replace(".prev-", ".unrecovered-");
+            let kept = PathBuf::from(name);
+            let _ = std::fs::rename(prev, &kept);
+            warn!(
+                "existing {} is not readable ({e:#}); preserved as {} and recording fresh",
+                path.display(),
+                kept.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Highest `seq` present across a session's existing (readable) table files
+/// with the given day `prefix` — `None` when no rows exist yet. Used on
+/// restart to seed the sequencer past what is already on disk, so an appended
+/// day keeps one monotonic `seq` sequence. Unreadable files are skipped: their
+/// rows are not carried forward either, so they cannot collide.
+pub fn max_existing_seq(dir: &Path, prefix: &str) -> Option<u64> {
+    let mut paths = vec![
+        dir.join(format!("{prefix}{ALL_MIDS_FILE}")),
+        dir.join(format!("{prefix}{TRADES_FILE}")),
+        dir.join(format!("{prefix}{L2_BOOK_FILE}")),
+    ];
+    if let Ok(parts) = std::fs::read_dir(dir.join(format!("{prefix}{L2_BOOK_DIR}"))) {
+        paths.extend(parts.flatten().map(|e| e.path()).filter(|p| {
+            p.extension().is_some_and(|x| x == "parquet")
+        }));
+    }
+    paths.iter().filter_map(|p| max_seq_in_file(p)).max()
+}
+
+/// Max of the `seq` column in one parquet file, or `None` if unreadable/empty.
+fn max_seq_in_file(path: &Path) -> Option<u64> {
+    let file = File::open(path).ok()?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
+    let seq_idx = builder.schema().index_of("seq").ok()?;
+    let mask = parquet::arrow::ProjectionMask::roots(builder.parquet_schema(), [seq_idx]);
+    let reader = builder.with_projection(mask).build().ok()?;
+    reader
+        .flatten()
+        .filter_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .and_then(arrow::compute::max)
+        })
+        .max()
 }
 
 /// Column buffers for the `all_mids` table.
@@ -251,5 +370,132 @@ impl TradesBuffer {
             Arc::new(Int64Array::from(std::mem::take(&mut self.trade_time_ms))),
         ];
         Ok(RecordBatch::try_new(Self::schema(), cols)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mids_batch(seqs: &[u64]) -> RecordBatch {
+        let mut buf = MidsBuffer::default();
+        for &s in seqs {
+            buf.push(s, s as i64, s as i64, "BTC", 1.0);
+        }
+        buf.drain_to_batch().unwrap()
+    }
+
+    fn read_seqs(path: &Path) -> Vec<u64> {
+        let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+        reader
+            .flat_map(|b| {
+                let b = b.unwrap();
+                let idx = b.schema().index_of("seq").unwrap();
+                b.column(idx)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    fn siblings_matching(dir: &Path, pattern: &str) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().contains(pattern))
+            .collect()
+    }
+
+    #[test]
+    fn reopening_a_table_file_appends_instead_of_truncating() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mids.parquet");
+
+        let mut first = TableFile::new(path.clone(), MidsBuffer::schema());
+        first.write_batch(&mids_batch(&[0, 1, 2])).unwrap();
+        first.close().unwrap();
+
+        // The same-day restart: a fresh TableFile at the same path.
+        let mut second = TableFile::new(path.clone(), MidsBuffer::schema());
+        second.write_batch(&mids_batch(&[3, 4])).unwrap();
+        second.close().unwrap();
+
+        assert_eq!(read_seqs(&path), vec![0, 1, 2, 3, 4]);
+        assert!(
+            siblings_matching(dir.path(), ".prev-").is_empty(),
+            "carried-over file must be removed after a successful copy"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_existing_file_is_preserved_not_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mids.parquet");
+        // A footerless crash leftover: bytes that are not readable parquet.
+        std::fs::write(&path, b"PAR1 crashed mid-write, no footer").unwrap();
+
+        let mut table = TableFile::new(path.clone(), MidsBuffer::schema());
+        table.write_batch(&mids_batch(&[9])).unwrap();
+        table.close().unwrap();
+
+        // New capture is intact...
+        assert_eq!(read_seqs(&path), vec![9]);
+        // ...and the unreadable bytes were kept for manual salvage.
+        let kept = siblings_matching(dir.path(), ".unrecovered-");
+        assert_eq!(kept.len(), 1, "crash leftover must be preserved");
+        assert_eq!(
+            std::fs::read(&kept[0]).unwrap(),
+            b"PAR1 crashed mid-write, no footer"
+        );
+    }
+
+    #[test]
+    fn max_existing_seq_scans_all_tables_including_l2_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = "20260719_";
+
+        let mut mids = TableFile::new(
+            dir.path().join(format!("{prefix}{ALL_MIDS_FILE}")),
+            MidsBuffer::schema(),
+        );
+        mids.write_batch(&mids_batch(&[0, 5])).unwrap();
+        mids.close().unwrap();
+
+        // The highest seq lives in an L2 part-file, not the mids table.
+        let part_dir = dir.path().join(format!("{prefix}{L2_BOOK_DIR}"));
+        std::fs::create_dir_all(&part_dir).unwrap();
+        let mut book = TableFile::new(part_dir.join("part-0001.parquet"), BookBuffer::schema());
+        let mut buf = BookBuffer::default();
+        buf.push_book(
+            42,
+            1,
+            1,
+            &L2Book {
+                coin: "BTC".into(),
+                time_ms: 1,
+                bids: vec![],
+                asks: vec![crate::events::Level {
+                    px: 1.0,
+                    sz: 1.0,
+                    n: 1,
+                }],
+            },
+        );
+        book.write_batch(&buf.drain_to_batch().unwrap()).unwrap();
+        book.close().unwrap();
+
+        assert_eq!(max_existing_seq(dir.path(), prefix), Some(42));
+        // A different prefix (fresh day) sees nothing.
+        assert_eq!(max_existing_seq(dir.path(), "20260720_"), None);
+        // Unreadable files are skipped rather than failing the scan.
+        std::fs::write(dir.path().join(format!("{prefix}{TRADES_FILE}")), b"junk").unwrap();
+        assert_eq!(max_existing_seq(dir.path(), prefix), Some(42));
     }
 }

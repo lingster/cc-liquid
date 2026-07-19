@@ -16,6 +16,12 @@ impl Sequencer {
         Self { next_seq: 0 }
     }
 
+    /// Start numbering at `first` instead of 0 — used when a restart appends
+    /// to existing session files, so `seq` stays monotonic across the gap.
+    pub fn starting_at(first: u64) -> Self {
+        Self { next_seq: first }
+    }
+
     /// Wrap a parsed event with a fresh `seq` and the supplied local receive
     /// time. The exchange event time is extracted from the payload when present,
     /// otherwise it falls back to `ts_recv_ms`.
@@ -60,6 +66,14 @@ mod tests {
         assert_eq!(a.seq, 0);
         assert_eq!(b.seq, 1);
         assert_eq!(s.count(), 2);
+    }
+
+    #[test]
+    fn starting_at_continues_an_existing_sequence() {
+        let mut s = Sequencer::starting_at(100);
+        let ev = s.wrap(MarketEvent::AllMids(AllMids { mids: vec![] }), 1);
+        assert_eq!(ev.seq, 100);
+        assert_eq!(s.count(), 101);
     }
 
     #[test]

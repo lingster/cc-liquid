@@ -2,3 +2,4 @@
 *.parquet
 sessions/
 rpc_log.jsonl
+.*.swp

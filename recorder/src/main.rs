@@ -439,7 +439,23 @@ async fn run(
             stopped.store(true, std::sync::atomic::Ordering::SeqCst);
         }
     };
+    // A restart into a session dir with same-day files *appends* to them (the
+    // sinks copy existing rows forward on open); continue `seq` past what is
+    // already on disk so the merged files keep one monotonic sequence.
+    let resume_prefix = if daily {
+        storage::rotating::day_prefix(now_ms())
+    } else {
+        String::new()
+    };
+    let start_seq = storage::max_existing_seq(&cfg.out_dir, &resume_prefix)
+        .map(|s| s + 1)
+        .unwrap_or(0);
+    if start_seq > 0 {
+        info!("appending to existing {resume_prefix}* files; seq resumes at {start_seq}");
+    }
+
     let stats = Recorder::new()
+        .with_start_seq(start_seq)
         .with_flush_interval(flush_interval)
         .run_until(&mut source, &mut sink, now_ms, stop)
         .await?;

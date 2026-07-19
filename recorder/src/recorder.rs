@@ -82,6 +82,14 @@ impl Recorder {
         self
     }
 
+    /// Start `seq` numbering at `first` (0 for a fresh session). A restart that
+    /// appends to existing files passes max-existing-seq + 1 so the merged
+    /// files keep one monotonic `seq` sequence.
+    pub fn with_start_seq(mut self, first: u64) -> Self {
+        self.sequencer = Sequencer::starting_at(first);
+        self
+    }
+
     /// Set the periodic flush cadence. `None` disables time-based flushing
     /// (data is still flushed at the row-count threshold and on finalize).
     pub fn with_flush_interval(mut self, interval: Option<Duration>) -> Self {

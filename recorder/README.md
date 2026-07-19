@@ -197,10 +197,13 @@ Check on it with `tmux attach -t hl` (window `recorder`) or
 single Ctrl-C in that window (graceful: the Parquet footers are written and
 the supervisor does not restart).
 
-> **Same-day restart caveat:** the Parquet sinks truncate existing files on
-> open, so restarting into a session directory that already has files for the
-> current UTC day overwrites that day's earlier capture. Move the current
-> day's `YYYYMMDD_*` files aside first if they must be kept.
+**Same-day restarts append.** Parquet cannot be appended in place, so on open
+each sink copies an existing same-day file's rows forward into the fresh
+writer before new rows flow — a restart merges into one file per table per
+day, and `seq` resumes past the highest value already on disk so the day stays
+monotonically ordered. An existing file that cannot be read back (footerless
+after a hard crash) is preserved next to the new one as `*.unrecovered-*`
+rather than deleted.
 
 ## Output session layout
 
