@@ -1,0 +1,16 @@
+# hl-recorder configuration. Keys mirror the CLI flags; explicit CLI flags
+# override these values, unset keys fall back to built-in defaults.
+# Secrets (CROWDCENT_API_KEY, DISCORD_WEBHOOK_URL) stay in .env, never here.
+
+# Coin universe: latest CrowdCent meta-model release.
+cc: true
+
+# Long-run production capture: daily-rotated files, L2 writes fanned across
+# 4 parquet part-files.
+daily: true
+l2_shards: 4
+out: /data/hyperliquid/sessions/long-run
+
+# Connection watchdog: reconnect after 90s of silence (default, spelled out
+# here for visibility).
+idle_timeout: 90

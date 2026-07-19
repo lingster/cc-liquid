@@ -20,6 +20,7 @@ pub mod reconnect;
 pub mod recorder;
 pub mod replay;
 pub mod sequencer;
+pub mod settings;
 pub mod sim;
 pub mod sink;
 pub mod source;

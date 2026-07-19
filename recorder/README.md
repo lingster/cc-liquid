@@ -30,22 +30,33 @@ hl-recorder --assets BTC,ETH,SOL --out sessions/demo
 
 # Or record the CrowdCent meta-model universe (coins of its latest release)
 hl-recorder --cc --duration 300 --out sessions/crowdcent
+
+# Or drive everything from a config file (flags still override it)
+hl-recorder --config config.yaml
 ```
+
+Settings are layered: **CLI flags > `--config` YAML file > built-in defaults**.
+When `--config` is omitted, `./config.yaml` is loaded if present. The YAML keys
+are the flag names with underscores (`out`, `cc`, `l2_shards`, `no_l2`, ...);
+unknown keys are rejected. Secrets never go in the config file — they stay in
+the environment / `.env`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--config` | `./config.yaml` if present | YAML config file with the same keys as these flags |
 | `--assets` | — | Comma-separated coins, e.g. `BTC,ETH,SOL`. Optional when `--cc` is used |
 | `--cc` | off | Source the coin list from the CrowdCent meta model instead of `--assets` |
 | `--cc-challenge` | `hyperliquid-ranking` | CrowdCent challenge slug to pull the universe from |
 | `--cc-url` | `https://crowdcent.com/api` | CrowdCent API base URL |
 | `--duration` | `0` | Recording length in seconds. `0` = record until stopped by a signal (Ctrl-C / SIGTERM) |
 | `--network` | `mainnet` | `mainnet` or `testnet` |
-| `--out` | (required) | Output session directory |
+| `--out` | `/data/hyperliquid/sessions` | Output session directory |
 | `--no-l2` / `--no-trades` / `--no-mids` | off | Drop a stream from the recording |
 | `--shard-size` | `0` | Coins per WebSocket connection (`0` = single); see *Scaling* |
 | `--l2-shards` | `1` | Parallel L2 Parquet part-files; see *Scaling* |
 | `--flush-interval` | `300` | Flush buffered rows to disk at least every N seconds (`0` disables); see *Durability* |
 | `--daily` | off | Rotate output files at midnight UTC with `YYYYMMDD_` prefixes; see *Daily rotation* |
+| `--idle-timeout` | `90` | Reconnect after N seconds with no inbound traffic (`0` disables the watchdog) |
 
 Set `RUST_LOG=debug` for verbose subscription/transport logging.
 

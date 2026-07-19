@@ -2,21 +2,47 @@
 # Supervise hl-recorder: restart it on abnormal exit and notify Discord.
 #
 # Usage: scripts/run-recorder.sh [hl-recorder args...]
-#   e.g. scripts/run-recorder.sh --cc --daily --l2-shards 4 --out sessions/long-run
+#   Settings come from ./config.yaml (or --config <path>); CLI args override.
 #
 # Behaviour:
 #   - exit code 0 (operator stop via SIGTERM/SIGINT/duration) -> supervisor stops
 #   - nonzero exit (crash, reconnect exhaustion)              -> notify + restart
 #   - restart backoff doubles 5s..300s, resets after a stable (>10 min) run
 #   - all recorder output is appended to $HL_RECORDER_LOG (default:
-#     hl-recorder.log next to this repo's recorder root)
+#     <out>/recorder.log, with <out> resolved like the recorder does:
+#     --out arg > config.yaml `out:` > /data/hyperliquid/sessions)
 #   - DISCORD_WEBHOOK_URL is read from the environment or ./.env (never log it)
 
 set -u
 
 cd "$(dirname "$0")/.."
 BIN=target/release/hl-recorder
-LOG="${HL_RECORDER_LOG:-hl-recorder.log}"
+
+# Resolve the recorder's output dir the same way the binary will, so the log
+# lands next to the data: --out/--out= in args, then `out:` in the config file
+# (--config in args, else ./config.yaml), then the built-in default.
+resolve_out() {
+    local prev="" cfg=config.yaml out=""
+    for a in "$@"; do
+        case "$prev" in
+            --out) out=$a ;;
+            --config) cfg=$a ;;
+        esac
+        case "$a" in
+            --out=*) out=${a#--out=} ;;
+            --config=*) cfg=${a#--config=} ;;
+        esac
+        prev=$a
+    done
+    if [ -z "$out" ] && [ -f "$cfg" ]; then
+        out=$(sed -n 's/^out:[[:space:]]*//p' "$cfg" | head -1 | tr -d '"'"'")
+    fi
+    printf '%s' "${out:-/data/hyperliquid/sessions}"
+}
+
+OUT=$(resolve_out "$@")
+LOG="${HL_RECORDER_LOG:-$OUT/recorder.log}"
+mkdir -p "$OUT" || { echo "[supervisor] cannot create out dir $OUT" >&2; exit 1; }
 
 # .env as a fallback for DISCORD_WEBHOOK_URL etc. (real env vars win).
 if [ -f .env ]; then

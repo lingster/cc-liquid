@@ -9,13 +9,14 @@ use clap::Parser;
 use tracing::{info, warn};
 
 use hl_recorder::client::{connect_sharded, WsSource};
-use hl_recorder::config::{Network, RecordConfig};
+use hl_recorder::config::RecordConfig;
 use hl_recorder::crowdcent;
 use hl_recorder::info::fetch_meta_body;
 use hl_recorder::manifest::{AssetInfo, Counts, Manifest, SCHEMA_VERSION};
 use hl_recorder::notify::DiscordNotifier;
 use hl_recorder::reconnect::{ReconnectPolicy, ReconnectSource};
 use hl_recorder::recorder::Recorder;
+use hl_recorder::settings::{self, PartialConfig, Settings};
 use hl_recorder::sink::EventSink;
 use hl_recorder::source::EventSource;
 use hl_recorder::storage::{self, ParquetSink, RotatingSink, ShardedParquetSink};
@@ -29,9 +30,18 @@ type BoxedSource = Box<dyn EventSource + Send>;
 const MANIFEST_FILE: &str = "manifest.json";
 
 /// Record tick-by-tick Hyperliquid L2 book, mids and trades to Parquet.
+///
+/// Every flag is one layer over a YAML config file (`--config`, default
+/// `./config.yaml` when present) which uses the same names; explicit CLI flags
+/// win, then the file, then built-in defaults.
 #[derive(Parser, Debug)]
 #[command(name = "hl-recorder", version)]
 struct Cli {
+    /// YAML config file with the same keys as these flags. When omitted,
+    /// `./config.yaml` is loaded if it exists.
+    #[arg(long)]
+    config: Option<PathBuf>,
+
     /// Comma-separated coins, e.g. `BTC,ETH,SOL`. Optional when `--cc` is given.
     #[arg(long, value_delimiter = ',')]
     assets: Vec<String>,
@@ -40,85 +50,108 @@ struct Cli {
     /// Downloads the challenge's consolidated meta model and records the coins of
     /// its latest release. Requires `CROWDCENT_API_KEY` (read from the
     /// environment or a `.env` file).
-    #[arg(long, default_value_t = false)]
-    cc: bool,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    cc: Option<bool>,
 
     /// CrowdCent challenge slug to pull the coin universe from (with `--cc`).
-    #[arg(long, default_value = crowdcent::DEFAULT_CHALLENGE_SLUG)]
-    cc_challenge: String,
+    #[arg(long)]
+    cc_challenge: Option<String>,
 
     /// CrowdCent API base URL (with `--cc`).
-    #[arg(long, default_value = crowdcent::DEFAULT_BASE_URL)]
-    cc_url: String,
+    #[arg(long)]
+    cc_url: Option<String>,
 
     /// Recording duration in seconds (e.g. 300 for 5 minutes). `0` (the default)
     /// records until stopped by a shutdown signal (Ctrl-C / SIGTERM), finalizing
     /// the Parquet at that point.
-    #[arg(long, default_value_t = 0)]
-    duration: u64,
-
-    /// Target network.
-    #[arg(long, default_value = "mainnet")]
-    network: Network,
-
-    /// Output session directory.
     #[arg(long)]
-    out: PathBuf,
+    duration: Option<u64>,
+
+    /// Target network (mainnet|testnet). Default: mainnet.
+    #[arg(long)]
+    network: Option<String>,
+
+    /// Output session directory. Default: /data/hyperliquid/sessions.
+    #[arg(long)]
+    out: Option<PathBuf>,
 
     /// Skip the L2 book stream (mids/trades only).
-    #[arg(long, default_value_t = false)]
-    no_l2: bool,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    no_l2: Option<bool>,
 
     /// Skip the trades stream.
-    #[arg(long, default_value_t = false)]
-    no_trades: bool,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    no_trades: Option<bool>,
 
     /// Skip the all-mids stream.
-    #[arg(long, default_value_t = false)]
-    no_mids: bool,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    no_mids: Option<bool>,
 
     /// Coins per WebSocket connection. `0` = single connection. Use a smaller
     /// value to shard full-universe L2 capture across many connections.
-    #[arg(long, default_value_t = 0)]
-    shard_size: usize,
+    #[arg(long)]
+    shard_size: Option<usize>,
 
     /// Number of parallel L2 Parquet part-files. `1` = single `l2_book.parquet`;
     /// higher values fan L2 writes across that many worker threads/files.
-    #[arg(long, default_value_t = 1)]
-    l2_shards: usize,
+    #[arg(long)]
+    l2_shards: Option<usize>,
 
     /// Flush buffered rows to disk at least this often (seconds). `0` disables
     /// the time-based flush (rows are still flushed at the row-count threshold
     /// and on shutdown). The Parquet footer is only written on shutdown.
-    #[arg(long, default_value_t = 300)]
-    flush_interval: u64,
+    #[arg(long)]
+    flush_interval: Option<u64>,
 
     /// Rotate output files at midnight UTC: each day's tables get a
     /// `YYYYMMDD_` prefix and are finalized (footer written) in the background
     /// while the new day records. Recommended for multi-day recordings.
-    #[arg(long, default_value_t = false)]
-    daily: bool,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    daily: Option<bool>,
 
     /// Treat a connection with no inbound traffic for this many seconds as
     /// dead and reconnect (a half-dead TCP link never errors on its own).
-    /// `0` disables the watchdog.
-    #[arg(long, default_value_t = 90)]
-    idle_timeout: u64,
+    /// `0` disables the watchdog. Default: 90.
+    #[arg(long)]
+    idle_timeout: Option<u64>,
 }
 
 impl Cli {
-    fn into_config(self) -> RecordConfig {
-        RecordConfig {
-            network: self.network,
-            coins: self.assets,
-            streams: StreamSelection {
-                all_mids: !self.no_mids,
-                l2_book: !self.no_l2,
-                trades: !self.no_trades,
-            },
-            duration_secs: self.duration,
-            out_dir: self.out,
+    /// This invocation's flags as one settings layer (`None` = flag not given).
+    fn as_layer(&self) -> PartialConfig {
+        PartialConfig {
+            assets: (!self.assets.is_empty()).then(|| self.assets.clone()),
+            // clap SetTrue yields Some(false) when the flag is absent; only an
+            // explicit flag should override the config file, so map to None.
+            cc: self.cc.filter(|&v| v),
+            cc_challenge: self.cc_challenge.clone(),
+            cc_url: self.cc_url.clone(),
+            duration: self.duration,
+            network: self.network.clone(),
+            out: self.out.clone(),
+            no_l2: self.no_l2.filter(|&v| v),
+            no_trades: self.no_trades.filter(|&v| v),
+            no_mids: self.no_mids.filter(|&v| v),
+            shard_size: self.shard_size,
+            l2_shards: self.l2_shards,
+            flush_interval: self.flush_interval,
+            daily: self.daily.filter(|&v| v),
+            idle_timeout: self.idle_timeout,
         }
+    }
+}
+
+fn record_config(s: &Settings) -> RecordConfig {
+    RecordConfig {
+        network: s.network,
+        coins: s.assets.clone(),
+        streams: StreamSelection {
+            all_mids: !s.no_mids,
+            l2_book: !s.no_l2,
+            trades: !s.no_trades,
+        },
+        duration_secs: s.duration,
+        out_dir: s.out.clone(),
     }
 }
 
@@ -138,18 +171,30 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let mut cli = Cli::parse();
+    let cli = Cli::parse();
 
-    if cli.cc {
-        cli.assets = resolve_crowdcent_coins(&cli.cc_url, &cli.cc_challenge).await?;
+    // Layer resolution: CLI flags > config file > defaults. An explicit
+    // `--config` must load; the default `./config.yaml` is optional.
+    let file_layer = match &cli.config {
+        Some(path) => settings::load_file(path)?,
+        None => settings::load_file_if_exists(std::path::Path::new(
+            settings::DEFAULT_CONFIG_FILE,
+        ))?,
+    };
+    let mut s = cli.as_layer().or(file_layer).finalize()?;
+
+    if s.cc {
+        s.assets = resolve_crowdcent_coins(&s.cc_url, &s.cc_challenge).await?;
     }
-    if cli.assets.is_empty() {
-        anyhow::bail!("no coins to record: pass --assets BTC,ETH,... or --cc");
+    if s.assets.is_empty() {
+        anyhow::bail!(
+            "no coins to record: pass --assets BTC,ETH,... or --cc (flags or config.yaml)"
+        );
     }
 
-    let (shard_size, l2_shards, daily) = (cli.shard_size, cli.l2_shards, cli.daily);
-    let flush_interval = (cli.flush_interval > 0).then(|| Duration::from_secs(cli.flush_interval));
-    let idle_timeout = (cli.idle_timeout > 0).then(|| Duration::from_secs(cli.idle_timeout));
+    let (shard_size, l2_shards, daily) = (s.shard_size, s.l2_shards, s.daily);
+    let flush_interval = (s.flush_interval > 0).then(|| Duration::from_secs(s.flush_interval));
+    let idle_timeout = (s.idle_timeout > 0).then(|| Duration::from_secs(s.idle_timeout));
 
     // Operator alerting for unrecoverable failures (opt-in via env/.env).
     let notifier = DiscordNotifier::from_env();
@@ -158,7 +203,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let result = run(
-        cli.into_config(),
+        record_config(&s),
         shard_size,
         l2_shards,
         flush_interval,
